@@ -133,6 +133,7 @@ from sglang.srt.model_executor.forward_context import (
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
     adjust_hybrid_swa_layer_ids,
+    compute_attention_and_moe_layers,
     resolve_layer_indices,
 )
 from sglang.srt.model_executor.model_runner_components.load_model_utils import (
@@ -187,7 +188,6 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     get_bool_env_var,
     init_cublas,
-    is_hip,
     is_host_cpu_arm64,
     is_npu,
     log_info_on_rank0,
@@ -209,7 +209,6 @@ from sglang.srt.utils.profile_utils import build_step_span_name
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.weight_checker import WeightChecker
 
-_is_hip = is_hip()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu_arm64 = is_host_cpu_arm64()
@@ -1676,69 +1675,9 @@ class ModelRunner:
             )
             return
 
-        self.attention_layers = []
-        self.moe_layers = []
-        self.moe_fusions = []
-        self.dsa_indexers = []
-        for layer in layer_model.layers:
-            attn_layer = None
-            if hasattr(layer, "self_attn"):
-                if hasattr(layer.self_attn, "attn"):
-                    attn_layer = layer.self_attn.attn
-                elif hasattr(layer.self_attn, "attn_mqa"):
-                    # For DeepSeek model
-                    attn_layer = layer.self_attn.attn_mqa
-                    if _is_hip and hasattr(layer.self_attn, "attn_mha"):
-                        attn_layer._pcg_mha_companion = layer.self_attn.attn_mha
-            # For hybrid model
-            elif hasattr(layer, "attn"):
-                attn_layer = layer.attn
-            elif hasattr(layer, "linear_attn"):
-                if hasattr(layer.linear_attn, "attn"):
-                    attn_layer = layer.linear_attn.attn
-                else:
-                    attn_layer = layer.linear_attn
-            # For InternVL model
-            elif hasattr(layer, "attention"):
-                if hasattr(layer.attention, "attn"):
-                    attn_layer = layer.attention.attn
-            # For NemotronH and similar hybrid models using 'mixer' attribute
-            elif hasattr(layer, "mixer"):
-                if hasattr(layer.mixer, "attn"):
-                    attn_layer = layer.mixer.attn
-                elif hasattr(layer, "_forward_mamba"):
-                    # Mamba layer with split op support - store the layer itself
-                    attn_layer = layer
-
-            if attn_layer is not None:
-                self.attention_layers.append(attn_layer)
-            elif hasattr(layer, "mixer"):
-                self.attention_layers.append(None)
-
-            moe_block = None
-            moe_fusion = None
-            if hasattr(layer, "mlp") and hasattr(layer.mlp, "experts"):
-                moe_block = layer.mlp.experts
-                moe_fusion = layer.mlp
-            if hasattr(layer, "block_sparse_moe") and hasattr(
-                layer.block_sparse_moe, "experts"
-            ):
-                moe_block = layer.block_sparse_moe.experts
-                moe_fusion = layer.block_sparse_moe
-            if hasattr(layer, "moe") and hasattr(layer.moe, "experts"):
-                moe_block = layer.moe.experts
-                moe_fusion = layer.moe
-            # For NemotronH MoE layers using 'mixer' attribute
-            if hasattr(layer, "mixer") and hasattr(layer.mixer, "experts"):
-                moe_block = layer.mixer.experts
-                moe_fusion = layer.mixer
-            self.moe_layers.append(moe_block)
-            self.moe_fusions.append(moe_fusion)
-            # NSA indexers (None for layers without NSA)
-            dsa_indexer = None
-            if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "indexer"):
-                dsa_indexer = layer.self_attn.indexer
-            self.dsa_indexers.append(dsa_indexer)
+        self.attention_layers, self.moe_layers, self.moe_fusions, self.dsa_indexers = (
+            compute_attention_and_moe_layers(layer_model)
+        )
 
         if len(self.attention_layers) < self.model_config.num_hidden_layers:
             # TODO(yuwei): support Non-Standard GQA

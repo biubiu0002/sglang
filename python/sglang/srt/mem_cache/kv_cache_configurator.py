@@ -151,6 +151,7 @@ class KVCacheConfigurator:
     # otherwise the target KV pool oversizes by 1+ GB on 32GB GPUs and
     # OOMs at cuda graph capture (see debug_journal 2026-05-11-kvc-...).
     dflash_draft_num_layers: Optional[int]
+    eagle_draft_num_layers: Optional[int]
     # arch flags (derived, not direct server_args fields)
     is_hybrid_swa: bool
     is_hybrid_swa_compress: bool
@@ -158,6 +159,9 @@ class KVCacheConfigurator:
     mambaish_config: Optional[Any]
     hybrid_gdn_config: Optional[Any]
     # PP slice
+    pp_size: int
+    pp_group: Any
+    attn_dp_size: int
     start_layer: int
     end_layer: int
     num_effective_layers: int

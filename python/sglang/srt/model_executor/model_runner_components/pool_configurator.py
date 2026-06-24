@@ -63,7 +63,7 @@ class MemoryPoolConfig:
 
 
 if TYPE_CHECKING:
-    from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 
 logger = logging.getLogger(__name__)
 
@@ -113,29 +113,31 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     bias = 0
     """
 
-    def __init__(self, model_runner: ModelRunner):
+    def __init__(self, kv_cache_configurator: KVCacheConfigurator):
         # Determine effective number of layers for KV cache
-        if mambaish := mambaish_config(model_runner.model_config):
+        if mambaish := mambaish_config(kv_cache_configurator.model_config):
             effective_layer_ids = [
                 i
                 for i in mambaish.full_attention_layer_ids
-                if model_runner.start_layer <= i < model_runner.end_layer
+                if kv_cache_configurator.start_layer
+                <= i
+                < kv_cache_configurator.end_layer
             ]
             num_layers = len(effective_layer_ids)
         else:
-            num_layers = model_runner.num_effective_layers
+            num_layers = kv_cache_configurator.num_effective_layers
 
-        self._cell_size = self._compute_cell_size(model_runner, num_layers)
+        self._cell_size = self._compute_cell_size(kv_cache_configurator, num_layers)
 
         # EAGLE/STANDALONE: scale cell_size to account for draft model KV cache.
         # Assumes draft and target share the same per-layer KV size (head_dim,
         # num_kv_heads, dtype), which holds for EAGLE/MTP draft models that
         # reuse the target architecture's attention config.
         if (
-            model_runner.spec_algorithm.is_eagle()
-            or model_runner.spec_algorithm.is_standalone()
-        ) and not model_runner.is_draft_worker:
-            eagle_draft_num_layers = model_runner.eagle_draft_num_layers
+            kv_cache_configurator.spec_algorithm.is_eagle()
+            or kv_cache_configurator.spec_algorithm.is_standalone()
+        ) and not kv_cache_configurator.is_draft_worker:
+            eagle_draft_num_layers = kv_cache_configurator.eagle_draft_num_layers
             if (
                 eagle_draft_num_layers is not None
                 and int(eagle_draft_num_layers) > 0
@@ -147,12 +149,15 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 )
 
         # DFLASH: scale cell_size to account for draft model KV cache
-        if model_runner.spec_algorithm.is_dflash() and not model_runner.is_draft_worker:
+        if (
+            kv_cache_configurator.spec_algorithm.is_dflash()
+            and not kv_cache_configurator.is_draft_worker
+        ):
             from sglang.srt.speculative.dflash_utils import (
                 scale_kv_cell_size_per_token_for_dflash,
             )
 
-            draft_num_layers = model_runner.dflash_draft_num_layers
+            draft_num_layers = kv_cache_configurator.dflash_draft_num_layers
             if (
                 draft_num_layers is not None
                 and int(draft_num_layers) > 0
@@ -164,16 +169,18 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     draft_num_layers=int(draft_num_layers),
                 )
 
-    def _compute_cell_size(self, model_runner: ModelRunner, num_layers: int) -> int:
+    def _compute_cell_size(
+        self, kv_cache_configurator: KVCacheConfigurator, num_layers: int
+    ) -> int:
         """Compute per-token KV cache cost in bytes. Subclasses can override."""
         # args to config cell size
-        model_config = model_runner.model_config
-        kv_cache_dtype = model_runner.kv_cache_dtype
+        model_config = kv_cache_configurator.model_config
+        kv_cache_dtype = kv_cache_configurator.kv_cache_dtype
 
         kv_size = torch._utils._element_size(kv_cache_dtype)
         tp_size = get_attention_tp_size()
 
-        if model_runner.use_mla_backend:
+        if kv_cache_configurator.use_mla_backend:
             cell_size = (
                 (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
                 * num_layers
@@ -242,9 +249,9 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
     Does NOT inherit DefaultPoolConfigurator — different coeff model.
     """
 
-    def __init__(self, model_runner: ModelRunner):
-        model_config = model_runner.model_config
-        kv_cache_dtype = model_runner.kv_cache_dtype
+    def __init__(self, kv_cache_configurator: KVCacheConfigurator):
+        model_config = kv_cache_configurator.model_config
+        kv_cache_dtype = kv_cache_configurator.kv_cache_dtype
         kv_size = torch._utils._element_size(kv_cache_dtype)
         tp_size = get_attention_tp_size()
 
@@ -254,7 +261,9 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             self._swa_layers_num > 0
         ), "Hybrid SWA model must have at least one SWA layer"
 
-        self._swa_full_tokens_ratio = model_runner.server_args.swa_full_tokens_ratio
+        self._swa_full_tokens_ratio = (
+            kv_cache_configurator.server_args.swa_full_tokens_ratio
+        )
 
         # Full layer per-token memory (bytes)
         self._full_per_token = (
@@ -347,13 +356,13 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
     both pools by swa_full_tokens_ratio.
     """
 
-    def __init__(self, model_runner: ModelRunner):
-        super().__init__(model_runner)
+    def __init__(self, kv_cache_configurator: KVCacheConfigurator):
+        super().__init__(kv_cache_configurator)
         assert self._full_layers_num > 0
 
-        sa = model_runner.server_args
-        page_size = model_runner.page_size
-        window = model_runner.sliding_window_size
+        sa = kv_cache_configurator.server_args
+        page_size = kv_cache_configurator.page_size
+        window = kv_cache_configurator.sliding_window_size
         draft_tokens = sa.speculative_num_draft_tokens or 1
         eviction_interval = max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get())
 
@@ -373,7 +382,7 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
             decode_alloc = 2 * get_alloc_len_per_decode(sa)
         per_request = trailing_tokens + decode_alloc
 
-        num_reqs = sa.max_running_requests // model_runner.attn_dp_size
+        num_reqs = sa.max_running_requests // kv_cache_configurator.attn_dp_size
         if sa.disaggregation_mode == "decode":
             self._swa_cap = (
                 per_request * num_reqs
@@ -388,18 +397,18 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
             )
 
     @staticmethod
-    def is_applicable(model_runner: ModelRunner) -> bool:
+    def is_applicable(kv_cache_configurator: KVCacheConfigurator) -> bool:
         """True when SWAChunkCache can be sized from explicit max requests."""
-        sa = model_runner.server_args
+        sa = kv_cache_configurator.server_args
         if sa.max_running_requests is None:
             return False
         if not sa.disable_radix_cache:
             return False
         if sa.chunked_prefill_size is None:
             return False
-        if model_runner.sliding_window_size is None:
+        if kv_cache_configurator.sliding_window_size is None:
             return False
-        return len(model_runner.model_config.full_attention_layer_ids) > 0
+        return len(kv_cache_configurator.model_config.full_attention_layer_ids) > 0
 
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
@@ -456,32 +465,34 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     decode reserves a draft worker, mirroring dflash's cell_size scaling); bias = 0.
     """
 
-    def __init__(self, model_runner: ModelRunner):
-        cfg = model_runner.model_config
+    def __init__(self, kv_cache_configurator: KVCacheConfigurator):
+        cfg = kv_cache_configurator.model_config
         self.qk_nope_head_dim = cfg.qk_nope_head_dim
         self.qk_rope_head_dim = cfg.qk_rope_head_dim
         self.indexer_head_dim = cfg.index_head_dim
         # PP-local slice; matches DeepSeekV4TokenToKVPool's stage_ratios.
         self.compression_ratios = cfg.compress_ratios[
-            model_runner.start_layer : model_runner.end_layer
+            kv_cache_configurator.start_layer : kv_cache_configurator.end_layer
         ]
-        if model_runner.pp_size > 1:
+        if kv_cache_configurator.pp_size > 1:
             logger.info(
-                f"DSV4 pool PP slice: rank={model_runner.pp_group.rank_in_group} "
-                f"layers=[{model_runner.start_layer},{model_runner.end_layer}) "
+                f"DSV4 pool PP slice: rank={kv_cache_configurator.pp_group.rank_in_group} "
+                f"layers=[{kv_cache_configurator.start_layer},{kv_cache_configurator.end_layer}) "
                 f"local={len(self.compression_ratios)}/{len(cfg.compress_ratios)}"
             )
         self.swa_page_size = cfg.window_size
-        self.swa_ratio = model_runner.server_args.swa_full_tokens_ratio
-        self.is_speculative = model_runner.server_args.speculative_algorithm is not None
-        self.online_c128_mtp_max_draft_tokens = (
-            model_runner.server_args.max_speculative_num_draft_tokens or 0
+        self.swa_ratio = kv_cache_configurator.server_args.swa_full_tokens_ratio
+        self.is_speculative = (
+            kv_cache_configurator.server_args.speculative_algorithm is not None
         )
-        if model_runner.server_args.enable_hisparse:
+        self.online_c128_mtp_max_draft_tokens = (
+            kv_cache_configurator.server_args.max_speculative_num_draft_tokens or 0
+        )
+        if kv_cache_configurator.server_args.enable_hisparse:
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
             self.c4_shrink_factor = parse_hisparse_config(
-                model_runner.server_args
+                kv_cache_configurator.server_args
             ).host_to_device_ratio
         else:
             self.c4_shrink_factor = 1
@@ -513,10 +524,10 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         if envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
             allow_experimental_online_c128_mtp = (
                 envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get()
-                and model_runner.spec_algorithm.is_eagle()
+                and kv_cache_configurator.spec_algorithm.is_eagle()
             )
             assert (
-                model_runner.spec_algorithm.is_none()
+                kv_cache_configurator.spec_algorithm.is_none()
                 or allow_experimental_online_c128_mtp
             ), (
                 "SGLANG_OPT_USE_ONLINE_COMPRESS does not support speculative decode "
@@ -643,17 +654,17 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
 
 def create_memory_pool_configurator(
-    model_runner: ModelRunner,
+    kv_cache_configurator: KVCacheConfigurator,
 ) -> MemoryPoolConfigurator:
     """Factory: select the right configurator for the model architecture."""
     if (
-        is_deepseek_v4(model_runner.model_config.hf_config)
-        and model_runner.is_hybrid_swa
+        is_deepseek_v4(kv_cache_configurator.model_config.hf_config)
+        and kv_cache_configurator.is_hybrid_swa
     ):
-        return DSV4PoolConfigurator(model_runner)
-    if model_runner.is_hybrid_swa:
-        if SWAChunkCapPoolConfigurator.is_applicable(model_runner):
-            return SWAChunkCapPoolConfigurator(model_runner)
-        return HybridSWAPoolConfigurator(model_runner)
+        return DSV4PoolConfigurator(kv_cache_configurator)
+    if kv_cache_configurator.is_hybrid_swa:
+        if SWAChunkCapPoolConfigurator.is_applicable(kv_cache_configurator):
+            return SWAChunkCapPoolConfigurator(kv_cache_configurator)
+        return HybridSWAPoolConfigurator(kv_cache_configurator)
     # Future: MambaPoolConfigurator
-    return DefaultPoolConfigurator(model_runner)
+    return DefaultPoolConfigurator(kv_cache_configurator)

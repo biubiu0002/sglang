@@ -135,9 +135,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             model_runner.spec_algorithm.is_eagle()
             or model_runner.spec_algorithm.is_standalone()
         ) and not model_runner.is_draft_worker:
-            eagle_draft_num_layers = getattr(
-                model_runner, "eagle_draft_num_layers", None
-            )
+            eagle_draft_num_layers = model_runner.spec_aux_config.eagle_draft_num_layers
             if (
                 eagle_draft_num_layers is not None
                 and int(eagle_draft_num_layers) > 0
@@ -154,7 +152,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 scale_kv_cell_size_per_token_for_dflash,
             )
 
-            draft_num_layers = model_runner.dflash_draft_num_layers
+            draft_num_layers = model_runner.spec_aux_config.dflash_draft_num_layers
             if (
                 draft_num_layers is not None
                 and int(draft_num_layers) > 0

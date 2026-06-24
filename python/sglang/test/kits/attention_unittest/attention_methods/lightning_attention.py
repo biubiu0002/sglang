@@ -199,6 +199,7 @@ class TinyLightningModelConfig:
             num_hidden_layers=num_hidden_layers,
             linear_backend=linear_backend,
         )
+        self.hf_config.get_text_config = lambda: self.hf_config
         self.hf_text_config = self.hf_config
 
     def get_num_kv_heads(self, tp_size: int) -> int:

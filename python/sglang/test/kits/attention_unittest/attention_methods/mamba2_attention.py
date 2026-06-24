@@ -286,6 +286,7 @@ class TinyMamba2ModelConfig:
             architectures=["TinyMamba2ForCausalLM"],
             mamba_chunk_size=case.mamba_chunk_size,
         )
+        self.hf_config.get_text_config = lambda: self.hf_config
         self.hf_text_config = self.hf_config
 
     def get_num_kv_heads(self, tp_size: int) -> int:

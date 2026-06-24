@@ -183,6 +183,7 @@ class TinyGDNModelConfig:
         self.attention_chunk_size = None
         self.sliding_window_size = None
         self.hf_config = SimpleNamespace(architectures=["TinyGDNForCausalLM"])
+        self.hf_config.get_text_config = lambda: self.hf_config
         self.hf_text_config = self.hf_config
 
     def get_num_kv_heads(self, tp_size: int) -> int:

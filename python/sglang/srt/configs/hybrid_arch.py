@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from weakref import WeakKeyDictionary
 
 from sglang.srt.configs import (
@@ -22,7 +22,9 @@ from sglang.srt.configs import (
     ZayaConfig,
 )
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
-from sglang.srt.configs.model_config import ModelConfig
+
+if TYPE_CHECKING:
+    from sglang.srt.configs.model_config import ModelConfig
 
 _linear_attn_registry_cache: WeakKeyDictionary[ModelConfig, Any] = WeakKeyDictionary()
 

@@ -199,7 +199,7 @@ class KVCacheConfigurator:
             memory_pool_config=config,
         )
 
-    def _derive_pool_sizes(self, *, config: "MemoryPoolConfig") -> _PoolSizes:
+    def _derive_pool_sizes(self, *, config: MemoryPoolConfig) -> _PoolSizes:
         max_total_num_tokens = config.max_total_num_tokens
         max_running_requests = config.max_running_requests
         full_max_total_num_tokens = None
@@ -1045,7 +1045,10 @@ class KVCacheConfigurator:
                             need_sort=need_sort,
                             host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
                         )
-                    elif self.server_args.page_size == 1 and self.server_args.dcp_size == 1:
+                    elif (
+                        self.server_args.page_size == 1
+                        and self.server_args.dcp_size == 1
+                    ):
                         token_to_kv_pool_allocator = TokenToKVPoolAllocator(
                             sizes.max_total_num_tokens,
                             dtype=self.kv_cache_dtype,
@@ -1056,7 +1059,8 @@ class KVCacheConfigurator:
                     else:
                         token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
                             sizes.max_total_num_tokens * self.server_args.dcp_size,
-                            page_size=self.server_args.page_size * self.server_args.dcp_size,
+                            page_size=self.server_args.page_size
+                            * self.server_args.dcp_size,
                             dtype=self.kv_cache_dtype,
                             device=self.device,
                             kvcache=token_to_kv_pool,

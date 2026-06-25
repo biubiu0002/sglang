@@ -381,7 +381,7 @@ class BaseRunner(ABC):
                 str(server_args.moe_runner_backend),
                 str(mr.tp_size),
                 str(mr.pp_size),
-                str(mr.dp_size),
+                str(mr.attn_dp_size),
                 str(mr.moe_ep_size),
                 str(mr.model_config.hf_config.__class__.__name__),
             ]

@@ -90,7 +90,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.device = model_runner.device
         self.device_module = torch.get_device_module(self.device)
         self.tp_size = model_runner.tp_size
-        self.dp_size = model_runner.dp_size
+        self.dp_size = model_runner.attn_dp_size
         self.pp_size = model_runner.server_args.pp_size
         self.enable_torch_compile = model_runner.server_args.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding

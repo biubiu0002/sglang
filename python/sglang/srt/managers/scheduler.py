@@ -1486,12 +1486,13 @@ class Scheduler(
         self.schedule_stream = self.device_module.Stream(priority=0)
         if self.device == "cpu":
             self.schedule_stream.synchronize = lambda: None  # No-op for CPU
-        # DFLASH fences its shared req_to_token writes with verify_done /
-        # plan-stream deps, so the global WAR barrier only serializes plan
-        # overlap. TODO: generalize this global-barrier enablement policy.
+        # The barrier fences the scheduler's next shared-buffer write on the
+        # forward's read-done event; workers that fence their own shared writes
+        # (DFLASH, via verify_done / plan-stream deps) opt out via
+        # needs_war_barrier.
         self._war_barrier_enabled = (
             is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
-        ) and not self.spec_algorithm.is_dflash()
+        ) and self.model_worker.needs_war_barrier
         with self.device_module.StreamContext(self.schedule_stream):
             dispatch_event_loop(self)
 

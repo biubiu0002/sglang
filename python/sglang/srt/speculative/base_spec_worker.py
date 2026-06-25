@@ -291,6 +291,12 @@ class BaseSpecWorker(ABC):
         return self.target_worker.model_runner
 
     @property
+    def needs_war_barrier(self) -> bool:
+        # See TpModelWorker.needs_war_barrier. Spec workers that fence their own
+        # shared writes override this to False.
+        return True
+
+    @property
     def spec_v2_attn_backends(self) -> tuple:
         """Attn backends touched by spec_v2 forward; OR-ed by decide_needs_cpu_seq_lens.
         Default returns target only; subclasses extend with draft backends."""

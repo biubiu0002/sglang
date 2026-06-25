@@ -78,6 +78,13 @@ class BaseTpWorker(ABC):
         return self.model_runner
 
     @property
+    def needs_war_barrier(self) -> bool:
+        # The scheduler fences its next shared-buffer write on this worker's
+        # read-done event (via war_fastpath_runner). Workers that fence their
+        # own shared writes override this to False.
+        return True
+
+    @property
     def sliding_window_size(self) -> Optional[int]:
         return self.model_runner.sliding_window_size
 

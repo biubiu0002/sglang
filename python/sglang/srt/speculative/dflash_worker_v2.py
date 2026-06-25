@@ -272,6 +272,13 @@ class DFlashWorkerV2(BaseSpecWorker):
             self.draft_model_runner.attn_backend,
         )
 
+    @property
+    def needs_war_barrier(self) -> bool:
+        # DFLASH fences its shared req_to_token writes with verify_done /
+        # plan-stream deps, so the scheduler's global WAR barrier is redundant
+        # (it would only serialize plan overlap).
+        return False
+
     def alloc_memory_pool(
         self,
         memory_pool_config=None,

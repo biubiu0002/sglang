@@ -209,7 +209,6 @@ class GenerateReqInput:
     routed_dp_rank: Optional[int] = None
     # For PD disagg — hint telling decode which prefill DP worker has the KV cache
     disagg_prefill_dp_rank: Optional[int] = None
-
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None
     # Conversation id used for tracking requests
@@ -878,6 +877,12 @@ class EmbeddingReqInput:
     # Resolved embedding overrides with positions (set by tokenizer manager or score mixin).
     # Runtime type: Optional[Union[PositionalEmbeds, List[Optional[PositionalEmbeds]]]]
     positional_embed_overrides: Any = None
+    # Routing key for routing-key schedule policy
+    routing_key: Optional[str] = None
+
+    # For background responses (OpenAI responses API)
+    background: bool = False
+
     # Dummy sampling params for compatibility
     sampling_params: Optional[Union[List[Dict], Dict]] = None
     # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
@@ -886,11 +891,7 @@ class EmbeddingReqInput:
     modalities: Optional[List[str]] = None
     # For cross-encoder requests
     is_cross_encoder_request: bool = False
-    # Routing key for routing-key schedule policy
-    routing_key: Optional[str] = None
 
-    # For background responses (OpenAI responses API)
-    background: bool = False
     # Priority for the request
     priority: Optional[int] = None
 
@@ -2167,27 +2168,19 @@ class DumperControlReqOutput(BaseReq):
     error: str = ""
 
 
-def sock_send(
-    sender: Union[zmq.Socket, zmq.asyncio.Socket],
-    obj: Any,
-    flags: int = 0,
-) -> None:
-    sender.send_pyobj(obj, flags=flags)
+def sock_send(socket: zmq.Socket, obj: Any, flags: int = 0) -> None:
+    socket.send_pyobj(obj, flags=flags)
 
 
-def sock_recv(socket, flags=0):
+def sock_recv(socket: zmq.Socket, flags: int = 0) -> Any:
     return socket.recv_pyobj(flags=flags)
 
 
-async def async_sock_send(
-    sender: zmq.asyncio.Socket,
-    obj: Any,
-    flags: int = 0,
-) -> None:
-    await sender.send_pyobj(obj, flags=flags)
+async def async_sock_send(socket: zmq.asyncio.Socket, obj: Any, flags: int = 0) -> None:
+    await socket.send_pyobj(obj, flags=flags)
 
 
-async def async_sock_recv(socket, flags=0):
+async def async_sock_recv(socket: zmq.asyncio.Socket, flags: int = 0) -> Any:
     return await socket.recv_pyobj(flags=flags)
 
 

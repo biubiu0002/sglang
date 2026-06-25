@@ -60,6 +60,7 @@ from sglang.srt.utils.field_validators import validate_optional_list_i64_1d_2d
 # Handle serialization of Image for pydantic
 if TYPE_CHECKING:
     from PIL.Image import Image
+
 else:
     Image = Any
 
@@ -732,11 +733,11 @@ class GenerateReqInput:
 @dataclass
 class TokenizedGenerateReqInput(BaseReq):
     # The input text
-    input_text: str
+    input_text: Optional[Union[str, List[Union[str, List[str]]]]]  # str
     # The input token ids
-    input_ids: Optional[array[int]]
+    input_ids: Optional[array]  # Optional[array[int]]
     # The input embeds
-    input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]]
+    input_embeds: Optional[List[List[Union[float, List[float]]]]]
     # The multimodal inputs
     mm_inputs: object
     token_type_ids: Optional[List[int]]
@@ -1073,9 +1074,9 @@ class EmbeddingReqInput:
 @dataclass
 class TokenizedEmbeddingReqInput(BaseReq):
     # The input text
-    input_text: str
+    input_text: Optional[Union[str, List[Union[str, List[str]]]]]  # str
     # The input token ids
-    input_ids: array[int]
+    input_ids: Optional[array]  # array[int]
     # The multimodal inputs
     mm_inputs: object
     # The token type ids
@@ -1130,10 +1131,10 @@ class BatchTokenIDOutput(BaseBatchReq):
     finished_reasons: List[Optional[FinishReasonDict]]
     # For incremental decoding
     decoded_texts: List[str]
-    decode_ids: List[array[int]]
+    decode_ids: List[array]  # List[array[int]]
     read_offsets: List[int]
     # Only used when `--skip-tokenizer-init` is on
-    output_ids: Optional[List[array[int]]]
+    output_ids: Optional[List[array]]  # Optional[List[array[int]]]
     # Detokenization configs
     skip_special_tokens: List[bool]
     spaces_between_special_tokens: List[bool]
@@ -1286,7 +1287,7 @@ class BatchEmbeddingOutput(BaseBatchReq):
     # The finish reason
     finished_reasons: List[Optional[FinishReasonDict]]
     # The output embedding
-    embeddings: Union[List[List[float]], List[Dict[int, float]]]
+    embeddings: List[Union[List[Union[float, List[float]]], Dict[int, float], float]]
     # Token counts
     prompt_tokens: List[int]
     cached_tokens: List[int]
@@ -1517,7 +1518,9 @@ class UpdateWeightsFromTensorReqInput(BaseReq):
     - Data is structured in JSON for easy transmission over HTTP
     """
 
-    serialized_named_tensors: List[Union[str, bytes]]
+    # Raw MultiprocessingSerializer bytes. HTTP/base64 strings are accepted at
+    # ingress and normalized before this request is sent over scheduler IPC.
+    serialized_named_tensors: List[bytes]
     # Optional format specification for loading
     load_format: Optional[str] = None
     # Whether to flush the cache after updating weights
@@ -1643,14 +1646,6 @@ class DestroyWeightsUpdateGroupReqOutput(BaseReq):
 
 
 @dataclass
-class UpdateWeightVersionReqInput(BaseReq):
-    # The new weight version
-    new_version: str
-    # Whether to abort all running requests before updating
-    abort_all_requests: bool = True
-
-
-@dataclass
 class GetWeightsByNameReqInput(BaseReq):
     name: str
     truncate_size: int = 100
@@ -1659,6 +1654,14 @@ class GetWeightsByNameReqInput(BaseReq):
 @dataclass
 class GetWeightsByNameReqOutput(BaseReq):
     parameter: list
+
+
+@dataclass
+class UpdateWeightVersionReqInput(BaseReq):
+    # The new weight version
+    new_version: str
+    # Whether to abort all running requests before updating
+    abort_all_requests: bool = True
 
 
 @dataclass
@@ -1956,7 +1959,7 @@ class LoadLoRAAdapterFromTensorsReqInput(BaseReq):
 class LoRAUpdateOutput(BaseReq):
     success: bool
     error_message: Optional[str] = None
-    loaded_adapters: Optional[Dict[str, LoRARef]] = None
+    loaded_adapters: Optional[Dict[str, Union[str, LoRARef]]] = None
 
 
 LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = (

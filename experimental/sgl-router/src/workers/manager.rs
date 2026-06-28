@@ -60,7 +60,9 @@ pub async fn run(rx: mpsc::Receiver<DiscoveryEvent>, registry: Arc<WorkerRegistr
 /// (threshold = 3).
 ///
 /// Uses the default HTTP client (2-second timeout) for `/server_info`
-/// introspection.  Tests that want a tighter timeout call
+/// introspection, carrying the optional `worker_introspect_key` from
+/// `cfg` as a bearer `Authorization` header so key-protected workers
+/// answer 200 instead of 401.  Tests that want a tighter timeout call
 /// [`run_with_introspector`] directly.
 pub async fn run_with_config(
     rx: mpsc::Receiver<DiscoveryEvent>,
@@ -69,15 +71,14 @@ pub async fn run_with_config(
     kv_index: Option<Arc<KvEventIndex>>,
     active_load: Option<Arc<ActiveLoadRegistry>>,
 ) {
-    run_with_introspector(
-        rx,
-        registry,
-        cfg,
-        kv_index,
-        active_load,
-        Arc::new(WorkerIntrospector::default()),
-    )
-    .await
+    // Introspection runs at startup before any client request exists, so
+    // it can't reuse a forwarded client `Authorization`; it needs the
+    // pool's shared worker key from config (None => unauthenticated).
+    let introspector = Arc::new(WorkerIntrospector::with_optional_key(
+        cfg.as_ref()
+            .and_then(|c| c.worker_introspect_key.as_deref()),
+    ));
+    run_with_introspector(rx, registry, cfg, kv_index, active_load, introspector).await
 }
 
 /// Internal entry point used by tests so they can supply a custom
@@ -492,6 +493,11 @@ mod tests {
             }),
             proxy: ProxyConfig::default(),
             active_load: ActiveLoadConfig::default(),
+            worker_introspect_key: None,
+            load_poll_interval_secs: None,
+            cache_tree_page_size: None,
+            cache_tree_bigram: false,
+            cache_tree_max_nodes: 1_000_000,
         }
     }
 

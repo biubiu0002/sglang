@@ -104,11 +104,49 @@ async fn main() -> Result<()> {
     // `cache_aware_zmq`, the index is still constructed (cheap) but no
     // subscribers are ever added.
     let block_size_oracle = sgl_router::policies::kv_events::BlockSizeOracle::new();
+
+    // Route-history tree mode: the router feeds the prefix tree from its own
+    // routing decisions instead of subscribing to worker ZMQ KV-events. In
+    // that mode there is no worker introspection to seed the block-size
+    // oracle, so seed it from --cache-tree-page-size / --cache-tree-bigram,
+    // and we deliberately DON'T attach ZMQ subscribers (no worker ZMQ port
+    // needed — works over NAT/Vast public mappings).
+    let route_history = matches!(
+        cfg.model.cache_aware.as_ref().map(|c| c.tree_source),
+        Some(sgl_router::config::CacheTreeSource::RouteHistory)
+    );
+    if route_history {
+        if let Some(ps) = cfg.cache_tree_page_size {
+            match block_size_oracle.try_set(ps) {
+                Ok(v) => tracing::info!(page_size = v, bigram = cfg.cache_tree_bigram, "route-history tree: seeded block-size oracle"),
+                Err(e) => tracing::error!(error = ?e, "route-history tree: failed to seed block size"),
+            }
+            block_size_oracle.set_bigram(cfg.cache_tree_bigram);
+        } else {
+            tracing::error!("route-history tree-source but --cache-tree-page-size unset; cache routing will fall back to min-load");
+        }
+    }
+
+    // The KV-event discovery client hits each worker's key-protected
+    // `/server_info` (same endpoint as worker introspection), so it must
+    // carry the pool's shared worker key as a default Authorization header
+    // when one is configured — otherwise discovery gets 401, no ZMQ
+    // subscriber is attached, and cache_aware_zmq degrades to min-load.
+    let kv_discovery_client = {
+        let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(2));
+        if let Some(token) = cfg.worker_introspect_key.as_deref() {
+            let mut headers = reqwest::header::HeaderMap::new();
+            let mut value =
+                reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+                    .expect("worker introspect key must be a valid HTTP header value");
+            value.set_sensitive(true);
+            headers.insert(reqwest::header::AUTHORIZATION, value);
+            builder = builder.default_headers(headers);
+        }
+        builder.build().expect("default http client builds")
+    };
     let kv_index = sgl_router::policies::kv_events::KvEventIndex::new_with_http_and_oracle(
-        reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(2))
-            .build()
-            .expect("default http client builds"),
+        kv_discovery_client,
         Arc::clone(&block_size_oracle),
     );
     let policies = Arc::new(
@@ -142,12 +180,50 @@ async fn main() -> Result<()> {
     let janitor_handle =
         sgl_router::policies::active_load::spawn_janitor(Arc::clone(&active_load), sweep_interval);
 
+    // Route-history tree eviction: the tree is fed by routing decisions and
+    // has no worker-driven BlockRemoved events to bound it, so periodically
+    // LRU-evict down to --cache-tree-max-nodes. (zmq mode evicts via worker
+    // events + its own cap, so this task is route-history-only.)
+    let tree_evict_handle = if route_history {
+        let tree = kv_index.tree();
+        let max_nodes = cfg.cache_tree_max_nodes;
+        tracing::info!(max_nodes, "route-history tree: spawning LRU eviction sweeper");
+        Some(sgl_router::policies::active_load::spawn_sweeper(
+            move || tree.evict_lru(max_nodes),
+            std::time::Duration::from_secs(10),
+            "route-history-tree",
+        ))
+    } else {
+        None
+    };
+
+    // Optional background load poller: when --load-poll-interval-secs is set,
+    // poll each worker's /get_load for its real queue depth and feed it to
+    // cache_aware_zmq (instead of the router-side in-flight count). Reuses the
+    // worker introspect key for auth. None => not spawned (in-flight count).
+    let load_poller_handle = cfg.load_poll_interval_secs.map(|secs| {
+        tracing::info!(interval_secs = secs, "spawning worker load poller (/get_load)");
+        sgl_router::policies::load_poller::spawn_load_poller(
+            Arc::clone(&registry),
+            std::time::Duration::from_secs(secs),
+            cfg.worker_introspect_key.clone(),
+        )
+    });
+
     // Spawn discovery + manager tasks.
     let (event_rx, discovery_handle) = sgl_router::discovery::spawn_discovery(&cfg)
         .await
         .context("spawn discovery")?;
-    let kv_index_opt: Option<Arc<sgl_router::policies::kv_events::KvEventIndex>> =
-        Some(Arc::clone(&kv_index));
+    // In route-history mode, do NOT attach the KV-event index to the manager:
+    // that path introspects each worker's /server_info and spawns ZMQ
+    // subscribers, which is exactly what route-history avoids. The policy still
+    // shares the same tree handle (built above) — it's just fed by routing
+    // decisions instead of ZMQ events.
+    let kv_index_opt: Option<Arc<sgl_router::policies::kv_events::KvEventIndex>> = if route_history {
+        None
+    } else {
+        Some(Arc::clone(&kv_index))
+    };
     let manager_handle = tokio::spawn(sgl_router::workers::manager::run_with_config(
         event_rx,
         registry.clone(),
@@ -195,6 +271,12 @@ async fn main() -> Result<()> {
     discovery_handle.abort();
     manager_handle.abort();
     janitor_handle.shutdown().await;
+    if let Some(h) = tree_evict_handle {
+        h.shutdown().await;
+    }
+    if let Some(h) = load_poller_handle {
+        h.shutdown().await;
+    }
     server_result
 }
 

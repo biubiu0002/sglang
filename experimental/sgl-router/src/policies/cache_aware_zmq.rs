@@ -35,11 +35,12 @@
 //! a misconfigured tree or tokenizer degrades to round-robin-with-load
 //! tiebreak, not a routing failure.
 
-use crate::config::CacheAwareConfig;
+use crate::config::{CacheAwareConfig, CacheTreeSource};
 
 use crate::policies::kv_events::{
     compute_block_hashes, compute_block_hashes_bigram, BlockSizeOracle, HashTree,
 };
+use crate::policies::kv_events::tree::KvWorkerId;
 use crate::policies::{request_tokens_for, Policy, SelectionContext};
 use crate::server::metrics::MetricsRegistry;
 use crate::tokenizer::TokenizerRegistry;
@@ -110,10 +111,12 @@ impl CacheAwareZmqPolicy {
     /// Lowest-load worker — ties broken by stable iteration order (which
     /// is the order the registry returned, i.e. dashmap-undefined). For
     /// production traffic the ties are rare; tests pin the load skew.
-    fn pick_min_load(workers: &[Arc<Worker>]) -> Option<Arc<Worker>> {
+    /// `use_reported` selects the real poller-reported load vs the
+    /// router-side in-flight counter (see `Worker::effective_load`).
+    fn pick_min_load(workers: &[Arc<Worker>], use_reported: bool) -> Option<Arc<Worker>> {
         workers
             .iter()
-            .min_by_key(|w| w.active_load())
+            .min_by_key(|w| w.effective_load(use_reported))
             .map(Arc::clone)
     }
 
@@ -133,14 +136,14 @@ impl CacheAwareZmqPolicy {
         if !self.config.hit_load_rel_threshold.is_finite() {
             return hot; // guard OFF — behaviour identical to plain cache-aware
         }
-        let Some(cool) = Self::pick_min_load(workers) else {
+        let Some(cool) = Self::pick_min_load(workers, self.config.use_reported_load) else {
             return hot;
         };
         if cool.url == hot.url {
             return hot;
         }
-        let c = hot.active_load();
-        let m = cool.active_load();
+        let c = hot.effective_load(self.config.use_reported_load);
+        let m = cool.effective_load(self.config.use_reported_load);
         let divert = c.saturating_sub(m) > self.config.hit_load_abs_threshold
             && (c as f32) > (m as f32) * self.config.hit_load_rel_threshold;
         if divert {
@@ -160,13 +163,32 @@ impl CacheAwareZmqPolicy {
     /// even more on the hot worker.
     fn is_imbalanced(&self, workers: &[Arc<Worker>]) -> bool {
         let (min_load, max_load) = workers.iter().fold((usize::MAX, 0usize), |(mn, mx), w| {
-            let l = w.active_load();
+            let l = w.effective_load(self.config.use_reported_load);
             (mn.min(l), mx.max(l))
         });
         let min_load = if min_load == usize::MAX { 0 } else { min_load };
         let abs_diff = max_load.saturating_sub(min_load);
         let rel_threshold = (min_load as f32 * self.config.balance_rel_threshold) as usize;
         abs_diff > self.config.balance_abs_threshold && max_load > rel_threshold
+    }
+
+    /// Route-history tree feeding: in `RouteHistory` tree-source mode, record
+    /// this request's prefix block hashes against the worker we actually
+    /// chose, so a subsequent request sharing the prefix matches it. No-op in
+    /// `Zmq` mode (there the worker's own KV-event stream owns the tree;
+    /// double-feeding would corrupt the eviction-accurate state). `parent_hash
+    /// = None` inserts the full chain from the root, mirroring how
+    /// `match_prefix(None, ..)` queries it.
+    fn feed_route_history(&self, chosen: &Option<Arc<Worker>>, block_hashes: &[i64]) {
+        if self.config.tree_source != CacheTreeSource::RouteHistory {
+            return;
+        }
+        let Some(w) = chosen else { return };
+        if block_hashes.is_empty() {
+            return;
+        }
+        let kw = KvWorkerId::new(w.url.clone(), 0);
+        self.tree.insert(&kw, None, block_hashes);
     }
 }
 
@@ -179,7 +201,7 @@ impl Policy for CacheAwareZmqPolicy {
         // 1. Load-imbalance fast-path: even the best cache hit gets
         //    dropped in favour of evening out load.
         if self.is_imbalanced(workers) {
-            return Self::pick_min_load(workers);
+            return Self::pick_min_load(workers, self.config.use_reported_load);
         }
 
         // 2. Routing tokens. Prefer the ids computed once at ingress; fall
@@ -192,13 +214,13 @@ impl Policy for CacheAwareZmqPolicy {
             _ => {
                 let body = match ctx.request_body() {
                     Some(b) if !b.is_empty() => b,
-                    _ => return Self::pick_min_load(workers),
+                    _ => return Self::pick_min_load(workers, self.config.use_reported_load),
                 };
                 let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
-                    return Self::pick_min_load(workers);
+                    return Self::pick_min_load(workers, self.config.use_reported_load);
                 };
                 let Some(rt) = request_tokens_for(&self.tokenizers, ctx.model(), &value) else {
-                    return Self::pick_min_load(workers);
+                    return Self::pick_min_load(workers, self.config.use_reported_load);
                 };
                 fallback_ids = rt.ids;
                 &fallback_ids
@@ -215,7 +237,7 @@ impl Policy for CacheAwareZmqPolicy {
                 model = %ctx.model(),
                 "cache-aware-zmq: block size unknown (no worker page_size yet), falling back to min-load",
             );
-            return Self::pick_min_load(workers);
+            return Self::pick_min_load(workers, self.config.use_reported_load);
         };
         // EAGLE-family workers hash KV blocks over token bigrams; the query
         // hashes must match the worker's stored hashes or the tree lookup
@@ -228,7 +250,7 @@ impl Policy for CacheAwareZmqPolicy {
             compute_block_hashes(tokens, block_size as usize)
         };
         if block_hashes.is_empty() {
-            return Self::pick_min_load(workers);
+            return Self::pick_min_load(workers, self.config.use_reported_load);
         }
         let matched = self.tree.match_prefix(None, &block_hashes);
         let match_rate = matched.matched_blocks as f32 / block_hashes.len() as f32;
@@ -256,7 +278,12 @@ impl Policy for CacheAwareZmqPolicy {
                 cache_threshold = self.config.cache_threshold,
                 "cache-aware-zmq: overlap below threshold, falling back to min-load",
             );
-            return Self::pick_min_load(workers);
+            // Route-history feeding: even on a min-load fallback, record this
+            // prefix against the worker we actually send it to, so the next
+            // request sharing the prefix can match it. (No-op in zmq mode.)
+            let chosen = Self::pick_min_load(workers, self.config.use_reported_load);
+            self.feed_route_history(&chosen, &block_hashes);
+            return chosen;
         }
         // Among workers in the matched set, pick the lowest-load one.
         let matched_urls: std::collections::HashSet<&str> =
@@ -264,7 +291,7 @@ impl Policy for CacheAwareZmqPolicy {
         let best_matched: Option<Arc<Worker>> = workers
             .iter()
             .filter(|w| matched_urls.contains(w.url.as_str()))
-            .min_by_key(|w| w.active_load())
+            .min_by_key(|w| w.effective_load(self.config.use_reported_load))
             .map(Arc::clone);
         // Cache-hit load guard: even when a cache hit wins, the hit worker
         // may be individually backed up while the system as a whole still
@@ -272,7 +299,7 @@ impl Policy for CacheAwareZmqPolicy {
         // Divert to the globally least-loaded worker when the hit worker
         // leads it past both thresholds. OFF by default (rel = INFINITY).
         let best_matched = best_matched.map(|hot| self.apply_hit_load_guard(hot, workers));
-        let chosen = best_matched.or_else(|| Self::pick_min_load(workers));
+        let chosen = best_matched.or_else(|| Self::pick_min_load(workers, self.config.use_reported_load));
         if let Some(w) = &chosen {
             tracing::debug!(
                 model = %ctx.model(),
@@ -281,6 +308,10 @@ impl Policy for CacheAwareZmqPolicy {
                 "cache-aware-zmq: selected worker by cache overlap",
             );
         }
+        // Route-history feeding: record this prefix against the chosen worker
+        // so subsequent shared-prefix requests match it. No-op in zmq mode
+        // (the worker's own ZMQ events own the tree there).
+        self.feed_route_history(&chosen, &block_hashes);
         chosen
     }
 
@@ -309,6 +340,8 @@ mod tests {
             balance_rel_threshold: 1.1,
             hit_load_abs_threshold: 0,
             hit_load_rel_threshold: f32::INFINITY,
+            use_reported_load: false,
+            tree_source: crate::config::CacheTreeSource::Zmq,
         }
     }
 
@@ -355,6 +388,11 @@ mod tests {
             ),
             proxy: crate::config::ProxyConfig::default(),
             active_load: crate::config::ActiveLoadConfig::default(),
+            worker_introspect_key: None,
+            load_poll_interval_secs: None,
+            cache_tree_page_size: None,
+            cache_tree_bigram: false,
+            cache_tree_max_nodes: 1_000_000,
         };
         Arc::new(TokenizerRegistry::load_from_config(&cfg).expect("load tiny tokenizer"))
     }
@@ -426,6 +464,8 @@ mod tests {
                 balance_rel_threshold: 1.1,
                 hit_load_abs_threshold: 0,
                 hit_load_rel_threshold: f32::INFINITY,
+                use_reported_load: false,
+                tree_source: crate::config::CacheTreeSource::Zmq,
             },
             tree,
             registry,
@@ -465,6 +505,8 @@ mod tests {
                 balance_rel_threshold: 1.1,
                 hit_load_abs_threshold: 0,
                 hit_load_rel_threshold: f32::INFINITY,
+                use_reported_load: false,
+                tree_source: crate::config::CacheTreeSource::Zmq,
             },
             tree,
             registry,
@@ -512,6 +554,8 @@ mod tests {
                 balance_rel_threshold: 1.1,
                 hit_load_abs_threshold: 0,
                 hit_load_rel_threshold: f32::INFINITY,
+                use_reported_load: false,
+                tree_source: crate::config::CacheTreeSource::Zmq,
             },
             tree,
             toks,
@@ -565,6 +609,8 @@ mod tests {
                 balance_rel_threshold: 1.1,
                 hit_load_abs_threshold: 0,
                 hit_load_rel_threshold: f32::INFINITY,
+                use_reported_load: false,
+                tree_source: crate::config::CacheTreeSource::Zmq,
             },
             tree,
             toks,
@@ -650,6 +696,8 @@ mod tests {
                     balance_rel_threshold: 1.1,
                     hit_load_abs_threshold: 0,
                     hit_load_rel_threshold: f32::INFINITY,
+                    use_reported_load: false,
+                    tree_source: crate::config::CacheTreeSource::Zmq,
                 },
                 tree,
                 Arc::clone(&registry),
@@ -691,6 +739,8 @@ mod tests {
                     balance_rel_threshold: 1.1,
                     hit_load_abs_threshold: 0,
                     hit_load_rel_threshold: f32::INFINITY,
+                    use_reported_load: false,
+                    tree_source: crate::config::CacheTreeSource::Zmq,
                 },
                 tree,
                 Arc::clone(&registry),
@@ -751,6 +801,8 @@ mod tests {
                 balance_rel_threshold: 1.1,
                 hit_load_abs_threshold: 0,
                 hit_load_rel_threshold: f32::INFINITY,
+                use_reported_load: false,
+                tree_source: crate::config::CacheTreeSource::Zmq,
             },
             tree,
             registry,
@@ -825,6 +877,8 @@ mod tests {
                 balance_rel_threshold: 1.1,
                 hit_load_abs_threshold: 0,
                 hit_load_rel_threshold: f32::INFINITY,
+                use_reported_load: false,
+                tree_source: crate::config::CacheTreeSource::Zmq,
             },
             tree,
             registry,
@@ -865,6 +919,8 @@ mod tests {
                 balance_rel_threshold: 1.1,
                 hit_load_abs_threshold: 0,
                 hit_load_rel_threshold: f32::INFINITY,
+                use_reported_load: false,
+                tree_source: crate::config::CacheTreeSource::Zmq,
             },
             tree,
             registry,
@@ -970,6 +1026,8 @@ mod tests {
                 balance_rel_threshold: 1.1,
                 hit_load_abs_threshold: 0,
                 hit_load_rel_threshold: f32::INFINITY,
+                use_reported_load: false,
+                tree_source: crate::config::CacheTreeSource::Zmq,
             },
             tree,
             registry,
@@ -1007,6 +1065,8 @@ mod tests {
                 balance_rel_threshold: 2.0,
                 hit_load_abs_threshold: 0,
                 hit_load_rel_threshold: f32::INFINITY,
+                use_reported_load: false,
+                tree_source: crate::config::CacheTreeSource::Zmq,
             },
             tree,
             registry,
@@ -1134,6 +1194,8 @@ mod tests {
                 balance_rel_threshold: 1.1,
                 hit_load_abs_threshold: 0,
                 hit_load_rel_threshold: f32::INFINITY,
+                use_reported_load: false,
+                tree_source: crate::config::CacheTreeSource::Zmq,
             },
             tree,
             tokenizer_registry_with_tiny(),
@@ -1219,6 +1281,8 @@ mod tests {
                 balance_rel_threshold: 1.1,
                 hit_load_abs_threshold: 0,
                 hit_load_rel_threshold: f32::INFINITY,
+                use_reported_load: false,
+                tree_source: crate::config::CacheTreeSource::Zmq,
             },
             tree.clone(),
             registry,
@@ -1318,6 +1382,8 @@ mod tests {
                 balance_rel_threshold: 1.1,
                 hit_load_abs_threshold: 0,
                 hit_load_rel_threshold: f32::INFINITY,
+                use_reported_load: false,
+                tree_source: crate::config::CacheTreeSource::Zmq,
             },
             tree,
             registry,
@@ -1367,6 +1433,8 @@ mod tests {
                 balance_rel_threshold: f32::INFINITY,
                 hit_load_abs_threshold,
                 hit_load_rel_threshold,
+                use_reported_load: false,
+                tree_source: crate::config::CacheTreeSource::Zmq,
             },
             tree,
             registry,
@@ -1460,5 +1528,84 @@ mod tests {
         let ctx = SelectionContext::new(&model, None).with_request_tokens(Some(&ids));
         let chosen = policy.select(&workers, &ctx).expect("must pick");
         assert_eq!(chosen.url, "http://w0:30000", "hit already coolest, keep it");
+    }
+
+    /// Route-history mode: the tree starts EMPTY (no ZMQ feed). The first
+    /// request for a prefix has no match → min-load fallback, but the policy
+    /// records the prefix against the chosen worker. A second, identical
+    /// request must then match that same worker via the now-populated tree —
+    /// proving the router-side feeding works without any ZMQ events.
+    #[test]
+    fn route_history_feeds_tree_and_matches_on_repeat() {
+        let tree = Arc::new(HashTree::new());
+        let registry = tokenizer_registry_with_tiny();
+        let text = "hello world hello world hello world";
+        let tok = registry.get("tiny").unwrap();
+        let ids = adapter::encode(&tok, text).unwrap();
+        assert!(!compute_block_hashes(&ids, 4).is_empty());
+
+        let policy = CacheAwareZmqPolicy::new(
+            CacheAwareConfig {
+                cache_threshold: 0.0, // any overlap counts as a hit
+                balance_abs_threshold: usize::MAX, // disable imbalance fast-path
+                balance_rel_threshold: f32::INFINITY,
+                hit_load_abs_threshold: 0,
+                hit_load_rel_threshold: f32::INFINITY, // guard OFF
+                use_reported_load: false,
+                tree_source: crate::config::CacheTreeSource::RouteHistory,
+            },
+            Arc::clone(&tree),
+            registry,
+            oracle_for_tests(4),
+        );
+        let w0 = worker("http://w0:30000", "tiny");
+        let w1 = worker("http://w1:30000", "tiny");
+        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
+        let model = ModelId("tiny".into());
+
+        // Tree empty → first select is a min-load fallback, but it feeds the
+        // tree with this prefix against whichever worker it picked.
+        assert_eq!(tree.node_count(), 0, "tree starts empty (no ZMQ)");
+        let ctx = SelectionContext::new(&model, None).with_request_tokens(Some(&ids));
+        let first = policy.select(&workers, &ctx).expect("must pick");
+        assert!(tree.node_count() > 0, "route-history must have fed the tree");
+
+        // Second identical request: now the tree has this prefix on `first`,
+        // so the cache-overlap path must select the same worker.
+        let ctx2 = SelectionContext::new(&model, None).with_request_tokens(Some(&ids));
+        let second = policy.select(&workers, &ctx2).expect("must pick");
+        assert_eq!(
+            second.url, first.url,
+            "repeat request for the same prefix must match the worker it was fed to",
+        );
+    }
+
+    /// Zmq mode must NOT feed the tree from routing decisions (the worker's
+    /// own KV-event stream owns it). A select against an empty tree leaves it
+    /// empty.
+    #[test]
+    fn zmq_mode_does_not_feed_tree_from_routing() {
+        let tree = Arc::new(HashTree::new());
+        let registry = tokenizer_registry_with_tiny();
+        let text = "hello world hello world hello world";
+        let tok = registry.get("tiny").unwrap();
+        let ids = adapter::encode(&tok, text).unwrap();
+
+        let policy = CacheAwareZmqPolicy::new(
+            cfg_default(), // tree_source = Zmq
+            Arc::clone(&tree),
+            registry,
+            oracle_for_tests(4),
+        );
+        let w0 = worker("http://w0:30000", "tiny");
+        let workers = vec![Arc::clone(&w0)];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None).with_request_tokens(Some(&ids));
+        let _ = policy.select(&workers, &ctx).expect("must pick");
+        assert_eq!(
+            tree.node_count(),
+            0,
+            "zmq mode must not insert routing history into the tree",
+        );
     }
 }

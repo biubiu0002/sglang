@@ -88,6 +88,35 @@ impl WorkerIntrospector {
         Self { client }
     }
 
+    /// Build with the production `/server_info` timeout and an optional
+    /// bearer token applied as a default `Authorization` header on every
+    /// `/server_info` request. Use this when the workers run SGLang with
+    /// `--api-key`: their `/server_info` is key-protected (only `/health*`
+    /// and `/metrics` are exempt), so an unauthenticated introspect gets
+    /// 401, the worker registers with empty model_ids, and
+    /// `cache_aware_zmq` silently degrades to min-load. `None` => no header
+    /// (workers with no `--api-key`), identical to [`default`].
+    ///
+    /// The token is the worker pool's shared SGLang api-key, NOT a
+    /// per-request client credential — introspection happens at startup
+    /// before any client request exists.
+    pub fn with_optional_key(bearer: Option<&str>) -> Self {
+        let mut builder = reqwest::Client::builder().timeout(SERVER_INFO_TIMEOUT);
+        if let Some(token) = bearer {
+            let mut headers = reqwest::header::HeaderMap::new();
+            // A non-parseable token (control chars, etc.) is an operator
+            // misconfiguration; surface it loudly at startup rather than
+            // silently dropping auth and emitting confusing 401s later.
+            let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+                .expect("worker introspect key must be a valid HTTP header value");
+            value.set_sensitive(true);
+            headers.insert(reqwest::header::AUTHORIZATION, value);
+            builder = builder.default_headers(headers);
+        }
+        let client = builder.build().expect("introspector http client builds");
+        Self { client }
+    }
+
     /// Reuse a caller-owned `reqwest::Client`. Useful in tests that want
     /// to assert request shape via a fake HTTP transport, or to share a
     /// connection pool across components.
@@ -621,5 +650,98 @@ mod tests {
         .await;
         let got = fast_introspector().fetch(&url).await;
         assert!(got.disaggregation_role.is_none());
+    }
+
+    /// A worker whose `/server_info` is protected by a bearer key: it
+    /// returns 200 with the expected `Authorization` header, else 401.
+    /// Mirrors SGLang's `--api-key` middleware (which exempts `/health*`
+    /// + `/metrics` but NOT `/server_info`).
+    async fn spawn_key_protected_worker(
+        expected_bearer: &'static str,
+        body: Value,
+    ) -> (String, oneshot::Sender<()>) {
+        use axum::http::{HeaderMap, StatusCode};
+        use axum::response::IntoResponse;
+        let body = Arc::new(body);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new().route(
+            "/server_info",
+            get(move |headers: HeaderMap| {
+                let body = body.clone();
+                async move {
+                    match headers.get(axum::http::header::AUTHORIZATION) {
+                        Some(v) if v == expected_bearer => {
+                            (StatusCode::OK, Json((*body).clone())).into_response()
+                        }
+                        _ => (StatusCode::UNAUTHORIZED, "Unauthorized").into_response(),
+                    }
+                }
+            }),
+        );
+        let (tx, rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = rx.await;
+                })
+                .await;
+        });
+        (format!("http://127.0.0.1:{port}"), tx)
+    }
+
+    /// `with_optional_key(Some(..))` must present the bearer token on the
+    /// `/server_info` request so a key-protected worker answers 200 and
+    /// the kv_events block is parsed. Regression guard for the
+    /// cache_aware_zmq-on-authenticated-workers fix: without the header
+    /// the worker 401s, introspection yields empty `ServerInfo`, and
+    /// cache-aware routing silently degrades to min-load.
+    #[tokio::test]
+    async fn fetch_sends_bearer_key_to_protected_worker() {
+        let (url, _shutdown) = spawn_key_protected_worker(
+            "Bearer secret-pool-key",
+            json!({
+                "served_model_name": "m",
+                "kv_events": {
+                    "publisher": "zmq",
+                    "endpoint_host": "127.0.0.1",
+                    "endpoint_port_base": 5557,
+                    "topic": "",
+                    "block_size": 64,
+                    "dp_size": 1,
+                }
+            }),
+        )
+        .await;
+        let got = WorkerIntrospector::with_optional_key(Some("secret-pool-key"))
+            .fetch(&url)
+            .await;
+        assert_eq!(
+            got.served_model_name.as_deref(),
+            Some("m"),
+            "authenticated introspect must resolve the model name"
+        );
+        assert!(
+            got.event_config.is_some(),
+            "authenticated introspect must parse the kv_events block"
+        );
+    }
+
+    /// `with_optional_key(None)` sends no `Authorization`, so a
+    /// key-protected worker 401s and introspection yields empty
+    /// `ServerInfo` — confirming the header is conditional on the key
+    /// being configured (no accidental default credential).
+    #[tokio::test]
+    async fn fetch_without_key_is_unauthorized_on_protected_worker() {
+        let (url, _shutdown) = spawn_key_protected_worker(
+            "Bearer secret-pool-key",
+            json!({"served_model_name": "m"}),
+        )
+        .await;
+        let got = WorkerIntrospector::with_optional_key(None).fetch(&url).await;
+        assert!(
+            got.served_model_name.is_none() && got.event_config.is_none(),
+            "unauthenticated introspect against a key-protected worker must yield empty ServerInfo"
+        );
     }
 }

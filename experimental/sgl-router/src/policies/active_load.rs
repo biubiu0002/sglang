@@ -473,6 +473,17 @@ pub struct JanitorHandle {
 }
 
 impl JanitorHandle {
+    /// Build a handle from a pre-spawned task + its cancellation token.
+    /// Lets other background loops (e.g. the load poller) reuse the same
+    /// cancel-on-drop / `shutdown()` lifecycle without going through
+    /// [`spawn_sweeper`]'s sync-closure shape.
+    pub fn from_parts(cancel: CancellationToken, join: tokio::task::JoinHandle<()>) -> Self {
+        JanitorHandle {
+            cancel,
+            join: Some(join),
+        }
+    }
+
     pub async fn shutdown(mut self) {
         self.cancel.cancel();
         if let Some(j) = self.join.take() {

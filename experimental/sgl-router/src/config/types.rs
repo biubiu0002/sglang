@@ -16,6 +16,28 @@ pub struct Config {
     pub discovery: DiscoveryBackend,
     pub proxy: ProxyConfig,
     pub active_load: ActiveLoadConfig,
+    /// Optional bearer token the router presents on its OWN requests to
+    /// each worker's `/server_info` (introspection + cache_aware_zmq
+    /// KV-event publisher discovery). `None` => unauthenticated
+    /// introspection (workers with no SGLang `--api-key`). Set it when
+    /// workers are key-protected so `/server_info` returns 200 instead of
+    /// 401 (a 401 silently disables cache-aware routing for that worker).
+    /// Not used for `/v1/*` proxying — that forwards the inbound client's
+    /// `Authorization` verbatim.
+    pub worker_introspect_key: Option<String>,
+    /// When `Some(secs)`, spawn the background load poller at this interval
+    /// (`/get_load` → real `num_waiting_reqs`). `None` => poller disabled,
+    /// `cache_aware_zmq` uses the router-side in-flight count. Set this and
+    /// `into_config` flips `CacheAwareConfig::use_reported_load` on.
+    pub load_poll_interval_secs: Option<u64>,
+    /// Route-history prefix-tree params (only meaningful when
+    /// `model.cache_aware.tree_source == RouteHistory`). `page_size` seeds the
+    /// block-size oracle at startup (no worker introspection in that mode);
+    /// `bigram` mirrors EAGLE/NEXTN hashing; `max_nodes` bounds the tree via
+    /// periodic LRU eviction. In `zmq` mode these are unused.
+    pub cache_tree_page_size: Option<u32>,
+    pub cache_tree_bigram: bool,
+    pub cache_tree_max_nodes: usize,
 }
 
 /// Outbound proxy tuning. Default mirrors SGLang's typical prefill /
@@ -157,6 +179,20 @@ pub struct ModelConfig {
     pub sticky: Option<StickyConfig>,
 }
 
+/// Source of the prefix HashTree's data for `cache_aware_zmq`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum CacheTreeSource {
+    /// Subscribe to each worker's ZMQ KV-event publisher (precise,
+    /// eviction-aware; requires worker ZMQ port reachable from the router).
+    #[default]
+    #[value(name = "zmq")]
+    Zmq,
+    /// Feed the tree from the router's own routing decisions (approximate,
+    /// no worker ZMQ port needed). Block size from `--cache-tree-page-size`.
+    #[value(name = "route_history")]
+    RouteHistory,
+}
+
 /// Per-model cache-aware-ZMQ tuning.
 #[derive(Debug, Clone, Copy)]
 pub struct CacheAwareConfig {
@@ -185,6 +221,24 @@ pub struct CacheAwareConfig {
     /// `f32::INFINITY` = guard OFF (behaviour identical to plain
     /// cache-aware). A finite value arms the guard; must be `>= 1.0`.
     pub hit_load_rel_threshold: f32,
+    /// When true, load comparisons (min-load pick, imbalance fast-path, and
+    /// the hit-load guard) use each worker's REAL load reported by the
+    /// background load poller (`Worker::reported_load`, e.g. summed
+    /// `num_waiting_reqs` from `/get_load`) instead of the router-side
+    /// in-flight counter. Set by `into_config` iff `--load-poll-interval-secs`
+    /// is configured. Default false (use in-flight, original behaviour).
+    pub use_reported_load: bool,
+    /// Where the prefix HashTree gets its data.
+    ///   `Zmq` (default): subscribe to each worker's ZMQ KV-event publisher
+    ///     — precise (real eviction-aware) but needs the worker ZMQ port
+    ///     reachable from the router.
+    ///   `RouteHistory`: the router feeds the tree from its OWN routing
+    ///     decisions (insert each request's block hashes into the chosen
+    ///     worker's subtree, LRU-evict to bound memory). Approximate but
+    ///     needs NO worker ZMQ port — works over NAT/Vast public mappings.
+    ///     The block size comes from `--cache-tree-page-size` (the oracle is
+    ///     seeded at startup) instead of worker introspection.
+    pub tree_source: CacheTreeSource,
 }
 
 impl Default for CacheAwareConfig {
@@ -195,6 +249,8 @@ impl Default for CacheAwareConfig {
             balance_rel_threshold: default_balance_rel(),
             hit_load_abs_threshold: default_hit_load_abs(),
             hit_load_rel_threshold: default_hit_load_rel(),
+            use_reported_load: false,
+            tree_source: CacheTreeSource::Zmq,
         }
     }
 }

@@ -11,7 +11,7 @@ use std::num::NonZeroU32;
 
 use crate::config::{
     default_cb_cool_down, default_proxy_request_timeout_secs, default_stale_request_timeout_secs,
-    resolve_mode, ActiveLoadConfig, CacheAwareConfig, CircuitBreakerConfig, Config,
+    resolve_mode, ActiveLoadConfig, CacheAwareConfig, CacheTreeSource, CircuitBreakerConfig, Config,
     DiscoveryBackend, K8sDiscoveryConfig, LogFormat, ModelConfig, ObservabilityConfig, PolicyKind,
     ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig, StickyConfig,
 };
@@ -79,6 +79,32 @@ pub struct Cli {
     /// guard OFF. Must be `>= 1.0` when set.
     #[arg(long)]
     pub hit_load_rel_threshold: Option<f32>,
+    /// Where the prefix tree gets its data: `zmq` (default; subscribe to
+    /// worker ZMQ KV-events, precise but needs the worker ZMQ port reachable)
+    /// or `route_history` (router feeds the tree from its own routing
+    /// decisions — approximate, but needs NO worker ZMQ port; works over
+    /// NAT/Vast public mappings). Only meaningful with
+    /// `--policy cache_aware_zmq`.
+    #[arg(long, value_enum)]
+    pub cache_tree_source: Option<CacheTreeSource>,
+    /// Block (page) size for route-history prefix hashing. REQUIRED when
+    /// `--cache-tree-source route_history` (no worker introspection seeds it
+    /// in that mode). MUST equal the workers' `--page-size` or the router's
+    /// block hashes never match. Ignored in `zmq` mode (the worker reports
+    /// it via `/server_info`).
+    #[arg(long)]
+    pub cache_tree_page_size: Option<u32>,
+    /// Whether workers use EAGLE-family speculative decoding (bigram block
+    /// hashing). Set in `route_history` mode to mirror the worker's hashing
+    /// (NEXTN/EAGLE => the router must hash over token bigrams). Defaults to
+    /// false. Ignored in `zmq` mode (reported via `/server_info`).
+    #[arg(long)]
+    pub cache_tree_bigram: bool,
+    /// Max prefix-tree node count before LRU eviction kicks in (route-history
+    /// mode only — zmq mode is eviction-driven by the worker). Bounds router
+    /// memory. Default 1_000_000 nodes.
+    #[arg(long)]
+    pub cache_tree_max_nodes: Option<usize>,
 
     // ---- sticky-session policy (only used by `--policy sticky`) ----
     /// Request header carrying the routing key for sticky-session routing.
@@ -136,6 +162,24 @@ pub struct Cli {
     #[arg(long, num_args = 1..)]
     pub decode_selector: Vec<String>,
 
+    // ---- worker introspection auth ----
+    /// Bearer token presented on the router's OWN requests to each
+    /// worker's `/server_info` (worker introspection + cache_aware_zmq
+    /// KV-event publisher discovery). Required when the workers run with
+    /// SGLang `--api-key` and expose `/server_info` behind that key (which
+    /// is the only thing protecting a worker on a bare public IP).
+    ///
+    /// This is distinct from per-request client auth: inbound client
+    /// `Authorization` is still forwarded verbatim to the worker for
+    /// `/v1/*` traffic. Introspection happens at startup before any client
+    /// request exists, so it needs its own credential. When omitted,
+    /// introspection is unauthenticated (correct for workers with no
+    /// `--api-key`); against a key-protected worker the unauthenticated
+    /// `/server_info` returns 401, KV-event discovery is skipped, and
+    /// `cache_aware_zmq` silently degrades to min-load.
+    #[arg(long)]
+    pub worker_introspect_key: Option<String>,
+
     // ---- proxy / active-load ----
     /// Per-request upstream timeout in seconds.
     #[arg(long, default_value_t = default_proxy_request_timeout_secs())]
@@ -144,6 +188,20 @@ pub struct Cli {
     /// reaps it (returns 504 `stale_request_expired`).
     #[arg(long, default_value_t = default_stale_request_timeout_secs())]
     pub stale_request_timeout_secs: u64,
+
+    // ---- real-load polling (cache_aware_zmq load source) ----
+    /// Interval (seconds) at which a background task polls each worker's
+    /// `/get_load` for its REAL queue depth (summed `num_waiting_reqs`),
+    /// stored on the worker and used by `cache_aware_zmq` for min-load /
+    /// imbalance / hit-load-guard decisions INSTEAD OF the router-side
+    /// in-flight counter. The in-flight counter treats a 200k-token request
+    /// and a 2k request identically; real queue depth does not. Omitted =>
+    /// poller disabled, decisions fall back to in-flight count (original
+    /// behaviour). Must be `>= 1` when set. Auth reuses
+    /// `--worker-introspect-key`. Only meaningful with
+    /// `--policy cache_aware_zmq`.
+    #[arg(long)]
+    pub load_poll_interval_secs: Option<u64>,
 
     // ---- observability ----
     /// Default tracing level (overridden by `RUST_LOG`).
@@ -179,12 +237,36 @@ impl Cli {
             || self.balance_abs_threshold.is_some()
             || self.balance_rel_threshold.is_some()
             || self.hit_load_abs_threshold.is_some()
-            || self.hit_load_rel_threshold.is_some();
+            || self.hit_load_rel_threshold.is_some()
+            || self.cache_tree_source.is_some()
+            || self.cache_tree_page_size.is_some()
+            || self.cache_tree_bigram
+            || self.cache_tree_max_nodes.is_some();
         if tuned_cache_aware && self.policy != PolicyKind::CacheAwareZmq {
             return Err(anyhow!(
                 "--cache-threshold / --balance-abs-threshold / --balance-rel-threshold \
                  / --hit-load-abs-threshold / --hit-load-rel-threshold \
-                 require --policy cache_aware_zmq"
+                 / --cache-tree-source / --cache-tree-page-size / --cache-tree-bigram \
+                 / --cache-tree-max-nodes require --policy cache_aware_zmq"
+            ));
+        }
+        // route_history tree source needs an explicit page size: there is no
+        // worker introspection in that mode to seed the block-size oracle, and
+        // a wrong block size makes the router's hashes never match the
+        // workers' — silent cache-routing failure. Require it explicitly.
+        let tree_source = self.cache_tree_source.unwrap_or_default();
+        if tree_source == CacheTreeSource::RouteHistory && self.cache_tree_page_size.is_none() {
+            return Err(anyhow!(
+                "--cache-tree-source route_history requires --cache-tree-page-size \
+                 (must equal the workers' --page-size)"
+            ));
+        }
+        if tree_source == CacheTreeSource::Zmq
+            && (self.cache_tree_page_size.is_some() || self.cache_tree_bigram)
+        {
+            return Err(anyhow!(
+                "--cache-tree-page-size / --cache-tree-bigram only apply to \
+                 --cache-tree-source route_history (zmq mode reads them from /server_info)"
             ));
         }
         // The relative hit-load guard arms the divert logic; a value < 1.0
@@ -266,10 +348,27 @@ impl Cli {
             cool_down_secs: self.cb_cool_down_secs.unwrap_or_else(default_cb_cool_down),
         });
 
-        // Only build a CacheAwareConfig when the operator tuned at least
-        // one knob; otherwise leave it None so the policy uses its own
-        // defaults. Unset knobs fall back to the per-field defaults.
-        let cache_aware = if tuned_cache_aware {
+        // Real-load polling: validate, and decide whether cache_aware_zmq
+        // should consume reported load. The poller only makes sense for the
+        // cache_aware_zmq policy (it feeds that policy's load decisions).
+        if let Some(secs) = self.load_poll_interval_secs {
+            if secs == 0 {
+                return Err(anyhow!("--load-poll-interval-secs must be >= 1"));
+            }
+            if self.policy != PolicyKind::CacheAwareZmq {
+                return Err(anyhow!(
+                    "--load-poll-interval-secs requires --policy cache_aware_zmq \
+                     (it feeds that policy's load decisions)"
+                ));
+            }
+        }
+        let use_reported_load = self.load_poll_interval_secs.is_some();
+
+        // Build a CacheAwareConfig when the operator tuned a knob OR enabled
+        // the load poller (which flips use_reported_load on); otherwise leave
+        // it None so the policy uses its own defaults. Unset knobs fall back
+        // to the per-field defaults.
+        let cache_aware = if tuned_cache_aware || use_reported_load {
             let d = CacheAwareConfig::default();
             Some(CacheAwareConfig {
                 cache_threshold: self.cache_threshold.unwrap_or(d.cache_threshold),
@@ -285,6 +384,8 @@ impl Cli {
                 hit_load_rel_threshold: self
                     .hit_load_rel_threshold
                     .unwrap_or(d.hit_load_rel_threshold),
+                use_reported_load,
+                tree_source,
             })
         } else {
             None
@@ -316,6 +417,11 @@ impl Cli {
             active_load: ActiveLoadConfig {
                 stale_request_timeout_secs: self.stale_request_timeout_secs,
             },
+            worker_introspect_key: self.worker_introspect_key,
+            load_poll_interval_secs: self.load_poll_interval_secs,
+            cache_tree_page_size: self.cache_tree_page_size,
+            cache_tree_bigram: self.cache_tree_bigram,
+            cache_tree_max_nodes: self.cache_tree_max_nodes.unwrap_or(1_000_000),
         };
         config.validate()?;
         Ok(config)

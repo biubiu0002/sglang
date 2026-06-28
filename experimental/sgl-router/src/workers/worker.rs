@@ -3,7 +3,7 @@
 
 use crate::discovery::{ModelId, WorkerId, WorkerMode};
 use crate::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// Parse a host from a worker URL. Matches SMG's `worker_builder.rs`
@@ -104,7 +104,26 @@ pub struct Worker {
     /// of the candidate set before policy selection. Carried from
     /// `WorkerSpec`; see [`crate::discovery::WorkerSpec::min_priority`].
     min_priority: Option<i64>,
+    /// Worker-reported real load (from the background load poller hitting
+    /// the worker's `/get_load`). Decoupled from `active_requests`
+    /// (router-side in-flight count), which is a poor signal for a mixed
+    /// short/long workload. Sentinel values:
+    ///   `REPORTED_LOAD_UNSET` (-1): no real data — poller disabled, or not
+    ///     polled yet → consumers fall back to `active_load()`.
+    ///   `REPORTED_LOAD_FAILED` (-2): last poll failed (timeout/401/parse)
+    ///     → consumers treat this worker as HIGH load (don't spill onto it).
+    ///   `>= 0`: real load signal (e.g. summed `num_waiting_reqs`).
+    /// `Arc<AtomicI64>` so the poller updates it lock-free without a
+    /// registry write-lock.
+    reported_load: Arc<AtomicI64>,
 }
+
+/// `reported_load` sentinel: no real data (poller off / not yet polled).
+/// Consumers fall back to the router-side in-flight `active_load()`.
+pub const REPORTED_LOAD_UNSET: i64 = -1;
+/// `reported_load` sentinel: last poll failed. Consumers treat the worker
+/// as HIGH load so spill-to-idle never routes onto a possibly-dead worker.
+pub const REPORTED_LOAD_FAILED: i64 = -2;
 
 impl Worker {
     pub fn new(spec: crate::discovery::WorkerSpec) -> Self {
@@ -132,6 +151,7 @@ impl Worker {
             bootstrap_host,
             bootstrap_port: spec.bootstrap_port,
             min_priority: spec.min_priority,
+            reported_load: Arc::new(AtomicI64::new(REPORTED_LOAD_UNSET)),
         }
     }
 
@@ -172,6 +192,37 @@ impl Worker {
 
     pub fn active_load(&self) -> usize {
         self.active_requests.load(Ordering::Relaxed)
+    }
+
+    /// Worker-reported real load, or a sentinel (`REPORTED_LOAD_UNSET` /
+    /// `REPORTED_LOAD_FAILED`). Updated by the background load poller.
+    pub fn reported_load(&self) -> i64 {
+        self.reported_load.load(Ordering::Relaxed)
+    }
+
+    /// Set the worker-reported real load (called by the load poller). Pass
+    /// a sentinel (`REPORTED_LOAD_FAILED`) on poll failure.
+    pub fn set_reported_load(&self, v: i64) {
+        self.reported_load.store(v, Ordering::Relaxed);
+    }
+
+    /// Effective load for routing decisions, honoring the configured load
+    /// source. When `use_reported` is false (poller disabled), always the
+    /// router-side in-flight count. When true: the real reported load if
+    /// available (`>= 0`); on poll failure (`REPORTED_LOAD_FAILED`) a very
+    /// high value so spill-to-idle never targets a possibly-dead worker;
+    /// before the first successful poll (`REPORTED_LOAD_UNSET`) fall back to
+    /// in-flight so a just-started router still routes sanely.
+    pub fn effective_load(&self, use_reported: bool) -> usize {
+        if !use_reported {
+            return self.active_load();
+        }
+        match self.reported_load() {
+            REPORTED_LOAD_FAILED => usize::MAX / 2, // treat unreachable as very busy
+            REPORTED_LOAD_UNSET => self.active_load(), // not polled yet → in-flight
+            v if v >= 0 => v as usize,
+            _ => self.active_load(), // any other negative: defensive fallback
+        }
     }
 
     /// Returns a RAII guard that increments `active_requests` now and
@@ -216,6 +267,39 @@ mod tests {
         assert_eq!(w.active_load(), 1);
         drop(g2);
         assert_eq!(w.active_load(), 0);
+    }
+
+    #[test]
+    fn effective_load_honors_source_and_sentinels() {
+        let w = Worker::new(WorkerSpec {
+            id: WorkerId("w".into()),
+            url: "http://x".into(),
+            mode: WorkerMode::Plain,
+            model_ids: vec![],
+            bootstrap_port: None,
+            min_priority: None,
+        });
+        // Seed router-side in-flight = 2.
+        let _g1 = w.load_guard();
+        let _g2 = w.load_guard();
+        assert_eq!(w.active_load(), 2);
+
+        // Poller disabled: always the in-flight count, ignoring reported_load.
+        w.set_reported_load(99);
+        assert_eq!(w.effective_load(false), 2);
+
+        // Poller enabled, real value present: use it.
+        w.set_reported_load(7);
+        assert_eq!(w.effective_load(true), 7);
+
+        // Poller enabled, UNSET sentinel: fall back to in-flight.
+        w.set_reported_load(REPORTED_LOAD_UNSET);
+        assert_eq!(w.effective_load(true), 2);
+
+        // Poller enabled, FAILED sentinel: treat as very-high load so
+        // spill-to-idle never targets a possibly-dead worker.
+        w.set_reported_load(REPORTED_LOAD_FAILED);
+        assert_eq!(w.effective_load(true), usize::MAX / 2);
     }
 
     #[test]

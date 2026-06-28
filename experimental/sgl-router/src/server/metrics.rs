@@ -271,6 +271,12 @@ pub struct WorkerSnapshot {
     pub cb_state: u8,
     /// In-flight request count for this worker (`Worker::active_load`).
     pub inflight: i64,
+    /// Worker-reported real load (`Worker::reported_load`): summed
+    /// `num_waiting_reqs` from `/get_load` when the load poller is enabled,
+    /// or a sentinel (`-1` = unset/not polled, `-2` = last poll failed).
+    /// Exposed so operators can verify the real-load signal that drives
+    /// cache_aware_zmq's spill decisions.
+    pub reported_load: i64,
 }
 
 #[derive(Debug, Hash, Eq, PartialEq, Clone)]
@@ -702,6 +708,19 @@ impl MetricsRegistry {
             ));
         }
 
+        // worker_reported_load (real queue depth from /get_load; -1 unset, -2 poll failed)
+        out.push_str(
+            "# HELP sgl_router_worker_reported_load Worker-reported real load (summed num_waiting_reqs from /get_load) when the load poller is on; -1 = unset/not polled, -2 = last poll failed (treated as high load).\n",
+        );
+        out.push_str("# TYPE sgl_router_worker_reported_load gauge\n");
+        for w in &sorted {
+            out.push_str(&format!(
+                "sgl_router_worker_reported_load{{worker_url=\"{}\"}} {}\n",
+                escape_label(&w.worker_url),
+                w.reported_load,
+            ));
+        }
+
         // stale_requests_total
         out.push_str(
             "# HELP sgl_router_stale_requests_total Total stale-request cancellations fired by the janitor.\n",
@@ -1026,6 +1045,7 @@ mod tests {
                 healthy: true,
                 cb_state: 0,
                 inflight: 5,
+                reported_load: 5,
             },
             WorkerSnapshot {
                 worker_url: "http://d0:30000".into(),
@@ -1033,6 +1053,7 @@ mod tests {
                 healthy: false,
                 cb_state: 1,
                 inflight: 0,
+                reported_load: -1,
             },
         ];
         let out = reg.render_with_workers(&workers);

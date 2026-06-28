@@ -81,6 +81,11 @@ async fn zmq_indexer_routes_to_publishing_worker_e2e() {
         ),
         proxy: ProxyConfig::default(),
         active_load: ActiveLoadConfig::default(),
+        worker_introspect_key: None,
+        load_poll_interval_secs: None,
+        cache_tree_page_size: None,
+        cache_tree_bigram: false,
+        cache_tree_max_nodes: 1_000_000,
     };
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
 
@@ -112,6 +117,8 @@ async fn zmq_indexer_routes_to_publishing_worker_e2e() {
             balance_rel_threshold: 1.1,
             hit_load_abs_threshold: 0,
             hit_load_rel_threshold: f32::INFINITY,
+            use_reported_load: false,
+            tree_source: sgl_router::config::CacheTreeSource::Zmq,
         },
         kv_index.tree(),
         Arc::clone(&tokenizers),

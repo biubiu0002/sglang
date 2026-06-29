@@ -65,18 +65,31 @@ impl Drop for LoadGuard {
 #[must_use = "PendingLoadGuard must be held for the request's lifetime; dropping it immediately clears the local reservation"]
 pub struct PendingLoadGuard {
     counter: Arc<AtomicUsize>,
+    token_counter: Arc<AtomicUsize>,
+    tokens: usize,
 }
 
 impl PendingLoadGuard {
-    pub(crate) fn new(counter: Arc<AtomicUsize>) -> Self {
+    pub(crate) fn with_tokens(
+        counter: Arc<AtomicUsize>,
+        token_counter: Arc<AtomicUsize>,
+        tokens: usize,
+    ) -> Self {
+        let tokens = tokens.max(1);
         counter.fetch_add(1, Ordering::Relaxed);
-        Self { counter }
+        token_counter.fetch_add(tokens, Ordering::Relaxed);
+        Self {
+            counter,
+            token_counter,
+            tokens,
+        }
     }
 }
 
 impl Drop for PendingLoadGuard {
     fn drop(&mut self) {
         self.counter.fetch_sub(1, Ordering::Relaxed);
+        self.token_counter.fetch_sub(self.tokens, Ordering::Relaxed);
     }
 }
 
@@ -119,6 +132,10 @@ pub struct Worker {
     /// pending count so concurrent selections inside the poll interval see
     /// each other immediately.
     pending_requests: Arc<AtomicUsize>,
+    /// Token-weighted form of `pending_requests`. Route handlers reserve the
+    /// prompt-token count at selection time so a long prefill immediately
+    /// contributes more local TTFT pressure than a short request.
+    pending_tokens: Arc<AtomicUsize>,
     /// Hostname parsed from `url` at construction time and cached.
     /// Used as the `bootstrap_host` field on PD-disagg requests so the
     /// prefill engine can match incoming KV-transfer requests from
@@ -181,6 +198,7 @@ impl Worker {
             breaker,
             active_requests: Arc::new(AtomicUsize::new(0)),
             pending_requests: Arc::new(AtomicUsize::new(0)),
+            pending_tokens: Arc::new(AtomicUsize::new(0)),
             bootstrap_host,
             bootstrap_port: spec.bootstrap_port,
             min_priority: spec.min_priority,
@@ -256,6 +274,10 @@ impl Worker {
         self.pending_requests.load(Ordering::Relaxed)
     }
 
+    pub fn pending_token_load(&self) -> usize {
+        self.pending_tokens.load(Ordering::Relaxed)
+    }
+
     /// Worker-reported real load, or a sentinel (`REPORTED_LOAD_UNSET` /
     /// `REPORTED_LOAD_FAILED`). Updated by the background load poller.
     pub fn reported_load(&self) -> i64 {
@@ -289,6 +311,23 @@ impl Worker {
         }
     }
 
+    /// TTFT-oriented load for routing decisions. This keeps the same remote
+    /// load semantics as `effective_load(use_reported)`, but replaces the
+    /// request-count local pending term with token-weighted pressure units.
+    pub fn effective_ttft_load(&self, use_reported: bool, token_scale: usize) -> usize {
+        let scale = token_scale.max(1);
+        let token_units = self.pending_token_load().saturating_add(scale - 1) / scale;
+        if !use_reported {
+            return self.active_load().saturating_add(token_units);
+        }
+        match self.reported_load() {
+            REPORTED_LOAD_FAILED => usize::MAX / 2,
+            REPORTED_LOAD_UNSET => self.active_load().saturating_add(token_units),
+            v if v >= 0 => (v as usize).saturating_add(token_units),
+            _ => self.active_load().saturating_add(token_units),
+        }
+    }
+
     /// Returns a RAII guard that increments `active_requests` now and
     /// decrements when the guard is dropped.
     pub fn load_guard(&self) -> LoadGuard {
@@ -298,7 +337,17 @@ impl Worker {
     /// Returns a RAII guard that increments router-local pending load now and
     /// decrements when the guard is dropped.
     pub fn pending_guard(&self) -> PendingLoadGuard {
-        PendingLoadGuard::new(self.pending_requests.clone())
+        self.pending_guard_with_tokens(1)
+    }
+
+    /// Returns a RAII guard that reserves one local pending request and the
+    /// routed prompt-token count for TTFT-first pressure decisions.
+    pub fn pending_guard_with_tokens(&self, tokens: usize) -> PendingLoadGuard {
+        PendingLoadGuard::with_tokens(
+            self.pending_requests.clone(),
+            self.pending_tokens.clone(),
+            tokens,
+        )
     }
 }
 
@@ -310,6 +359,7 @@ impl std::fmt::Debug for Worker {
             .field("mode", &self.mode())
             .field("active_load", &self.active_load())
             .field("pending_load", &self.pending_load())
+            .field("pending_token_load", &self.pending_token_load())
             .finish()
     }
 }
@@ -385,6 +435,38 @@ mod tests {
         // spill-to-idle never targets a possibly-dead worker.
         w.set_reported_load(REPORTED_LOAD_FAILED);
         assert_eq!(w.effective_load(true), usize::MAX / 2);
+    }
+
+    #[test]
+    fn effective_ttft_load_uses_token_weighted_pending_pressure() {
+        let w = Worker::new(WorkerSpec {
+            id: WorkerId("w".into()),
+            url: "http://x".into(),
+            mode: WorkerMode::Plain,
+            model_ids: vec![],
+            bootstrap_port: None,
+            min_priority: None,
+            bearer_token: None,
+        });
+
+        w.set_reported_load(2);
+        let pending = w.pending_guard_with_tokens(130);
+        assert_eq!(w.pending_load(), 1);
+        assert_eq!(w.pending_token_load(), 130);
+        assert_eq!(
+            w.effective_load(true),
+            3,
+            "legacy load still counts one local pending request"
+        );
+        assert_eq!(
+            w.effective_ttft_load(true, 64),
+            5,
+            "TTFT load counts ceil(130 / 64) = 3 local token units plus reported load 2"
+        );
+        drop(pending);
+        assert_eq!(w.pending_load(), 0);
+        assert_eq!(w.pending_token_load(), 0);
+        assert_eq!(w.effective_ttft_load(true, 64), 2);
     }
 
     #[test]

@@ -122,6 +122,7 @@ async fn zmq_indexer_routes_to_publishing_worker_e2e() {
             hit_load_rel_threshold: f32::INFINITY,
             use_reported_load: false,
             tree_source: sgl_router::config::CacheTreeSource::Zmq,
+            ..CacheAwareConfig::default()
         },
         kv_index.tree(),
         Arc::clone(&tokenizers),

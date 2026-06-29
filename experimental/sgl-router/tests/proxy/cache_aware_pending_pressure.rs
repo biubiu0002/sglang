@@ -65,8 +65,23 @@ fn config() -> Config {
     }
 }
 
+fn ttft_first_config() -> Config {
+    let mut cfg = config();
+    cfg.model.cache_aware = Some(CacheAwareConfig {
+        use_reported_load: true,
+        ttft_first_routing: true,
+        ttft_token_scale: 4,
+        ttft_cache_score_margin: 0,
+        ..CacheAwareConfig::default()
+    });
+    cfg
+}
+
 fn build_ctx(urls: [&str; 2]) -> Arc<AppContext> {
-    let cfg = config();
+    build_ctx_with_config(urls, config())
+}
+
+fn build_ctx_with_config(urls: [&str; 2], cfg: Config) -> Arc<AppContext> {
     let tokenizers = Arc::new(TokenizerRegistry::default());
     let registry = Arc::new(WorkerRegistry::default());
     for (idx, url) in urls.iter().enumerate() {
@@ -111,6 +126,11 @@ async fn send(app: axum::Router, body: Value) -> StatusCode {
     app.oneshot(req).await.unwrap().status()
 }
 
+async fn send_after(app: axum::Router, body: Value, delay: Duration) -> StatusCode {
+    tokio::time::sleep(delay).await;
+    send(app, body).await
+}
+
 fn captured(mock: &MockWorker) -> bool {
     mock.captured.lock().unwrap().last_body.is_some()
 }
@@ -133,5 +153,35 @@ async fn concurrent_reported_load_burst_uses_local_pending_pressure() {
     assert!(
         captured(&a) && captured(&b),
         "two concurrent requests with equal remote load should be split by local pending pressure",
+    );
+}
+
+#[tokio::test]
+async fn ttft_first_burst_uses_token_weighted_local_pending_pressure() {
+    let a = MockWorker::start_hanging(Duration::from_millis(250)).await;
+    let b = MockWorker::start_hanging(Duration::from_millis(250)).await;
+    let ctx = build_ctx_with_config([&a.url, &b.url], ttft_first_config());
+    let app = build_router(ctx);
+
+    let long_prompt = "long prompt ".repeat(128);
+    let long_body = json!({
+        "model": MODEL,
+        "messages": [{"role": "user", "content": long_prompt}],
+    });
+    let short_body = json!({
+        "model": MODEL,
+        "messages": [{"role": "user", "content": "short"}],
+    });
+
+    let (s1, s2) = tokio::join!(
+        send(app.clone(), long_body),
+        send_after(app, short_body, Duration::from_millis(25))
+    );
+
+    assert_eq!(s1, StatusCode::OK);
+    assert_eq!(s2, StatusCode::OK);
+    assert!(
+        captured(&a) && captured(&b),
+        "TTFT-first routing should see the long prompt's token-weighted local pending pressure and spill the next request",
     );
 }

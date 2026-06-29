@@ -628,7 +628,11 @@ async fn messages_inner(
                 model: model_str.clone(),
             }
         })?;
-        let pending_guard = worker.pending_guard();
+        let pending_tokens = request_tokens
+            .as_ref()
+            .map(|t| t.ids.len().max(1))
+            .unwrap_or(1);
+        let pending_guard = worker.pending_guard_with_tokens(pending_tokens);
         (worker, pending_guard)
     };
     let worker_headers = worker

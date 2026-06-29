@@ -106,6 +106,20 @@ pub struct Cli {
     /// memory. Default 1_000_000 nodes.
     #[arg(long)]
     pub cache_tree_max_nodes: Option<usize>,
+    /// Enable TTFT-first cache-aware routing. Selection ranks workers by
+    /// predicted first-token pressure and uses prefix cache only inside the
+    /// configured score band. Only meaningful with `--policy cache_aware_zmq`.
+    #[arg(long)]
+    pub ttft_first_routing: bool,
+    /// Prompt-token count that maps to one local TTFT pressure unit for
+    /// token-weighted pending reservations. Must be greater than zero.
+    #[arg(long)]
+    pub ttft_token_scale: Option<usize>,
+    /// Additive score band where cache affinity may win in TTFT-first mode.
+    /// `0` means cache can win only among workers tied for best predicted
+    /// first-token pressure.
+    #[arg(long)]
+    pub ttft_cache_score_margin: Option<usize>,
 
     // ---- sticky-session policy (only used by `--policy sticky`) ----
     /// Request header carrying the routing key for sticky-session routing.
@@ -268,14 +282,23 @@ impl Cli {
             || self.cache_tree_source.is_some()
             || self.cache_tree_page_size.is_some()
             || self.cache_tree_bigram
-            || self.cache_tree_max_nodes.is_some();
+            || self.cache_tree_max_nodes.is_some()
+            || self.ttft_first_routing
+            || self.ttft_token_scale.is_some()
+            || self.ttft_cache_score_margin.is_some();
         if tuned_cache_aware && self.policy != PolicyKind::CacheAwareZmq {
             return Err(anyhow!(
                 "--cache-threshold / --balance-abs-threshold / --balance-rel-threshold \
                  / --hit-load-abs-threshold / --hit-load-rel-threshold \
                  / --cache-tree-source / --cache-tree-page-size / --cache-tree-bigram \
-                 / --cache-tree-max-nodes require --policy cache_aware_zmq"
+                 / --cache-tree-max-nodes / --ttft-first-routing / --ttft-token-scale \
+                 / --ttft-cache-score-margin require --policy cache_aware_zmq"
             ));
+        }
+        if let Some(scale) = self.ttft_token_scale {
+            if scale == 0 {
+                return Err(anyhow!("--ttft-token-scale must be greater than 0"));
+            }
         }
         // route_history tree source needs an explicit page size: there is no
         // worker introspection in that mode to seed the block-size oracle, and
@@ -413,6 +436,11 @@ impl Cli {
                     .unwrap_or(d.hit_load_rel_threshold),
                 use_reported_load,
                 tree_source,
+                ttft_first_routing: self.ttft_first_routing,
+                ttft_token_scale: self.ttft_token_scale.unwrap_or(d.ttft_token_scale),
+                ttft_cache_score_margin: self
+                    .ttft_cache_score_margin
+                    .unwrap_or(d.ttft_cache_score_margin),
             })
         } else {
             None
@@ -1093,6 +1121,60 @@ mod tests {
         let ca = c.model.cache_aware.expect("cache_aware set");
         assert!(ca.hit_load_rel_threshold.is_infinite());
     }
+
+    #[test]
+    fn ttft_first_flags_build_cache_aware_config() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "cache_aware_zmq",
+            "--ttft-first-routing",
+            "--ttft-token-scale",
+            "128",
+            "--ttft-cache-score-margin",
+            "2",
+        ]))
+        .unwrap();
+        let ca = c.model.cache_aware.expect("cache_aware set");
+        assert!(ca.ttft_first_routing);
+        assert_eq!(ca.ttft_token_scale, 128);
+        assert_eq!(ca.ttft_cache_score_margin, 2);
+    }
+
+    #[test]
+    fn rejects_ttft_first_flag_without_cache_aware_policy() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--ttft-first-routing",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("require --policy cache_aware_zmq"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_zero_ttft_token_scale() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--policy",
+            "cache_aware_zmq",
+            "--ttft-token-scale",
+            "0",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("--ttft-token-scale must be greater than 0"),
+            "got: {err}"
+        );
+    }
+
     #[test]
     fn log_format_parses_json() {
         let c = into_config_owned(with_model(&[

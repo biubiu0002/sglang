@@ -249,6 +249,19 @@ pub struct CacheAwareConfig {
     ///     The block size comes from `--cache-tree-page-size` (the oracle is
     ///     seeded at startup) instead of worker introspection.
     pub tree_source: CacheTreeSource,
+    /// Opt-in TTFT-first routing mode. When false, cache-aware selection keeps
+    /// its existing cache-first semantics. When true, selection scores workers
+    /// by predicted first-token pressure and uses cache affinity only inside
+    /// the configured score band.
+    pub ttft_first_routing: bool,
+    /// Number of locally reserved prompt tokens that count as one TTFT
+    /// pressure unit. The default matches the common SGLang page size so
+    /// token-weighted pending load is comparable with uncached block count.
+    pub ttft_token_scale: usize,
+    /// Additive score band in TTFT-first mode. Cache affinity may pick a
+    /// worker whose predicted score is at most this many units above the best
+    /// score; `0` means cache only wins when it is part of the best score.
+    pub ttft_cache_score_margin: usize,
 }
 
 impl Default for CacheAwareConfig {
@@ -261,6 +274,9 @@ impl Default for CacheAwareConfig {
             hit_load_rel_threshold: default_hit_load_rel(),
             use_reported_load: false,
             tree_source: CacheTreeSource::Zmq,
+            ttft_first_routing: false,
+            ttft_token_scale: default_ttft_token_scale(),
+            ttft_cache_score_margin: default_ttft_cache_score_margin(),
         }
     }
 }
@@ -279,6 +295,12 @@ fn default_hit_load_abs() -> usize {
 }
 fn default_hit_load_rel() -> f32 {
     f32::INFINITY
+}
+fn default_ttft_token_scale() -> usize {
+    64
+}
+fn default_ttft_cache_score_margin() -> usize {
+    0
 }
 
 /// Default routing-key header for the sticky policy. The `x-sgl-` prefix

@@ -125,6 +125,7 @@ mod tests {
             discovery: crate::config::DiscoveryBackend::StaticUrls(
                 crate::config::StaticUrlsDiscoveryConfig {
                     urls: vec!["http://placeholder:0".into()],
+                    bearer_keys: Vec::new(),
                 },
             ),
             proxy: crate::config::ProxyConfig::default(),
@@ -134,6 +135,7 @@ mod tests {
             cache_tree_page_size: None,
             cache_tree_bigram: false,
             cache_tree_max_nodes: 1_000_000,
+            alias_fallback: None,
         };
         let registry = crate::tokenizer::TokenizerRegistry::load_from_config(&cfg).unwrap();
         let proxy = Arc::new(

@@ -119,6 +119,7 @@ mod tests {
                     model_ids: vec![ModelId("test".into())],
                     bootstrap_port: None,
                     min_priority: None,
+                    bearer_token: None,
                 })
                 .expect("test worker accepted");
         }

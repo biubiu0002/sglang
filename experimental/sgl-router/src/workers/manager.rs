@@ -405,7 +405,13 @@ async fn register_one(
         .fetch_with_bearer(&worker_url, spec.bearer_token.as_deref())
         .await;
     if let Some(name) = info.served_model_name {
-        spec.model_ids = vec![ModelId(name)];
+        let mut model_ids = vec![ModelId(name)];
+        if let Some(public_model_id) = cfg.as_ref().map(|cfg| ModelId(cfg.model.id.clone())) {
+            if !model_ids.contains(&public_model_id) {
+                model_ids.push(public_model_id);
+            }
+        }
+        spec.model_ids = model_ids;
     }
     // Trust `/server_info` over the discovery backend when the worker
     // self-disclosed its PD role: the server's own ServerArgs is the
@@ -601,6 +607,56 @@ mod tests {
         })
         .await;
         assert!(registered.is_ok(), "manager did not resolve model id");
+
+        drop(tx);
+        let _ = manager_handle.await;
+    }
+
+    #[tokio::test]
+    async fn manager_registers_config_model_alias_alongside_server_info_name() {
+        let (worker_url, _shutdown) =
+            spawn_fake_server_info_worker(json!({"served_model_name": "internal-model"})).await;
+
+        let registry = Arc::new(WorkerRegistry::default());
+        let (tx, rx) = mpsc::channel::<DiscoveryEvent>(8);
+        let cfg = Arc::new(cfg_with_model_cb("public-model", 3, 30));
+        let manager_handle = tokio::spawn(run_with_introspector(
+            rx,
+            registry.clone(),
+            Some(cfg),
+            None,
+            None,
+            fast_introspector(),
+        ));
+
+        let spec = WorkerSpec {
+            id: WorkerId("w-1".into()),
+            url: worker_url,
+            mode: WorkerMode::Plain,
+            model_ids: Vec::new(),
+            bootstrap_port: None,
+            min_priority: None,
+            bearer_token: None,
+        };
+        tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
+
+        let registered = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let internal = registry.workers_for(&ModelId("internal-model".into()));
+                let public = registry.workers_for(&ModelId("public-model".into()));
+                if internal.iter().any(|w| w.id == spec.id)
+                    && public.iter().any(|w| w.id == spec.id)
+                {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            registered.is_ok(),
+            "manager did not register worker under both internal and public model ids"
+        );
 
         drop(tx);
         let _ = manager_handle.await;

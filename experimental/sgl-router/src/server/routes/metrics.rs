@@ -140,6 +140,7 @@ mod tests {
                 model_ids: vec![ModelId("m".into())],
                 bootstrap_port: None,
                 min_priority: None,
+                bearer_token: None,
             })
             .unwrap();
         let app = crate::server::app::build_router(ctx.clone());

@@ -436,6 +436,7 @@ mod tests {
             model_ids: vec![ModelId("m".into())],
             bootstrap_port: None,
             min_priority,
+            bearer_token: None,
         }))
     }
 

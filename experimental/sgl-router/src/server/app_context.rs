@@ -11,6 +11,7 @@ use crate::tokenizer::TokenizerRegistry;
 use crate::workers::WorkerRegistry;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use tokio::sync::Mutex;
 
 #[derive(Debug)]
 pub struct AppContext {
@@ -30,6 +31,11 @@ pub struct AppContext {
     /// (active_load gauge + stale_requests_total), and PD resolver
     /// (decode_affinity_total).
     pub metrics: Arc<MetricsRegistry>,
+    /// Serializes policy selection with router-local pending reservation.
+    /// Without this small critical section, concurrent requests can all score
+    /// the same stale `/get_load` snapshot before any of them increments the
+    /// local pending counter.
+    pub selection_lock: Mutex<()>,
     ready: AtomicBool,
 }
 
@@ -82,6 +88,7 @@ impl AppContext {
             policies,
             active_load,
             metrics,
+            selection_lock: Mutex::new(()),
             ready: AtomicBool::new(false),
         }
     }
@@ -132,6 +139,7 @@ impl AppContext {
             policies: Arc::new(PolicyRegistry::default()),
             active_load: ActiveLoadRegistry::with_defaults(),
             metrics: MetricsRegistry::new(),
+            selection_lock: Mutex::new(()),
             ready: AtomicBool::new(false),
         }
     }

@@ -224,12 +224,16 @@ pub async fn chat_completions(
         .filter(|s| !s.is_empty());
     let selection_ctx = SelectionContext::with_routing_key(&model_id, Some(&body), routing_key)
         .with_request_tokens(request_tokens.as_ref().map(|t| t.ids.as_slice()));
-    let worker =
-        policy
-            .select(&workers, &selection_ctx)
-            .ok_or_else(|| ApiError::PolicySelectionFailed {
+    let (worker, pending_guard) = {
+        let _selection_guard = ctx.selection_lock.lock().await;
+        let worker = policy.select(&workers, &selection_ctx).ok_or_else(|| {
+            ApiError::PolicySelectionFailed {
                 model: model_str.clone(),
-            })?;
+            }
+        })?;
+        let pending_guard = worker.pending_guard();
+        (worker, pending_guard)
+    };
 
     // PD-mode decoder affinity. When the selected prefill worker is
     // part of a PD-disagg deployment, also resolve the matching decode
@@ -290,18 +294,12 @@ pub async fn chat_completions(
     }
     let headers = request_headers;
 
-    // Per-worker `active_requests` guard. The `ActiveLoadGuard` below
-    // sits beside this one: both track in-flight load, but the
-    // ActiveLoadGuard entry is per-request (with timeout-based janitor)
-    // while the worker-scoped counter is what the cache-aware policy
-    // reads. Both must drop at the same time — when the response stream
-    // ends, the client disconnects, or the handler returns an error. In
-    // PD mode the pair moves into the spawned prefill task so prefill
-    // load is tracked for the full duration of the KV transfer; in plain
-    // mode the pair stays in this handler. Decode-load contribution is
-    // 0 here: the active-load registry's decode axis is reserved for a
-    // future decode-side scheduler — current decode selection is
-    // host-affinity only.
+    // Per-worker guards. `pending_guard` was created inside the selection
+    // critical section, so the next concurrent selection sees this dispatch
+    // immediately even when `/get_load` has not polled it yet. The
+    // `LoadGuard` below tracks request lifetime in the existing active-load
+    // counter, and `ActiveLoadGuard` tracks token-weighted stale-request
+    // state.
     let guard = worker.load_guard();
     // Use the exact token count from the ingress tokenization when available;
     // fall back to the byte-count heuristic for load-only policies that don't
@@ -445,7 +443,7 @@ pub async fn chat_completions(
         let prefill_headers = headers.clone();
         let prefill_body = outgoing_body.clone();
         let prefill_proxy = Arc::clone(&ctx.proxy);
-        let prefill_holds: (LoadGuard, _) = (guard, active_guard);
+        let prefill_holds: (LoadGuard, _, _) = (guard, active_guard, pending_guard);
         tokio::spawn(async move {
             // The tuple binding extends both guards' lifetime to the
             // end of this async block, which lasts until the prefill
@@ -520,7 +518,7 @@ pub async fn chat_completions(
         // the body completes — see the matching comment in the
         // non-streaming arm.
         let stream_guards: Box<dyn Send + 'static> =
-            Box::new((guard, active_guard, make_duration_guard()));
+            Box::new((guard, active_guard, pending_guard, make_duration_guard()));
         let fetch = ctx.proxy.forward_streaming_to(
             &worker.url,
             &worker.breaker,
@@ -548,7 +546,7 @@ pub async fn chat_completions(
         // lifetime to the end of the function — the `forward_json_to`
         // future does not need them (it does not return until the
         // body is buffered).
-        let _holds: (LoadGuard, _) = (guard, active_guard);
+        let _holds: (LoadGuard, _, _) = (guard, active_guard, pending_guard);
         let fetch = ctx.proxy.forward_json_to(
             &worker.url,
             &worker.breaker,

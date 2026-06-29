@@ -55,6 +55,29 @@ impl Drop for LoadGuard {
     }
 }
 
+/// RAII guard for router-local dispatch reservations. Unlike
+/// `active_requests`, this counter is used only to bridge the gap between a
+/// router-side selection decision and the next worker `/get_load` poll. It is
+/// part of `effective_load(use_reported = true)` so bursty requests do not all
+/// route on the same stale remote snapshot.
+#[must_use = "PendingLoadGuard must be held for the request's lifetime; dropping it immediately clears the local reservation"]
+pub struct PendingLoadGuard {
+    counter: Arc<AtomicUsize>,
+}
+
+impl PendingLoadGuard {
+    pub(crate) fn new(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self { counter }
+    }
+}
+
+impl Drop for PendingLoadGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 impl WorkerMode {
     fn as_u8(self) -> u8 {
         match self {
@@ -88,6 +111,12 @@ pub struct Worker {
     pub model_ids: Vec<ModelId>,
     pub breaker: Arc<CircuitBreaker>,
     pub active_requests: Arc<AtomicUsize>,
+    /// Router-local reservations made at worker selection time. This is
+    /// intentionally separate from `active_requests`: reported-load routing
+    /// uses worker-side queue depth as its remote signal, then adds this local
+    /// pending count so concurrent selections inside the poll interval see
+    /// each other immediately.
+    pending_requests: Arc<AtomicUsize>,
     /// Hostname parsed from `url` at construction time and cached.
     /// Used as the `bootstrap_host` field on PD-disagg requests so the
     /// prefill engine can match incoming KV-transfer requests from
@@ -148,6 +177,7 @@ impl Worker {
             model_ids: spec.model_ids,
             breaker,
             active_requests: Arc::new(AtomicUsize::new(0)),
+            pending_requests: Arc::new(AtomicUsize::new(0)),
             bootstrap_host,
             bootstrap_port: spec.bootstrap_port,
             min_priority: spec.min_priority,
@@ -194,6 +224,10 @@ impl Worker {
         self.active_requests.load(Ordering::Relaxed)
     }
 
+    pub fn pending_load(&self) -> usize {
+        self.pending_requests.load(Ordering::Relaxed)
+    }
+
     /// Worker-reported real load, or a sentinel (`REPORTED_LOAD_UNSET` /
     /// `REPORTED_LOAD_FAILED`). Updated by the background load poller.
     pub fn reported_load(&self) -> i64 {
@@ -209,19 +243,21 @@ impl Worker {
     /// Effective load for routing decisions, honoring the configured load
     /// source. When `use_reported` is false (poller disabled), always the
     /// router-side in-flight count. When true: the real reported load if
-    /// available (`>= 0`); on poll failure (`REPORTED_LOAD_FAILED`) a very
+    /// available (`>= 0`) plus router-local pending reservations; on poll
+    /// failure (`REPORTED_LOAD_FAILED`) a very
     /// high value so spill-to-idle never targets a possibly-dead worker;
     /// before the first successful poll (`REPORTED_LOAD_UNSET`) fall back to
-    /// in-flight so a just-started router still routes sanely.
+    /// in-flight plus pending so a just-started router still routes sanely.
     pub fn effective_load(&self, use_reported: bool) -> usize {
         if !use_reported {
             return self.active_load();
         }
+        let pending = self.pending_load();
         match self.reported_load() {
             REPORTED_LOAD_FAILED => usize::MAX / 2, // treat unreachable as very busy
-            REPORTED_LOAD_UNSET => self.active_load(), // not polled yet → in-flight
-            v if v >= 0 => v as usize,
-            _ => self.active_load(), // any other negative: defensive fallback
+            REPORTED_LOAD_UNSET => self.active_load().saturating_add(pending),
+            v if v >= 0 => (v as usize).saturating_add(pending),
+            _ => self.active_load().saturating_add(pending),
         }
     }
 
@@ -229,6 +265,12 @@ impl Worker {
     /// decrements when the guard is dropped.
     pub fn load_guard(&self) -> LoadGuard {
         LoadGuard::new(self.active_requests.clone())
+    }
+
+    /// Returns a RAII guard that increments router-local pending load now and
+    /// decrements when the guard is dropped.
+    pub fn pending_guard(&self) -> PendingLoadGuard {
+        PendingLoadGuard::new(self.pending_requests.clone())
     }
 }
 
@@ -239,6 +281,7 @@ impl std::fmt::Debug for Worker {
             .field("url", &self.url)
             .field("mode", &self.mode())
             .field("active_load", &self.active_load())
+            .field("pending_load", &self.pending_load())
             .finish()
     }
 }
@@ -292,8 +335,20 @@ mod tests {
         w.set_reported_load(7);
         assert_eq!(w.effective_load(true), 7);
 
-        // Poller enabled, UNSET sentinel: fall back to in-flight.
+        // Router-local pending reservations bridge the poll interval when
+        // real load is present.
+        let pending = w.pending_guard();
+        assert_eq!(w.pending_load(), 1);
+        assert_eq!(w.effective_load(true), 8);
+        drop(pending);
+        assert_eq!(w.pending_load(), 0);
+        assert_eq!(w.effective_load(true), 7);
+
+        // Poller enabled, UNSET sentinel: fall back to in-flight plus pending.
         w.set_reported_load(REPORTED_LOAD_UNSET);
+        let pending = w.pending_guard();
+        assert_eq!(w.effective_load(true), 3);
+        drop(pending);
         assert_eq!(w.effective_load(true), 2);
 
         // Poller enabled, FAILED sentinel: treat as very-high load so

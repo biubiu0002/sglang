@@ -137,6 +137,54 @@ async fn messages_non_streaming_passthrough_200() {
 }
 
 #[tokio::test]
+async fn count_tokens_passthrough_200() {
+    // count_tokens shares the /v1/messages worker-selection path but forwards
+    // to /v1/messages/count_tokens. The mock worker serves that path (echoing
+    // the chat handler), so a 200 confirms the router routed to the correct
+    // upstream path. The body carries no `stream`, so it takes the buffered
+    // path — Claude Code calls this before each turn once claude-proxy is gone.
+    let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let ctx = build_ctx_with_worker(&worker.url);
+    let app = build_router(ctx);
+
+    let body = serde_json::to_vec(&serde_json::json!({
+        "model": "tiny",
+        "messages": [{"role": "user", "content": "hi"}],
+    }))
+    .unwrap();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/messages/count_tokens")
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn count_tokens_missing_model_returns_400() {
+    // Router-side validation (missing `model`) must surface as an Anthropic
+    // error envelope before any worker forward — same as /v1/messages.
+    let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let ctx = build_ctx_with_worker(&worker.url);
+    let app = build_router(ctx);
+
+    let body = serde_json::to_vec(&serde_json::json!({
+        "messages": [{"role": "user", "content": "hi"}],
+    }))
+    .unwrap();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/messages/count_tokens")
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn messages_streaming_passthrough_sse() {
     let chunks: Vec<&'static str> = vec![
         "data: {\"type\":\"content_block_delta\"}\n\n",

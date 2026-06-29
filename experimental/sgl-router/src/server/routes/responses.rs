@@ -1,18 +1,24 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Anthropic `/v1/messages` passthrough route.
+//! OpenAI `/v1/responses` passthrough route.
 //!
-//! Forwards the Anthropic request body to a selected SGLang worker at
-//! `/v1/messages` without translating to/from OpenAI chat completions — the
-//! worker natively serves `/v1/messages`. The router only needs `model` and
-//! `stream` from the body for worker selection and buffered-vs-SSE routing.
+//! Forwards the OpenAI Responses request body to a selected SGLang worker at
+//! `/v1/responses` without translating to/from chat completions — the worker
+//! natively serves `/v1/responses`. The router only needs `model` and `stream`
+//! from the body for worker selection and buffered-vs-SSE routing.
+//!
+//! Mirrors `messages.rs` exactly except for the forward path and the error
+//! envelope: router-originated `ApiError`s use the default OpenAI-shaped
+//! `IntoResponse` (`{"error":{"type","code","message"}}`) — the same shape the
+//! `/v1/chat/completions` path returns — so OpenAI SDK / Codex clients parse
+//! router-side failures uniformly. Worker-originated errors are forwarded
+//! verbatim and are already OpenAI-shaped.
 //!
 //! Deliberately does NOT replicate chat.rs's `input_ids` forwarding, PD
 //! bootstrap injection, or decode-peer resolution (see design.md). It DOES
-//! register active-load + hold the per-worker LoadGuard so load-aware
-//! policies (`power_of_two`, `cache_aware_zmq`) see accurate in-flight
-//! counts — without this the LB scheme would route on stale load.
+//! register active-load + hold the per-worker LoadGuard so load-aware policies
+//! (`power_of_two`, `cache_aware_zmq`) see accurate in-flight counts.
 
 use crate::discovery::{ModelId, WorkerMode};
 use crate::policies::registry::{filter_eligible, PdPoolResolver, PdResolveError};
@@ -28,15 +34,15 @@ use bytes::Bytes;
 use serde::Deserialize;
 use std::sync::Arc;
 
-/// Per-route body cap, mirroring chat. Same rationale: bound heap allocation
-/// before forwarding while accommodating long contexts.
-pub const MAX_MESSAGES_BODY_BYTES: usize = 5 << 20;
+/// Per-route body cap, mirroring chat/messages. Same rationale: bound heap
+/// allocation before forwarding while accommodating long contexts.
+pub const MAX_RESPONSES_BODY_BYTES: usize = 5 << 20;
 
 /// Minimal probe: `model` selects the worker, `stream` picks buffered vs SSE.
-/// The worker is authoritative for the full Anthropic schema. `#[serde(default)]`
+/// The worker is authoritative for the full Responses schema. `#[serde(default)]`
 /// keeps it tolerant of optional fields — only `model` is required.
 #[derive(Debug, Deserialize)]
-struct MessagesProbe {
+struct ResponsesProbe {
     #[serde(default)]
     stream: Option<bool>,
     model: Option<String>,
@@ -47,94 +53,26 @@ struct MessagesProbe {
     priority: Option<serde_json::Value>,
 }
 
-fn parse_probe(body: &Bytes) -> Result<MessagesProbe, ApiError> {
+fn parse_probe(body: &Bytes) -> Result<ResponsesProbe, ApiError> {
     serde_json::from_slice(body)
         .map_err(|_| ApiError::BadRequest("invalid request: body must be a JSON object".into()))
 }
 
-/// POST /v1/messages — select a worker via the per-model policy and proxy the
-/// raw Anthropic body to `<worker>/v1/messages`.
-pub async fn messages(
+/// POST /v1/responses — select a worker via the per-model policy and proxy the
+/// raw Responses body to `<worker>/v1/responses`. Router-side failures map to
+/// the default OpenAI error envelope via `ApiError`'s `IntoResponse`.
+pub async fn responses(
     State(ctx): State<Arc<AppContext>>,
     headers: HeaderMap,
     body: Bytes,
-) -> Response<Body> {
-    match messages_inner(State(ctx), headers, body, "/v1/messages").await {
-        Ok(resp) => resp,
-        Err(e) => anthropic_error_response(e),
-    }
+) -> Result<Response<Body>, ApiError> {
+    responses_inner(State(ctx), headers, body).await
 }
 
-/// POST /v1/messages/count_tokens — select a worker via the same per-model
-/// policy as `/v1/messages` and proxy the raw Anthropic body to
-/// `<worker>/v1/messages/count_tokens`. The worker natively serves this
-/// endpoint (returns `{"input_tokens": N}`). Always buffered: the count_tokens
-/// body carries no `stream` field, so the probe yields `streaming = false` and
-/// the request takes the buffered forward path. Claude Code calls this before
-/// each turn to size context, so it MUST be served once claude-proxy is retired.
-pub async fn count_tokens(
+async fn responses_inner(
     State(ctx): State<Arc<AppContext>>,
     headers: HeaderMap,
     body: Bytes,
-) -> Response<Body> {
-    match messages_inner(State(ctx), headers, body, "/v1/messages/count_tokens").await {
-        Ok(resp) => resp,
-        Err(e) => anthropic_error_response(e),
-    }
-}
-
-/// Map a router-originated `ApiError` to an Anthropic Messages error envelope
-/// `{"type":"error","error":{"type":...,"message":...}}` so Anthropic SDK clients
-/// parse router-side failures (missing `model`, PD-reject, no healthy worker,
-/// breaker open, stale). Worker-originated errors are forwarded verbatim by the
-/// proxy and are already Anthropic-shaped, so they never reach here.
-///
-/// `message` comes from `ApiError::client_message()` — the same sanitized string
-/// the OpenAI envelope uses, so no worker URL / anyhow chain leaks.
-fn anthropic_error_response(e: ApiError) -> Response<Body> {
-    use serde::Serialize;
-    #[derive(Serialize)]
-    struct AnthropicErr {
-        #[serde(rename = "type")]
-        typ: &'static str,
-        message: String,
-    }
-    #[derive(Serialize)]
-    struct Envelope {
-        #[serde(rename = "type")]
-        typ: &'static str,
-        error: AnthropicErr,
-    }
-    let status = e.status_code();
-    let typ = match status.as_u16() {
-        400 => "invalid_request_error",
-        404 => "not_found_error",
-        503 => "overloaded_error",
-        _ => "api_error",
-    };
-    let message = e.client_message();
-    let body = serde_json::to_vec(&Envelope {
-        typ: "error",
-        error: AnthropicErr { typ, message },
-    })
-    .unwrap_or_else(|_| {
-        b"{\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"internal error\"}}"
-            .to_vec()
-    });
-    let mut r = Response::new(Body::from(body));
-    *r.status_mut() = status;
-    r.headers_mut().insert(
-        axum::http::header::CONTENT_TYPE,
-        axum::http::HeaderValue::from_static("application/json"),
-    );
-    r
-}
-
-async fn messages_inner(
-    State(ctx): State<Arc<AppContext>>,
-    headers: HeaderMap,
-    body: Bytes,
-    forward_path: &'static str,
 ) -> Result<Response<Body>, ApiError> {
     let start = std::time::Instant::now();
     let probe = parse_probe(&body)?;
@@ -169,29 +107,23 @@ async fn messages_inner(
         .get(&model_id)
         .ok_or_else(|| ApiError::ModelNotFound(model_str.clone()))?;
 
-    // PD-disaggregated mode is unsupported on this route, and that is a
-    // permanent property of the model/route — NOT a transient capacity
-    // condition. Reject it (400) BEFORE priority filtering so a PD model
-    // whose only prefill candidate is priority-gated surfaces the honest
-    // "PD not supported" error rather than a misleading 503 from the filter
-    // emptying the candidate set. A model's workers are homogeneous in mode
-    // (`prefill_candidates` yields prefill/non-Plain workers only for PD
-    // deployments), so any non-Plain candidate marks a PD topology. This
-    // passthrough forwards to a single worker and does NOT replicate
-    // chat.rs's decode-peer resolution + bootstrap body injection (see
-    // design.md); in PD mode the final response comes from the decode side,
-    // so silently forwarding to a prefill worker would hang.
+    // PD-disaggregated mode is unsupported on this route (same rationale as
+    // /v1/messages): this passthrough forwards to a single worker and does NOT
+    // replicate chat.rs's decode-peer resolution + bootstrap body injection, so
+    // silently forwarding to a prefill worker would hang. Reject (400) BEFORE
+    // priority filtering so the honest "PD not supported" error surfaces rather
+    // than a misleading 503 from the filter emptying the candidate set.
     if workers.iter().any(|w| w.mode() != WorkerMode::Plain) {
         return Err(ApiError::BadRequest(
-            "/v1/messages passthrough does not support PD-disaggregated mode yet; use /v1/chat/completions".into(),
+            "/v1/responses passthrough does not support PD-disaggregated mode yet; use /v1/chat/completions".into(),
         ));
     }
 
     // Priority-eligibility filtering — identical semantics to the
-    // `/v1/chat/completions` path: capacity-restricted workers are removed
-    // for sub-threshold requests before policy selection. Hard isolation:
-    // if filtering empties the candidate set, reject with 503 rather than
-    // spill the request onto a gated worker.
+    // `/v1/chat/completions` and `/v1/messages` paths: capacity-restricted
+    // workers are removed for sub-threshold requests before policy selection.
+    // Hard isolation: if filtering empties the candidate set, reject with 503
+    // rather than spill the request onto a gated worker.
     let request_priority = crate::policies::priority_from_value(probe.priority.as_ref());
     let eligible = filter_eligible(&workers, request_priority);
     if eligible.excluded_all {
@@ -212,22 +144,16 @@ async fn messages_inner(
     }
     let workers = eligible.workers;
 
-    // Deliberately do NOT produce routing tokens for /v1/messages.
+    // Deliberately do NOT produce routing tokens for /v1/responses.
     //
-    // The cache-aware-zmq policy hashes the request to find a worker that
-    // already holds the prefix in its KV cache. For chat completions the
-    // router's chat-encoder tokenization matches the engine's cached blocks.
-    // For Anthropic bodies that is NOT true: the worker's Anthropic serving
-    // path folds the top-level `system` prompt into the actual prompt before
-    // tokenizing, so hashing only `messages` (which `request_tokens_for`
-    // would read) would route two requests with identical `messages` but
-    // different `system` to the same cached worker — a false locality hit.
-    // Rather than replicate the engine's `system`-folding exactly, we skip
-    // router-side tokenization here: cache_aware_zmq falls back to min-load
-    // for /v1/messages, and the worker tokenizes the body itself (we never
-    // forward input_ids). Correct and safe; costs cache affinity on this
-    // route, which is the honest trade-off until the engine exposes its
-    // Anthropic block hashes.
+    // Same rationale as /v1/messages: the worker's Responses serving path
+    // tokenizes the `input` (and folds any instructions/system) itself before
+    // generation, and the router never forwards input_ids on this route. The
+    // router's chat-encoder tokenization would not match the engine's cached
+    // blocks for a Responses body, so router-side hashing risks false-locality
+    // hits. We skip router-side tokenization: cache_aware_zmq falls back to
+    // min-load for /v1/responses (honest trade-off, costs cache affinity on
+    // this route until the engine exposes its Responses block hashes).
     let request_tokens: Option<crate::policies::RequestTokens> = None;
 
     let routing_key = ctx
@@ -238,13 +164,10 @@ async fn messages_inner(
         .and_then(|s| headers.get(s.header_name.as_str()))
         .and_then(|v| v.to_str().ok())
         .filter(|s| !s.is_empty());
-    // Pass NO body to the selection context. With `request_tokens = None`
-    // AND no body, CacheAwareZmqPolicy::select cannot tokenize (its fallback
-    // reads the body) and falls back to min-load — which is exactly the honest
-    // behavior we want for /v1/messages (see the request_tokens comment).
-    // Passing the body would let the policy tokenize `messages` and reintroduce
-    // the false-locality bug (identical `messages`, different `system`).
-    // `routing_key` is still honored by the sticky policy (it reads headers, not body).
+    // Pass NO body to the selection context (see /v1/messages): with
+    // `request_tokens = None` AND no body, CacheAwareZmqPolicy::select falls
+    // back to min-load rather than tokenizing the body. `routing_key` is still
+    // honored by the sticky policy (it reads headers, not body).
     let selection_ctx = SelectionContext::with_routing_key(&model_id, None, routing_key)
         .with_request_tokens(request_tokens.as_ref().map(|t| t.ids.as_slice()));
     let (worker, pending_guard) = {
@@ -259,8 +182,8 @@ async fn messages_inner(
     };
 
     // Hold the per-worker in-flight guard + register active load so load-aware
-    // policies see this request. prefill_load uses the real token count when we
-    // tokenized, else the byte heuristic (same as chat).
+    // policies see this request. prefill_load uses the byte heuristic (we never
+    // tokenize on this route), same as chat's fallback.
     let guard = worker.load_guard();
     let prefill_load = request_tokens
         .as_ref()
@@ -279,14 +202,14 @@ async fn messages_inner(
     };
 
     let result = if streaming {
-        // ponytail: skip chat's TTFT hook + streaming-duration RAII guard —
-        // v1 measures header-time only; end-to-end streaming latency is a
-        // follow-up. Guards move into stream_guards so load stays accurate.
+        // Mirror /v1/messages: skip chat's TTFT hook + streaming-duration RAII
+        // guard (v1 measures header-time only). Guards move into stream_guards
+        // so load stays accurate for the stream's lifetime.
         let stream_guards: Box<dyn Send + 'static> = Box::new((guard, active_guard, pending_guard));
         let fetch = ctx.proxy.forward_streaming_to(
             &worker.url,
             &worker.breaker,
-            forward_path,
+            "/v1/responses",
             &headers,
             body,
             Some(stream_guards),
@@ -299,9 +222,13 @@ async fn messages_inner(
         }
     } else {
         let _holds: (LoadGuard, _, _) = (guard, active_guard, pending_guard);
-        let fetch =
-            ctx.proxy
-                .forward_json_to(&worker.url, &worker.breaker, forward_path, &headers, body);
+        let fetch = ctx.proxy.forward_json_to(
+            &worker.url,
+            &worker.breaker,
+            "/v1/responses",
+            &headers,
+            body,
+        );
         tokio::select! {
             biased;
             r = fetch => r,
@@ -338,7 +265,7 @@ async fn messages_inner(
     tracing::info!(
         request_id = %request_id,
         method = "POST",
-        path = forward_path,
+        path = "/v1/responses",
         model = %metrics_model,
         worker = %metrics_worker_url,
         outcome = match outcome {
@@ -349,7 +276,7 @@ async fn messages_inner(
         http_status,
         stream = streaming,
         latency_ms = elapsed.as_millis() as u64,
-        "messages",
+        "responses",
     );
     result
 }
@@ -361,7 +288,7 @@ mod tests {
 
     #[test]
     fn probe_reads_stream_and_model() {
-        let b = Bytes::from(r#"{"model":"glm","stream":true,"messages":[]}"#);
+        let b = Bytes::from(r#"{"model":"glm","stream":true,"input":"hi"}"#);
         let p = parse_probe(&b).unwrap();
         assert_eq!(p.stream, Some(true));
         assert_eq!(p.model.as_deref(), Some("glm"));
@@ -369,7 +296,7 @@ mod tests {
 
     #[test]
     fn probe_stream_defaults_to_false() {
-        let b = Bytes::from(r#"{"model":"glm","messages":[]}"#);
+        let b = Bytes::from(r#"{"model":"glm","input":"hi"}"#);
         let p = parse_probe(&b).unwrap();
         assert_eq!(p.stream, None);
         assert_eq!(p.model.as_deref(), Some("glm"));
@@ -382,13 +309,22 @@ mod tests {
     }
 
     #[test]
-    fn probe_allows_anthropic_shape_without_stream() {
-        // Real Anthropic body has system/messages/max_tokens; only model is required here.
+    fn probe_allows_responses_shape_without_stream() {
+        // Real Responses body has input/max_output_tokens; only model is required here.
         let b = Bytes::from(
-            r#"{"model":"claude-3","max_tokens":256,"system":"s","messages":[{"role":"user","content":"hi"}]}"#,
+            r#"{"model":"gpt","input":"hi","max_output_tokens":256,"reasoning":{"effort":"low"}}"#,
         );
         let p = parse_probe(&b).unwrap();
-        assert_eq!(p.model.as_deref(), Some("claude-3"));
+        assert_eq!(p.model.as_deref(), Some("gpt"));
         assert_eq!(p.stream, None);
+    }
+
+    #[test]
+    fn probe_missing_model_parses_then_handler_rejects() {
+        // parse_probe only requires valid JSON object; `model` absence is
+        // enforced in responses_inner (returns 400 missing `model`).
+        let b = Bytes::from(r#"{"input":"hi"}"#);
+        let p = parse_probe(&b).unwrap();
+        assert_eq!(p.model, None);
     }
 }

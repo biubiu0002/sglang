@@ -11,6 +11,7 @@
 mod common;
 
 mod cache_aware_input_ids;
+mod cache_aware_pending_pressure;
 mod chat_routing;
 mod failover;
 mod graceful_shutdown;

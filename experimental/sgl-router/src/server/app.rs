@@ -4,6 +4,7 @@
 use crate::server::app_context::AppContext;
 use crate::server::routes::chat::MAX_CHAT_BODY_BYTES;
 use crate::server::routes::messages::MAX_MESSAGES_BODY_BYTES;
+use crate::server::routes::responses::MAX_RESPONSES_BODY_BYTES;
 use axum::extract::{DefaultBodyLimit, Request};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
@@ -58,6 +59,18 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
             "/v1/messages",
             post(crate::server::routes::messages::messages)
                 .layer(DefaultBodyLimit::max(MAX_MESSAGES_BODY_BYTES))
+                .layer(middleware::from_fn(log_413)),
+        )
+        .route(
+            "/v1/messages/count_tokens",
+            post(crate::server::routes::messages::count_tokens)
+                .layer(DefaultBodyLimit::max(MAX_MESSAGES_BODY_BYTES))
+                .layer(middleware::from_fn(log_413)),
+        )
+        .route(
+            "/v1/responses",
+            post(crate::server::routes::responses::responses)
+                .layer(DefaultBodyLimit::max(MAX_RESPONSES_BODY_BYTES))
                 .layer(middleware::from_fn(log_413)),
         )
         .route(

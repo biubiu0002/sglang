@@ -132,6 +132,10 @@ impl CacheAwareZmqPolicy {
     /// The `is_finite()` arm-gate also dodges the `min_load == 0` edge: with
     /// min_load 0 the REL test would degenerate to `hot_load > 0`, so we only
     /// arm when the operator set a finite ratio.
+    ///
+    /// Setting `hit_load_abs_threshold = 1` and
+    /// `hit_load_rel_threshold = 1.0` expresses the simple policy:
+    /// keep cache affinity only while `hot_load <= min_load + 1`.
     fn apply_hit_load_guard(&self, hot: Arc<Worker>, workers: &[Arc<Worker>]) -> Arc<Worker> {
         if !self.config.hit_load_rel_threshold.is_finite() {
             return hot; // guard OFF — behaviour identical to plain cache-aware
@@ -1460,16 +1464,16 @@ mod tests {
         assert_eq!(chosen.url, "http://w0:30000", "guard OFF keeps the cache hit");
     }
 
-    /// Guard ARMED and the hit worker is backed up past both thresholds:
-    /// divert to the globally least-loaded worker.
+    /// Guard ARMED as `min_load + 1`: a cache hit may be one request
+    /// busier than the coolest worker, but not two.
     #[test]
     fn hit_load_guard_diverts_off_backed_up_worker() {
         let text = "hello world hello world hello world";
-        let (policy, ids) = guard_policy(text, "http://w0:30000", 6, 1.2);
+        let (policy, ids) = guard_policy(text, "http://w0:30000", 1, 1.0);
         let w0 = worker("http://w0:30000", "tiny");
         let w1 = worker("http://w1:30000", "tiny");
-        // w0 load 10, w1 load 0: gap 10 > abs 6, and 10 > 0*1.2 — divert.
-        let _guards: Vec<_> = (0..10).map(|_| w0.load_guard()).collect();
+        // w0 load 2, w1 load 0: gap 2 > slack 1 — divert.
+        let _guards: Vec<_> = (0..2).map(|_| w0.load_guard()).collect();
         let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
         let model = ModelId("tiny".into());
         let ctx = SelectionContext::new(&model, None).with_request_tokens(Some(&ids));
@@ -1477,16 +1481,16 @@ mod tests {
         assert_eq!(chosen.url, "http://w1:30000", "armed guard diverts to coolest");
     }
 
-    /// Guard ARMED but the gap is below the absolute threshold: keep the
-    /// cache hit even though another worker is slightly cooler.
+    /// Guard ARMED but the hit worker is only one request above the coolest
+    /// worker: keep the cache hit.
     #[test]
     fn hit_load_guard_below_abs_keeps_cache_worker() {
         let text = "hello world hello world hello world";
-        let (policy, ids) = guard_policy(text, "http://w0:30000", 6, 1.2);
+        let (policy, ids) = guard_policy(text, "http://w0:30000", 1, 1.0);
         let w0 = worker("http://w0:30000", "tiny");
         let w1 = worker("http://w1:30000", "tiny");
-        // w0 load 4, w1 load 0: gap 4 <= abs 6 → ABS fails → keep hit.
-        let _guards: Vec<_> = (0..4).map(|_| w0.load_guard()).collect();
+        // w0 load 1, w1 load 0: gap 1 <= slack 1 → keep hit.
+        let _guards: Vec<_> = (0..1).map(|_| w0.load_guard()).collect();
         let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
         let model = ModelId("tiny".into());
         let ctx = SelectionContext::new(&model, None).with_request_tokens(Some(&ids));

@@ -26,10 +26,19 @@ pub enum ChatEncoder {
 
 impl ChatEncoder {
     /// Render `messages` into the engine-equivalent prompt text.
-    fn render(&self, messages: &serde_json::Value) -> Result<String> {
+    fn render(
+        &self,
+        messages: &serde_json::Value,
+        tools: Option<&serde_json::Value>,
+    ) -> Result<String> {
         match self {
-            ChatEncoder::Jinja(t) => t.render(messages),
-            ChatEncoder::DeepSeekV4 => Ok(dsv4::render_messages(messages)),
+            ChatEncoder::Jinja(t) => t.render(messages, tools),
+            ChatEncoder::DeepSeekV4 => {
+                if tools.is_some() {
+                    anyhow::bail!("DeepSeek-V4 built-in router encoder does not support tools")
+                }
+                Ok(dsv4::render_messages(messages))
+            }
         }
     }
 }
@@ -147,13 +156,24 @@ impl TokenizerRegistry {
     /// `None` — caller falls back to raw routing — when the model has no
     /// encoder, no tokenizer, or rendering/encoding fails or yields no tokens.
     pub fn encode_chat(&self, model_id: &str, messages: &serde_json::Value) -> Option<Vec<u32>> {
+        self.encode_chat_with_tools(model_id, messages, None)
+    }
+
+    /// Like [`Self::encode_chat`], but includes function tool schemas in the
+    /// chat-template context when supplied.
+    pub fn encode_chat_with_tools(
+        &self,
+        model_id: &str,
+        messages: &serde_json::Value,
+        tools: Option<&serde_json::Value>,
+    ) -> Option<Vec<u32>> {
         // Clone the Arc and drop the DashMap guard before the CPU-bound
         // render+encode (mirrors `get`), so no shard read-lock is held across it.
         let entry = Arc::clone(&*self.encoders.get(model_id)?);
         let tokenizer = self.get(model_id)?;
         let rendered = entry
             .encoder
-            .render(messages)
+            .render(messages, tools)
             .inspect_err(|e| {
                 // `{e:#}` prints the full anyhow chain, so the underlying
                 // minijinja cause (e.g. a `raise_exception` message) is
@@ -439,9 +459,35 @@ mod tests {
             .get("tiny")
             .unwrap()
             .encoder
-            .render(&messages)
+            .render(&messages, None)
             .unwrap();
         assert_eq!(chat_ids, adapter::encode(&tok, &rendered).unwrap());
+    }
+
+    #[test]
+    fn encode_chat_with_tools_renders_tool_context() {
+        let reg = TokenizerRegistry::default();
+        reg.inner.insert(
+            "tiny".into(),
+            adapter::load("tests/fixtures/tiny_tokenizer.json").unwrap(),
+        );
+        let cfg = serde_json::json!({
+            "chat_template": "{% if tools is not none %}{% for tool in tools %}{{ tool['function']['name'] }}:{% endfor %}{% endif %}{% for m in messages %}{{ m['content'] }}{% endfor %}",
+        });
+        reg.attach_chat_template_for_test("tiny", &cfg);
+        let messages = serde_json::json!([{"role":"user","content":"hi"}]);
+        let tools = serde_json::json!([
+            {"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}
+        ]);
+
+        let with_tools = reg
+            .encode_chat_with_tools("tiny", &messages, Some(&tools))
+            .expect("tool-aware encode");
+        let without_tools = reg.encode_chat("tiny", &messages).expect("encode_chat");
+        assert_ne!(
+            with_tools, without_tools,
+            "tool schemas must perturb chat-template routing tokens"
+        );
     }
 
     #[test]

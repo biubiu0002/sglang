@@ -22,7 +22,7 @@
 
 use crate::discovery::{ModelId, WorkerMode};
 use crate::policies::registry::{filter_eligible, PdPoolResolver, PdResolveError};
-use crate::policies::SelectionContext;
+use crate::policies::{request_tokens_for, RequestTokens, SelectionContext};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{PriorityFilterOutcome, RequestOutcome, WorkerModeLabel};
@@ -35,6 +35,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, Response};
 use bytes::Bytes;
 use serde::Deserialize;
+use serde_json::{Map, Value};
 use std::sync::Arc;
 
 /// Per-route body cap, mirroring chat/messages. Same rationale: bound heap
@@ -53,12 +54,317 @@ struct ResponsesProbe {
     /// is tolerated (treated as `0`) rather than rejected. Gates
     /// capacity-restricted workers (see [`filter_eligible`]).
     #[serde(default)]
-    priority: Option<serde_json::Value>,
+    priority: Option<Value>,
 }
 
 fn parse_probe(body: &Bytes) -> Result<ResponsesProbe, ApiError> {
     serde_json::from_slice(body)
         .map_err(|_| ApiError::BadRequest("invalid request: body must be a JSON object".into()))
+}
+
+fn normalize_response_content_part_for_chat(part: &Value) -> Option<Value> {
+    let obj = part.as_object()?;
+    match obj.get("type").and_then(|t| t.as_str()) {
+        Some("input_text") | Some("output_text") => Some(serde_json::json!({
+            "type": "text",
+            "text": obj.get("text").and_then(|t| t.as_str()).unwrap_or(""),
+        })),
+        Some("text") => Some(part.clone()),
+        // Image parts affect prompt bytes through the multimodal processor,
+        // which the router does not reproduce. Avoid false route-history hits.
+        Some("input_image") | Some("image_url") => None,
+        _ => Some(part.clone()),
+    }
+}
+
+fn compact_json_string(value: &Value) -> Option<String> {
+    serde_json::to_string(value).ok()
+}
+
+fn coerce_function_arguments(raw: Option<&Value>) -> Option<String> {
+    match raw {
+        Some(Value::String(s)) => {
+            if s.is_empty() {
+                return Some("{}".to_string());
+            }
+            match serde_json::from_str::<Value>(s) {
+                Ok(Value::Object(_)) => Some(s.clone()),
+                _ => Some("{}".to_string()),
+            }
+        }
+        Some(Value::Object(_)) => compact_json_string(raw?),
+        _ => Some("{}".to_string()),
+    }
+}
+
+fn collect_response_text_parts(parts: Option<&Value>) -> Vec<String> {
+    parts
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|entry| entry.as_object()?.get("text")?.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn normalize_response_message_for_chat(message: &Value) -> Option<Option<Value>> {
+    let obj = message.as_object()?;
+    let msg_type = obj.get("type").and_then(|t| t.as_str());
+    if msg_type == Some("function_call") {
+        return Some(Some(serde_json::json!({
+            "role": "assistant",
+            "tool_calls": [{
+                "id": obj.get("call_id").or_else(|| obj.get("id")).cloned().unwrap_or(Value::Null),
+                "type": "function",
+                "function": {
+                    "name": obj.get("name").cloned().unwrap_or(Value::Null),
+                    "arguments": coerce_function_arguments(obj.get("arguments"))?,
+                },
+            }],
+        })));
+    }
+    if msg_type == Some("function_call_output") {
+        return Some(Some(serde_json::json!({
+            "role": "tool",
+            "tool_call_id": obj.get("call_id").cloned().unwrap_or(Value::Null),
+            "content": obj.get("output").cloned().unwrap_or_else(|| Value::String(String::new())),
+        })));
+    }
+    if msg_type == Some("reasoning") {
+        let mut text_parts = collect_response_text_parts(obj.get("summary"));
+        if text_parts.is_empty() {
+            text_parts = collect_response_text_parts(obj.get("content"));
+        }
+        if text_parts.is_empty() {
+            return Some(None);
+        }
+        return Some(Some(serde_json::json!({
+            "role": "assistant",
+            "reasoning_content": text_parts.join("\n"),
+        })));
+    }
+    if !matches!(msg_type, None | Some("message")) {
+        return None;
+    }
+
+    let mut out = Map::new();
+    for (k, v) in obj {
+        if v.is_null() || matches!(k.as_str(), "id" | "status" | "type") {
+            continue;
+        }
+        if k == "role" && v.as_str() == Some("developer") {
+            out.insert(k.clone(), Value::String("system".to_string()));
+        } else if k != "content" {
+            out.insert(k.clone(), v.clone());
+        }
+    }
+    match obj.get("content") {
+        Some(Value::Array(parts)) => {
+            let mut normalized = Vec::with_capacity(parts.len());
+            for part in parts {
+                normalized.push(normalize_response_content_part_for_chat(part)?);
+            }
+            out.insert("content".to_string(), Value::Array(normalized));
+        }
+        Some(content) => {
+            out.insert("content".to_string(), content.clone());
+        }
+        None => {}
+    }
+    Some(Some(Value::Object(out)))
+}
+
+fn as_text_parts(content: &Value) -> Vec<Value> {
+    match content {
+        Value::Array(parts) => parts.clone(),
+        Value::String(s) if !s.is_empty() => vec![serde_json::json!({"type":"text","text":s})],
+        _ => Vec::new(),
+    }
+}
+
+fn merge_consecutive_assistant_messages(messages: Vec<Value>) -> Vec<Value> {
+    let mut merged: Vec<Value> = Vec::with_capacity(messages.len());
+    for msg in messages {
+        let merge = msg.get("role").and_then(|r| r.as_str()) == Some("assistant")
+            && merged
+                .last()
+                .and_then(|m| m.get("role"))
+                .and_then(|r| r.as_str())
+                == Some("assistant");
+        if !merge {
+            merged.push(msg);
+            continue;
+        }
+
+        let prev = merged.last_mut().and_then(|v| v.as_object_mut()).unwrap();
+        if let Some(new_content) = msg.get("content").filter(|c| !c.is_null() && **c != "") {
+            match prev.get("content") {
+                None => {
+                    prev.insert("content".to_string(), new_content.clone());
+                }
+                Some(Value::String(s)) if s.is_empty() => {
+                    prev.insert("content".to_string(), new_content.clone());
+                }
+                Some(Value::String(prev_s)) if new_content.is_string() => {
+                    let new_s = new_content.as_str().unwrap_or("");
+                    let sep = if !prev_s.is_empty() && !new_s.is_empty() {
+                        "\n\n"
+                    } else {
+                        ""
+                    };
+                    prev.insert(
+                        "content".to_string(),
+                        Value::String(format!("{prev_s}{sep}{new_s}")),
+                    );
+                }
+                Some(prev_content) => {
+                    let mut parts = as_text_parts(prev_content);
+                    parts.extend(as_text_parts(new_content));
+                    prev.insert("content".to_string(), Value::Array(parts));
+                }
+            }
+        }
+        if let Some(Value::Array(new_calls)) = msg.get("tool_calls") {
+            let mut calls = prev
+                .get("tool_calls")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            calls.extend(new_calls.clone());
+            prev.insert("tool_calls".to_string(), Value::Array(calls));
+        }
+        if let Some(new_reasoning) = msg.get("reasoning_content").and_then(|r| r.as_str()) {
+            let reasoning = prev
+                .get("reasoning_content")
+                .and_then(|r| r.as_str())
+                .map(|prev_r| format!("{prev_r}\n{new_reasoning}"))
+                .unwrap_or_else(|| new_reasoning.to_string());
+            prev.insert("reasoning_content".to_string(), Value::String(reasoning));
+        }
+    }
+    merged
+}
+
+fn coalesce_system_messages(messages: Vec<Value>) -> Vec<Value> {
+    let mut system_chunks = Vec::new();
+    let mut others = Vec::new();
+    for msg in messages {
+        if msg.get("role").and_then(|r| r.as_str()) == Some("system") {
+            match msg.get("content") {
+                Some(Value::String(s)) => system_chunks.push(s.clone()),
+                Some(Value::Array(parts)) => {
+                    for part in parts {
+                        if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                            system_chunks.push(text.to_string());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        } else {
+            others.push(msg);
+        }
+    }
+    if !system_chunks.is_empty() {
+        let mut out = vec![serde_json::json!({
+            "role": "system",
+            "content": system_chunks.join("\n\n"),
+        })];
+        out.extend(others);
+        out
+    } else {
+        others
+    }
+}
+
+fn response_tools_for_chat(value: &Value) -> Option<Option<Value>> {
+    let tools = value
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut chat_tools = Vec::new();
+    for tool in tools {
+        let obj = tool.as_object()?;
+        if obj.get("type").and_then(|t| t.as_str()) != Some("function") {
+            continue;
+        }
+        chat_tools.push(serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": obj.get("name").cloned().unwrap_or(Value::Null),
+                "description": obj.get("description").cloned().unwrap_or(Value::Null),
+                "parameters": obj.get("parameters").cloned().unwrap_or(Value::Null),
+                "strict": obj.get("strict").cloned().unwrap_or(Value::Null),
+            },
+        }));
+    }
+    if chat_tools.is_empty() {
+        return Some(None);
+    }
+
+    match value.get("tool_choice") {
+        Some(Value::String(s)) if s == "none" => Some(None),
+        Some(Value::Object(obj)) => {
+            let selected = obj
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .or_else(|| obj.get("name"))
+                .and_then(|n| n.as_str());
+            if let Some(selected) = selected {
+                let filtered: Vec<Value> = chat_tools
+                    .into_iter()
+                    .filter(|tool| {
+                        tool.get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(|n| n.as_str())
+                            == Some(selected)
+                    })
+                    .collect();
+                return Some((!filtered.is_empty()).then(|| Value::Array(filtered)));
+            }
+            Some(Some(Value::Array(chat_tools)))
+        }
+        _ => Some(Some(Value::Array(chat_tools))),
+    }
+}
+
+fn responses_routing_value(body: &Bytes) -> Option<Value> {
+    let value: Value = serde_json::from_slice(body).ok()?;
+    if value
+        .get("previous_response_id")
+        .is_some_and(|v| !v.is_null())
+    {
+        return None;
+    }
+
+    let mut messages = Vec::new();
+    if let Some(instructions) = value.get("instructions").and_then(|i| i.as_str()) {
+        if !instructions.is_empty() {
+            messages.push(serde_json::json!({"role":"system","content":instructions}));
+        }
+    }
+
+    match value.get("input")? {
+        Value::String(s) => messages.push(serde_json::json!({"role":"user","content":s})),
+        Value::Array(items) => {
+            for item in items {
+                if let Some(normalized) = normalize_response_message_for_chat(item)? {
+                    messages.push(normalized);
+                }
+            }
+        }
+        _ => return None,
+    }
+
+    let messages = coalesce_system_messages(merge_consecutive_assistant_messages(messages));
+    let mut out = Map::new();
+    out.insert("messages".to_string(), Value::Array(messages));
+    if let Some(tools) = response_tools_for_chat(&value)? {
+        out.insert("tools".to_string(), tools);
+    }
+    Some(Value::Object(out))
 }
 
 /// POST /v1/responses — select a worker via the per-model policy and proxy the
@@ -212,17 +518,16 @@ async fn responses_inner(
     }
     let workers = eligible.workers;
 
-    // Deliberately do NOT produce routing tokens for /v1/responses.
-    //
-    // Same rationale as /v1/messages: the worker's Responses serving path
-    // tokenizes the `input` (and folds any instructions/system) itself before
-    // generation, and the router never forwards input_ids on this route. The
-    // router's chat-encoder tokenization would not match the engine's cached
-    // blocks for a Responses body, so router-side hashing risks false-locality
-    // hits. We skip router-side tokenization: cache_aware_zmq falls back to
-    // min-load for /v1/responses (honest trade-off, costs cache affinity on
-    // this route until the engine exposes its Responses block hashes).
-    let request_tokens: Option<crate::policies::RequestTokens> = None;
+    // Produce routing-only tokens for stateless /v1/responses generation
+    // requests. The worker still receives the original native Responses body;
+    // this normalized chat-shaped value exists only so cache-aware routing can
+    // hash the same instruction/input/tool prefix that the worker's non-harmony
+    // Responses path passes to chat prompt processing. Stateful
+    // previous_response_id and unsupported multimodal/renderer cases return
+    // None, so route-history is not polluted with approximate prefixes.
+    let request_tokens: Option<RequestTokens> = responses_routing_value(&body)
+        .as_ref()
+        .and_then(|v| request_tokens_for(&ctx.tokenizers, &model_id, v));
 
     let routing_key = ctx
         .config
@@ -232,10 +537,11 @@ async fn responses_inner(
         .and_then(|s| headers.get(s.header_name.as_str()))
         .and_then(|v| v.to_str().ok())
         .filter(|s| !s.is_empty());
-    // Pass NO body to the selection context (see /v1/messages): with
-    // `request_tokens = None` AND no body, CacheAwareZmqPolicy::select falls
-    // back to min-load rather than tokenizing the body. `routing_key` is still
-    // honored by the sticky policy (it reads headers, not body).
+    // Pass NO body to the selection context (see /v1/messages): if
+    // routing-only tokenization is unavailable, CacheAwareZmqPolicy::select
+    // falls back to min-load rather than tokenizing the native Responses body.
+    // `routing_key` is still honored by the sticky policy (it reads headers,
+    // not body).
     let selection_ctx = SelectionContext::with_routing_key(&model_id, None, routing_key)
         .with_request_tokens(request_tokens.as_ref().map(|t| t.ids.as_slice()));
     let (worker, pending_guard) = {
@@ -253,8 +559,8 @@ async fn responses_inner(
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("build worker auth header: {e}")))?;
 
     // Hold the per-worker in-flight guard + register active load so load-aware
-    // policies see this request. prefill_load uses the byte heuristic (we never
-    // tokenize on this route), same as chat's fallback.
+    // policies see this request. prefill_load uses the routing token count when
+    // available, else the byte heuristic, same as chat's fallback.
     let guard = worker.load_guard();
     let prefill_load = request_tokens
         .as_ref()
@@ -354,7 +660,7 @@ async fn responses_inner(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_probe;
+    use super::{parse_probe, responses_routing_value};
     use bytes::Bytes;
 
     #[test]
@@ -397,5 +703,89 @@ mod tests {
         let b = Bytes::from(r#"{"input":"hi"}"#);
         let p = parse_probe(&b).unwrap();
         assert_eq!(p.model, None);
+    }
+
+    #[test]
+    fn routing_value_builds_instructions_and_text_input() {
+        let b = Bytes::from(
+            r#"{
+                "model":"gpt",
+                "instructions":"be brief",
+                "input":"hello",
+                "metadata":{"session":"a"},
+                "priority":100
+            }"#,
+        );
+
+        assert_eq!(
+            responses_routing_value(&b).expect("routing value"),
+            serde_json::json!({
+                "messages":[
+                    {"role":"system","content":"be brief"},
+                    {"role":"user","content":"hello"}
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn routing_value_normalizes_function_tools_calls_and_outputs() {
+        let b = Bytes::from(
+            r#"{
+                "model":"gpt",
+                "instructions":"root",
+                "tools":[
+                    {"type":"function","name":"lookup","description":"Look up","parameters":{"type":"object"},"strict":true},
+                    {"type":"web_search_preview","name":"web_search"}
+                ],
+                "tool_choice":{"type":"function","function":{"name":"lookup"}},
+                "input":[
+                    {"role":"developer","content":"dev"},
+                    {"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},
+                    {"type":"function_call","call_id":"call_1","name":"lookup","arguments":{"q":"x"}},
+                    {"type":"function_call","call_id":"call_2","name":"lookup","arguments":"not-json"},
+                    {"type":"function_call_output","call_id":"call_1","output":"result"}
+                ]
+            }"#,
+        );
+
+        assert_eq!(
+            responses_routing_value(&b).expect("routing value"),
+            serde_json::json!({
+                "messages":[
+                    {"role":"system","content":"root\n\ndev"},
+                    {"role":"user","content":[{"type":"text","text":"hi"}]},
+                    {
+                        "role":"assistant",
+                        "tool_calls":[
+                            {"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{\"q\":\"x\"}"}},
+                            {"id":"call_2","type":"function","function":{"name":"lookup","arguments":"{}"}}
+                        ]
+                    },
+                    {"role":"tool","tool_call_id":"call_1","content":"result"}
+                ],
+                "tools":[{
+                    "type":"function",
+                    "function":{
+                        "name":"lookup",
+                        "description":"Look up",
+                        "parameters":{"type":"object"},
+                        "strict":true
+                    }
+                }]
+            })
+        );
+    }
+
+    #[test]
+    fn routing_value_rejects_previous_response_and_images() {
+        let previous =
+            Bytes::from(r#"{"model":"gpt","previous_response_id":"resp_1","input":"hello"}"#);
+        assert!(responses_routing_value(&previous).is_none());
+
+        let image = Bytes::from(
+            r#"{"model":"gpt","input":[{"role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,abc"}]}]}"#,
+        );
+        assert!(responses_routing_value(&image).is_none());
     }
 }

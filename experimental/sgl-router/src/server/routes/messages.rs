@@ -16,7 +16,7 @@
 
 use crate::discovery::{ModelId, WorkerMode};
 use crate::policies::registry::{filter_eligible, PdPoolResolver, PdResolveError};
-use crate::policies::SelectionContext;
+use crate::policies::{request_tokens_for, RequestTokens, SelectionContext};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{PriorityFilterOutcome, RequestOutcome, WorkerModeLabel};
@@ -29,6 +29,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, Response};
 use bytes::Bytes;
 use serde::Deserialize;
+use serde_json::{Map, Value};
 use std::sync::Arc;
 
 /// Per-route body cap, mirroring chat. Same rationale: bound heap allocation
@@ -47,12 +48,306 @@ struct MessagesProbe {
     /// is tolerated (treated as `0`) rather than rejected. Gates
     /// capacity-restricted workers (see [`filter_eligible`]).
     #[serde(default)]
-    priority: Option<serde_json::Value>,
+    priority: Option<Value>,
 }
 
 fn parse_probe(body: &Bytes) -> Result<MessagesProbe, ApiError> {
     serde_json::from_slice(body)
         .map_err(|_| ApiError::BadRequest("invalid request: body must be a JSON object".into()))
+}
+
+fn text_from_anthropic_content(content: &Value) -> Option<String> {
+    match content {
+        Value::String(s) => {
+            let s = s.trim();
+            (!s.is_empty()).then(|| s.to_string())
+        }
+        Value::Array(blocks) => {
+            let texts: Vec<&str> = blocks
+                .iter()
+                .filter_map(|block| {
+                    let text = block
+                        .as_object()
+                        .filter(|o| o.get("type").and_then(|t| t.as_str()) == Some("text"))?
+                        .get("text")?
+                        .as_str()?
+                        .trim();
+                    (!text.is_empty()).then_some(text)
+                })
+                .collect();
+            (!texts.is_empty()).then(|| texts.join("\n"))
+        }
+        _ => None,
+    }
+}
+
+fn collapse_content_parts(parts: &[Value]) -> Value {
+    if parts.len() == 1 && parts[0].get("type").and_then(|t| t.as_str()) == Some("text") {
+        Value::String(
+            parts[0]
+                .get("text")
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .to_string(),
+        )
+    } else {
+        Value::Array(parts.to_vec())
+    }
+}
+
+fn anthropic_tool_result_content(content: Option<&Value>) -> Option<(Value, String)> {
+    match content {
+        Some(Value::String(s)) => Some((Value::String(s.clone()), s.clone())),
+        None | Some(Value::Null) => Some((Value::String(String::new()), String::new())),
+        Some(Value::Array(blocks)) => {
+            let mut parts = Vec::new();
+            let mut text_parts = Vec::new();
+            for block in blocks {
+                let obj = block.as_object()?;
+                match obj.get("type").and_then(|t| t.as_str()) {
+                    Some("text") => {
+                        let text = obj.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                        if !text.is_empty() {
+                            text_parts.push(text.to_string());
+                        }
+                        parts.push(serde_json::json!({"type":"text","text":text}));
+                    }
+                    _ => return None,
+                }
+            }
+            let joined = text_parts.join("\n");
+            if parts.len() == 1 && parts[0].get("type").and_then(|t| t.as_str()) == Some("text") {
+                let text = parts[0]
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                Some((Value::String(text), joined))
+            } else {
+                Some((Value::Array(parts), joined))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn emit_user_message(openai_messages: &mut Vec<Value>, parts: &mut Vec<Value>) {
+    if parts.is_empty() {
+        return;
+    }
+    openai_messages.push(serde_json::json!({
+        "role": "user",
+        "content": collapse_content_parts(parts),
+    }));
+    parts.clear();
+}
+
+fn anthropic_tools_for_chat(value: &Value) -> Option<Option<Value>> {
+    let Some(tools) = value.get("tools").and_then(|t| t.as_array()) else {
+        return Some(None);
+    };
+    let mut converted = Vec::new();
+    for tool in tools {
+        let obj = tool.as_object()?;
+        let typ = obj.get("type").and_then(|t| t.as_str()).unwrap_or("custom");
+        if typ.starts_with("web_search_")
+            || typ.starts_with("computer_")
+            || typ.starts_with("bash_")
+            || typ.starts_with("text_editor_")
+        {
+            continue;
+        }
+        let name = obj.get("name").and_then(|n| n.as_str())?;
+        let parameters = obj.get("input_schema")?.clone();
+        let mut out = Map::new();
+        out.insert("type".to_string(), Value::String("function".to_string()));
+        if let Some(v) = obj.get("defer_loading") {
+            out.insert("defer_loading".to_string(), v.clone());
+        }
+        out.insert(
+            "function".to_string(),
+            serde_json::json!({
+                "name": name,
+                "description": obj.get("description").and_then(|d| d.as_str()).unwrap_or(""),
+                "parameters": parameters,
+            }),
+        );
+        converted.push(Value::Object(out));
+    }
+
+    let Some(choice) = value.get("tool_choice").and_then(|c| c.as_object()) else {
+        return Some((!converted.is_empty()).then(|| Value::Array(converted)));
+    };
+    match choice.get("type").and_then(|t| t.as_str()) {
+        Some("none") => Some(None),
+        Some("tool") => {
+            let selected = choice.get("name").and_then(|n| n.as_str())?;
+            let filtered: Vec<Value> = converted
+                .into_iter()
+                .filter(|tool| {
+                    tool.get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(|n| n.as_str())
+                        == Some(selected)
+                })
+                .collect();
+            if filtered.is_empty() {
+                None
+            } else {
+                Some(Some(Value::Array(filtered)))
+            }
+        }
+        Some("auto") | Some("any") | None => {
+            Some((!converted.is_empty()).then(|| Value::Array(converted)))
+        }
+        _ => None,
+    }
+}
+
+fn anthropic_message_to_chat(
+    msg: &Value,
+    system_parts: &mut Vec<String>,
+    openai_messages: &mut Vec<Value>,
+) -> Option<()> {
+    let obj = msg.as_object()?;
+    let role = obj.get("role").and_then(|r| r.as_str())?;
+    let content = obj.get("content")?;
+    if role == "system" {
+        if let Some(text) = text_from_anthropic_content(content) {
+            system_parts.push(text);
+        }
+        return Some(());
+    }
+    if matches!(content, Value::String(_)) {
+        openai_messages.push(serde_json::json!({"role": role, "content": content}));
+        return Some(());
+    }
+    let blocks = content.as_array()?;
+    let mut content_parts = Vec::new();
+    let mut tool_calls = Vec::new();
+
+    for block in blocks {
+        let block_obj = block.as_object()?;
+        match block_obj.get("type").and_then(|t| t.as_str()) {
+            Some("text") => content_parts.push(serde_json::json!({
+                "type": "text",
+                "text": block_obj.get("text").and_then(|t| t.as_str()).unwrap_or(""),
+            })),
+            Some("tool_use") => {
+                if role != "assistant" {
+                    return None;
+                }
+                let id = block_obj.get("id").and_then(|id| id.as_str())?;
+                let name = block_obj
+                    .get("name")
+                    .and_then(|name| name.as_str())
+                    .unwrap_or("");
+                let input = block_obj
+                    .get("input")
+                    .filter(|input| input.is_object())
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                let arguments = serde_json::to_string(&input).ok()?;
+                tool_calls.push(serde_json::json!({
+                    "id": id,
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": arguments,
+                    },
+                }));
+            }
+            Some("tool_result") => {
+                let (tool_content, tool_text) =
+                    anthropic_tool_result_content(block_obj.get("content"))?;
+                let tool_call_id = block_obj
+                    .get("tool_use_id")
+                    .or_else(|| block_obj.get("id"))
+                    .and_then(|id| id.as_str())
+                    .unwrap_or("");
+                if role == "user" {
+                    emit_user_message(openai_messages, &mut content_parts);
+                    openai_messages.push(serde_json::json!({
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "content": tool_content,
+                    }));
+                } else {
+                    content_parts.push(serde_json::json!({
+                        "type": "text",
+                        "text": format!("Tool result: {tool_text}"),
+                    }));
+                }
+            }
+            Some("image")
+            | Some("search_result")
+            | Some("tool_reference")
+            | Some("thinking")
+            | Some("redacted_thinking") => return None,
+            _ => return None,
+        }
+    }
+
+    if role == "user" {
+        emit_user_message(openai_messages, &mut content_parts);
+        return Some(());
+    }
+
+    let mut openai_msg = Map::new();
+    openai_msg.insert("role".to_string(), Value::String(role.to_string()));
+    let has_tool_calls = !tool_calls.is_empty();
+    if has_tool_calls {
+        openai_msg.insert("tool_calls".to_string(), Value::Array(tool_calls));
+    }
+    if !content_parts.is_empty() {
+        openai_msg.insert(
+            "content".to_string(),
+            collapse_content_parts(&content_parts),
+        );
+    } else if !has_tool_calls {
+        openai_msg.insert("content".to_string(), Value::String(String::new()));
+    }
+    openai_messages.push(Value::Object(openai_msg));
+    Some(())
+}
+
+/// Build a routing-only OpenAI-chat-shaped view of an Anthropic request.
+///
+/// The worker is still authoritative for Anthropic validation/conversion, and
+/// the original body is forwarded unchanged. This view exists only to let
+/// cache-aware routing hash the same chat-shaped prompt that the worker builds
+/// before tokenization. It intentionally omits request metadata, headers,
+/// priority, and other transport fields.
+fn anthropic_routing_value(body: &Bytes) -> Option<Value> {
+    let value: Value = serde_json::from_slice(body).ok()?;
+    let messages = value.get("messages")?.as_array()?;
+
+    let mut system_parts = Vec::new();
+    if let Some(system) = value.get("system").and_then(text_from_anthropic_content) {
+        system_parts.push(system);
+    }
+
+    let mut routed_messages = Vec::new();
+    for msg in messages {
+        anthropic_message_to_chat(msg, &mut system_parts, &mut routed_messages)?;
+    }
+
+    if !system_parts.is_empty() {
+        routed_messages.insert(
+            0,
+            serde_json::json!({
+                "role": "system",
+                "content": system_parts.join("\n"),
+            }),
+        );
+    }
+
+    let mut out = Map::new();
+    out.insert("messages".to_string(), Value::Array(routed_messages));
+    if let Some(tools) = anthropic_tools_for_chat(&value)? {
+        out.insert("tools".to_string(), tools);
+    }
+    Some(Value::Object(out))
 }
 
 /// POST /v1/messages — select a worker via the per-model policy and proxy the
@@ -290,23 +585,27 @@ async fn messages_inner(
     }
     let workers = eligible.workers;
 
-    // Deliberately do NOT produce routing tokens for /v1/messages.
+    // Produce routing-only tokens for /v1/messages generation requests.
     //
     // The cache-aware-zmq policy hashes the request to find a worker that
     // already holds the prefix in its KV cache. For chat completions the
     // router's chat-encoder tokenization matches the engine's cached blocks.
-    // For Anthropic bodies that is NOT true: the worker's Anthropic serving
-    // path folds the top-level `system` prompt into the actual prompt before
-    // tokenizing, so hashing only `messages` (which `request_tokens_for`
-    // would read) would route two requests with identical `messages` but
-    // different `system` to the same cached worker — a false locality hit.
-    // Rather than replicate the engine's `system`-folding exactly, we skip
-    // router-side tokenization here: cache_aware_zmq falls back to min-load
-    // for /v1/messages, and the worker tokenizes the body itself (we never
-    // forward input_ids). Correct and safe; costs cache affinity on this
-    // route, which is the honest trade-off until the engine exposes its
-    // Anthropic block hashes.
-    let request_tokens: Option<crate::policies::RequestTokens> = None;
+    // Anthropic bodies need one extra normalization step before that is useful:
+    // the worker folds top-level `system` into the prompt before tokenizing.
+    // Hashing raw `messages` would miss that prefix and create false locality
+    // between requests with different systems. Build a routing-only chat-shaped
+    // value that includes the folded system and feed that to the existing chat
+    // encoder. The original Anthropic body is still forwarded unchanged, and we
+    // never inject `input_ids` on this route, so request semantics remain
+    // entirely worker-owned.
+    let request_tokens: Option<RequestTokens> = if forward_path == "/v1/messages" {
+        let routing_value = anthropic_routing_value(&body);
+        routing_value
+            .as_ref()
+            .and_then(|v| request_tokens_for(&ctx.tokenizers, &model_id, v))
+    } else {
+        None
+    };
 
     let routing_key = ctx
         .config
@@ -316,12 +615,9 @@ async fn messages_inner(
         .and_then(|s| headers.get(s.header_name.as_str()))
         .and_then(|v| v.to_str().ok())
         .filter(|s| !s.is_empty());
-    // Pass NO body to the selection context. With `request_tokens = None`
-    // AND no body, CacheAwareZmqPolicy::select cannot tokenize (its fallback
-    // reads the body) and falls back to min-load — which is exactly the honest
-    // behavior we want for /v1/messages (see the request_tokens comment).
-    // Passing the body would let the policy tokenize `messages` and reintroduce
-    // the false-locality bug (identical `messages`, different `system`).
+    // Pass NO body to the selection context. If the routing-only tokenization
+    // above fails, CacheAwareZmqPolicy::select falls back to min-load instead of
+    // tokenizing the raw Anthropic body and losing the top-level `system`.
     // `routing_key` is still honored by the sticky policy (it reads headers, not body).
     let selection_ctx = SelectionContext::with_routing_key(&model_id, None, routing_key)
         .with_request_tokens(request_tokens.as_ref().map(|t| t.ids.as_slice()));
@@ -441,7 +737,14 @@ async fn messages_inner(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_probe;
+    use super::{anthropic_routing_value, parse_probe};
+    use crate::config::{
+        ActiveLoadConfig, Config, DiscoveryBackend, ModelConfig, ObservabilityConfig, PolicyKind,
+        ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
+    };
+    use crate::discovery::ModelId;
+    use crate::policies::request_tokens_for;
+    use crate::tokenizer::TokenizerRegistry;
     use bytes::Bytes;
 
     #[test]
@@ -475,5 +778,256 @@ mod tests {
         let p = parse_probe(&b).unwrap();
         assert_eq!(p.model.as_deref(), Some("claude-3"));
         assert_eq!(p.stream, None);
+    }
+
+    #[test]
+    fn routing_value_folds_system_into_chat_messages() {
+        let b = Bytes::from(
+            r#"{
+                "model":"claude-3",
+                "max_tokens":256,
+                "metadata":{"user_id":"session-a"},
+                "priority":0,
+                "system":[
+                    {"type":"text","text":"top system"},
+                    {"type":"text","text":"second"}
+                ],
+                "messages":[
+                    {"role":"system","content":"mid system"},
+                    {"role":"user","content":"hi"}
+                ]
+            }"#,
+        );
+
+        let routed = anthropic_routing_value(&b).expect("routing value");
+        assert_eq!(
+            routed,
+            serde_json::json!({
+                "messages": [
+                    {"role":"system","content":"top system\nsecond\nmid system"},
+                    {"role":"user","content":"hi"}
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn routing_value_maps_anthropic_tools_and_tool_blocks() {
+        let b = Bytes::from(
+            r#"{
+                "model":"claude-3",
+                "tools":[{
+                    "name":"lookup",
+                    "description":"Look up data",
+                    "input_schema":{"type":"object","properties":{"q":{"type":"string"}}}
+                }],
+                "tool_choice":{"type":"tool","name":"lookup"},
+                "messages":[
+                    {"role":"user","content":"find x"},
+                    {"role":"assistant","content":[
+                        {"type":"text","text":"checking"},
+                        {"type":"tool_use","id":"call_1","name":"lookup","input":{"q":"x"}}
+                    ]},
+                    {"role":"user","content":[
+                        {"type":"tool_result","tool_use_id":"call_1","content":"result x"},
+                        {"type":"text","text":"thanks"}
+                    ]}
+                ]
+            }"#,
+        );
+
+        let routed = anthropic_routing_value(&b).expect("routing value");
+        assert_eq!(
+            routed,
+            serde_json::json!({
+                "messages": [
+                    {"role":"user","content":"find x"},
+                    {
+                        "role":"assistant",
+                        "tool_calls":[{
+                            "id":"call_1",
+                            "type":"function",
+                            "function":{"name":"lookup","arguments":"{\"q\":\"x\"}"}
+                        }],
+                        "content":"checking"
+                    },
+                    {"role":"tool","tool_call_id":"call_1","content":"result x"},
+                    {"role":"user","content":"thanks"}
+                ],
+                "tools":[{
+                    "type":"function",
+                    "function":{
+                        "name":"lookup",
+                        "description":"Look up data",
+                        "parameters":{"type":"object","properties":{"q":{"type":"string"}}}
+                    }
+                }]
+            })
+        );
+    }
+
+    #[test]
+    fn routing_value_rejects_unsupported_multimodal_messages() {
+        let b = Bytes::from(
+            r#"{
+                "model":"claude-3",
+                "messages":[{"role":"user","content":[
+                    {"type":"image","source":{"type":"base64","media_type":"image/png","data":"abc"}}
+                ]}]
+            }"#,
+        );
+
+        assert!(
+            anthropic_routing_value(&b).is_none(),
+            "unsupported multimodal content must not create approximate route-history prefixes"
+        );
+    }
+
+    #[test]
+    fn routing_value_ignores_transport_metadata() {
+        let a = Bytes::from(
+            r#"{
+                "model":"claude-3",
+                "max_tokens":256,
+                "metadata":{"user_id":"session-a"},
+                "priority":0,
+                "system":"same system",
+                "messages":[{"role":"user","content":"hi"}]
+            }"#,
+        );
+        let b = Bytes::from(
+            r#"{
+                "model":"claude-3",
+                "max_tokens":256,
+                "metadata":{"user_id":"session-b"},
+                "priority":100,
+                "system":"same system",
+                "messages":[{"role":"user","content":"hi"}]
+            }"#,
+        );
+
+        assert_eq!(
+            anthropic_routing_value(&a),
+            anthropic_routing_value(&b),
+            "session metadata and priority must not perturb routing prompt"
+        );
+    }
+
+    #[test]
+    fn routing_value_changes_when_system_changes() {
+        let a = Bytes::from(
+            r#"{"model":"claude-3","max_tokens":256,"system":"system-a","messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        let b = Bytes::from(
+            r#"{"model":"claude-3","max_tokens":256,"system":"system-b","messages":[{"role":"user","content":"hi"}]}"#,
+        );
+
+        assert_ne!(
+            anthropic_routing_value(&a),
+            anthropic_routing_value(&b),
+            "routing prompt must include top-level system"
+        );
+    }
+
+    #[test]
+    fn routing_tokens_include_system_but_ignore_metadata() {
+        let cfg = Config {
+            server: ServerConfig {
+                host: "0".into(),
+                port: 0,
+            },
+            observability: ObservabilityConfig::default(),
+            model: ModelConfig {
+                id: "tiny".into(),
+                tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
+                policy: PolicyKind::RoundRobin,
+                circuit_breaker: None,
+                cache_aware: None,
+                sticky: None,
+            },
+            discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
+                urls: vec!["http://placeholder:0".into()],
+                bearer_keys: Vec::new(),
+            }),
+            proxy: ProxyConfig::default(),
+            active_load: ActiveLoadConfig::default(),
+            worker_introspect_key: None,
+            load_poll_interval_secs: None,
+            cache_tree_page_size: None,
+            cache_tree_bigram: false,
+            cache_tree_max_nodes: 1_000_000,
+            alias_fallback: None,
+        };
+        let registry = TokenizerRegistry::load_from_config(&cfg).unwrap();
+        registry.attach_chat_template_for_test(
+            "tiny",
+            &serde_json::json!({
+                "chat_template": "{{ bos_token }}{% for m in messages %}<|{{ m['role'] }}|>{{ m['content'] }}{% endfor %}",
+                "bos_token": "<s>",
+            }),
+        );
+        let model = ModelId("tiny".into());
+
+        let session_a = Bytes::from(
+            r#"{
+                "model":"tiny",
+                "max_tokens":256,
+                "metadata":{"user_id":"session-a"},
+                "priority":0,
+                "system":"same system",
+                "messages":[{"role":"user","content":"hi"}]
+            }"#,
+        );
+        let session_b = Bytes::from(
+            r#"{
+                "model":"tiny",
+                "max_tokens":256,
+                "metadata":{"user_id":"session-b"},
+                "priority":100,
+                "system":"same system",
+                "messages":[{"role":"user","content":"hi"}]
+            }"#,
+        );
+        let different_system = Bytes::from(
+            r#"{
+                "model":"tiny",
+                "max_tokens":256,
+                "metadata":{"user_id":"session-b"},
+                "priority":100,
+                "system":"different system",
+                "messages":[{"role":"user","content":"hi"}]
+            }"#,
+        );
+
+        let ids_a = request_tokens_for(
+            &registry,
+            &model,
+            &anthropic_routing_value(&session_a).unwrap(),
+        )
+        .expect("session a tokens")
+        .ids;
+        let ids_b = request_tokens_for(
+            &registry,
+            &model,
+            &anthropic_routing_value(&session_b).unwrap(),
+        )
+        .expect("session b tokens")
+        .ids;
+        let ids_system = request_tokens_for(
+            &registry,
+            &model,
+            &anthropic_routing_value(&different_system).unwrap(),
+        )
+        .expect("different system tokens")
+        .ids;
+
+        assert_eq!(
+            ids_a, ids_b,
+            "metadata/priority must not perturb cache-aware routing tokens"
+        );
+        assert_ne!(
+            ids_a, ids_system,
+            "top-level system must perturb cache-aware routing tokens"
+        );
     }
 }

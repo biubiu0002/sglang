@@ -114,14 +114,16 @@ impl ChatTemplate {
     /// template may stringify the array (divergent hashes → min-load) or error
     /// (raw prompt-text fallback); neither fails the request.
     ///
-    /// `tools` and `documents` are supplied as `none` — the context HuggingFace
-    /// renders with when a request carries neither, so tools-branching
-    /// templates take the no-tools path. A request that does carry them renders
-    /// the no-tools form, so its hashes won't match the engine and it routes by
-    /// min-load — no worse than before this path existed. Any other variable
-    /// the template prints is a render error (semi-strict undefined), falling
-    /// back to raw rather than hashing a silently divergent prompt.
-    pub fn render(&self, messages: &serde_json::Value) -> Result<String> {
+    /// `tools` is supplied when the worker prompt path would pass function
+    /// schemas into `apply_chat_template`; otherwise it is `none`, matching
+    /// HuggingFace's no-tools context. Any other variable the template prints
+    /// is a render error (semi-strict undefined), falling back to raw rather
+    /// than hashing a silently divergent prompt.
+    pub fn render(
+        &self,
+        messages: &serde_json::Value,
+        tools: Option<&serde_json::Value>,
+    ) -> Result<String> {
         let tmpl = self
             .env
             .get_template(TEMPLATE_NAME)
@@ -129,7 +131,10 @@ impl ChatTemplate {
         let mut ctx: BTreeMap<&str, JinjaValue> = BTreeMap::new();
         ctx.insert("messages", JinjaValue::from_serialize(messages));
         ctx.insert("add_generation_prompt", JinjaValue::from(true));
-        ctx.insert("tools", JinjaValue::from(()));
+        match tools {
+            Some(tools) => ctx.insert("tools", JinjaValue::from_serialize(tools)),
+            None => ctx.insert("tools", JinjaValue::from(())),
+        };
         ctx.insert("documents", JinjaValue::from(()));
         for (name, token) in &self.special_tokens {
             ctx.insert(name, JinjaValue::from(token.clone()));
@@ -215,7 +220,7 @@ mod tests {
             "eos_token": "</s>",
         });
         let tmpl = ChatTemplate::from_tokenizer_config(&cfg).unwrap().unwrap();
-        let out = tmpl.render(&messages()).unwrap();
+        let out = tmpl.render(&messages(), None).unwrap();
         assert_eq!(
             out,
             "<s><|system|>\nbe brief<|end|>\n<|user|>\nhi<|end|>\n<|assistant|>\n"
@@ -229,7 +234,7 @@ mod tests {
         let cfg = json!({ "chat_template": SIMPLE_TEMPLATE, "bos_token": "<s>" });
         let tmpl = ChatTemplate::from_tokenizer_config(&cfg).unwrap().unwrap();
         assert!(tmpl
-            .render(&messages())
+            .render(&messages(), None)
             .unwrap()
             .ends_with("<|assistant|>\n"));
     }
@@ -246,7 +251,7 @@ mod tests {
         });
         let tmpl = ChatTemplate::from_tokenizer_config(&cfg).unwrap().unwrap();
         assert!(tmpl
-            .render(&messages())
+            .render(&messages(), None)
             .unwrap()
             .starts_with("<s><|system|>"));
     }
@@ -259,7 +264,7 @@ mod tests {
             "bos_token": {"content": "<|begin|>", "lstrip": false},
         });
         let tmpl = ChatTemplate::from_tokenizer_config(&cfg).unwrap().unwrap();
-        assert_eq!(tmpl.render(&json!([])).unwrap(), "<|begin|>X");
+        assert_eq!(tmpl.render(&json!([]), None).unwrap(), "<|begin|>X");
     }
 
     /// `raise_exception` surfaces as a render error (caller then falls back to
@@ -271,7 +276,7 @@ mod tests {
             "bos_token": "<s>",
         });
         let tmpl = ChatTemplate::from_tokenizer_config(&cfg).unwrap().unwrap();
-        let err = tmpl.render(&messages()).unwrap_err();
+        let err = tmpl.render(&messages(), None).unwrap_err();
         // The minijinja message is the cause; check the full anyhow chain.
         assert!(format!("{err:#}").contains("bad messages"), "got: {err:#}");
     }
@@ -285,7 +290,7 @@ mod tests {
             "bos_token": "<s>",
         });
         let tmpl = ChatTemplate::from_tokenizer_config(&cfg).unwrap().unwrap();
-        assert_eq!(tmpl.render(&messages()).unwrap(), "BE BRIEF");
+        assert_eq!(tmpl.render(&messages(), None).unwrap(), "BE BRIEF");
     }
 
     /// An absent special token renders as `""` exactly like an undefined name
@@ -295,7 +300,7 @@ mod tests {
     fn absent_special_tokens_render_empty() {
         let cfg = json!({"chat_template": "A{{ bos_token }}{{ pad_token }}B"});
         let tmpl = ChatTemplate::from_tokenizer_config(&cfg).unwrap().unwrap();
-        assert_eq!(tmpl.render(&json!([])).unwrap(), "AB");
+        assert_eq!(tmpl.render(&json!([]), None).unwrap(), "AB");
     }
 
     /// Every name in HuggingFace's `special_tokens_map` is threaded from
@@ -308,7 +313,7 @@ mod tests {
             "unk_token": {"content": "<unk>"},
         });
         let tmpl = ChatTemplate::from_tokenizer_config(&cfg).unwrap().unwrap();
-        assert_eq!(tmpl.render(&json!([])).unwrap(), "<pad>|<unk>");
+        assert_eq!(tmpl.render(&json!([]), None).unwrap(), "<pad>|<unk>");
     }
 
     /// Printing a variable the router doesn't supply is a render error
@@ -321,7 +326,7 @@ mod tests {
             "bos_token": "<s>",
         });
         let tmpl = ChatTemplate::from_tokenizer_config(&cfg).unwrap().unwrap();
-        tmpl.render(&messages()).unwrap_err();
+        tmpl.render(&messages(), None).unwrap_err();
     }
 
     /// Undefined names stay usable in if-tests (semi-strict only rejects
@@ -333,7 +338,7 @@ mod tests {
             "chat_template": "{% if enable_thinking is defined and enable_thinking %}T{% endif %}X",
         });
         let tmpl = ChatTemplate::from_tokenizer_config(&cfg).unwrap().unwrap();
-        assert_eq!(tmpl.render(&messages()).unwrap(), "X");
+        assert_eq!(tmpl.render(&messages(), None).unwrap(), "X");
     }
 
     /// `tools` is `none` in the render context — the same context HuggingFace
@@ -345,7 +350,21 @@ mod tests {
             "chat_template": "{% if tools is not none %}TOOLS{% endif %}X",
         });
         let tmpl = ChatTemplate::from_tokenizer_config(&cfg).unwrap().unwrap();
-        assert_eq!(tmpl.render(&messages()).unwrap(), "X");
+        assert_eq!(tmpl.render(&messages(), None).unwrap(), "X");
+    }
+
+    /// When tools are supplied, they are serialized into the template context
+    /// instead of forcing the no-tools branch.
+    #[test]
+    fn tools_are_rendered_when_supplied() {
+        let cfg = json!({
+            "chat_template": "{% if tools is not none %}{% for tool in tools %}{{ tool['function']['name'] }}:{% endfor %}{% endif %}X",
+        });
+        let tmpl = ChatTemplate::from_tokenizer_config(&cfg).unwrap().unwrap();
+        let tools = json!([
+            {"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}
+        ]);
+        assert_eq!(tmpl.render(&messages(), Some(&tools)).unwrap(), "lookup:X");
     }
 
     /// trim_blocks + lstrip_blocks match HuggingFace's compilation: the newline
@@ -361,6 +380,6 @@ mod tests {
         // Each iteration emits just "<role>\n"; lstrip removes the two leading
         // spaces before the `{% if %}`/`{% endif %}`, trim removes the newline
         // immediately after each block tag.
-        assert_eq!(tmpl.render(&messages()).unwrap(), "system\nuser\n");
+        assert_eq!(tmpl.render(&messages(), None).unwrap(), "system\nuser\n");
     }
 }

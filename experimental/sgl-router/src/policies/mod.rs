@@ -60,7 +60,8 @@ pub fn request_tokens_for(
 ) -> Option<RequestTokens> {
     if tokenizers.has_chat_encoder(&model_id.0) {
         if let Some(messages) = value.get("messages").filter(|m| m.is_array()) {
-            if let Some(ids) = tokenizers.encode_chat(&model_id.0, messages) {
+            let tools = value.get("tools").filter(|t| t.is_array());
+            if let Some(ids) = tokenizers.encode_chat_with_tools(&model_id.0, messages, tools) {
                 return Some(RequestTokens {
                     ids,
                     engine_equivalent: true,

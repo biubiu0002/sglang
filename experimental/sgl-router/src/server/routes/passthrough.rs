@@ -10,6 +10,7 @@
 use crate::discovery::{ModelId, WorkerMode};
 use crate::policies::registry::{filter_eligible, PdPoolResolver, PdResolveError};
 use crate::policies::SelectionContext;
+use crate::policies::{request_tokens_for, RequestTokens};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{PriorityFilterOutcome, RequestOutcome, WorkerModeLabel};
@@ -190,6 +191,18 @@ async fn passthrough_primary(
     }
     let workers = eligible.workers;
 
+    // /v1/completions has an explicit raw `prompt`; feed those tokens to
+    // cache-aware routing without changing the worker-facing passthrough body.
+    // Other generic passthrough shapes stay min-load until their engine prompt
+    // construction is replicated exactly enough for routing hashes.
+    let request_tokens: Option<RequestTokens> = if path == "/v1/completions" {
+        serde_json::from_slice::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| request_tokens_for(&ctx.tokenizers, &model_id, &v))
+    } else {
+        None
+    };
+
     let routing_key = ctx
         .config
         .model
@@ -198,7 +211,8 @@ async fn passthrough_primary(
         .and_then(|s| headers.get(s.header_name.as_str()))
         .and_then(|v| v.to_str().ok())
         .filter(|s| !s.is_empty());
-    let selection_ctx = SelectionContext::with_routing_key(&model_id, None, routing_key);
+    let selection_ctx = SelectionContext::with_routing_key(&model_id, None, routing_key)
+        .with_request_tokens(request_tokens.as_ref().map(|t| t.ids.as_slice()));
     let (worker, pending_guard) = {
         let _selection_guard = ctx.selection_lock.lock().await;
         let worker = policy.select(&workers, &selection_ctx).ok_or_else(|| {
@@ -214,7 +228,10 @@ async fn passthrough_primary(
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("build worker auth header: {e}")))?;
 
     let guard = worker.load_guard();
-    let prefill_load = crate::server::routes::chat::estimate_prefill_tokens(&body);
+    let prefill_load = request_tokens
+        .as_ref()
+        .map(|t| t.ids.len().max(1))
+        .unwrap_or_else(|| crate::server::routes::chat::estimate_prefill_tokens(&body));
     let active_guard =
         ctx.active_load
             .register(worker.id.clone(), worker.url.clone(), prefill_load, 0);

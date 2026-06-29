@@ -23,6 +23,7 @@ use sgl_router::workers::WorkerRegistry;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
+use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
 use tower::ServiceExt;
@@ -117,6 +118,87 @@ fn build_ctx_with_prefill_worker(url: &str) -> Arc<AppContext> {
     let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(TEST_TIMEOUT).unwrap());
     Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies))
+}
+
+fn build_cache_aware_ctx_with_workers(urls: [&str; 2]) -> Arc<AppContext> {
+    let cfg = Config {
+        server: ServerConfig {
+            host: "0".into(),
+            port: 0,
+        },
+        observability: ObservabilityConfig::default(),
+        model: ModelConfig {
+            id: "tiny".into(),
+            tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
+            policy: PolicyKind::CacheAwareZmq,
+            circuit_breaker: None,
+            cache_aware: Some(sgl_router::config::CacheAwareConfig {
+                cache_threshold: 0.0,
+                balance_abs_threshold: usize::MAX,
+                use_reported_load: true,
+                tree_source: sgl_router::config::CacheTreeSource::RouteHistory,
+                ..sgl_router::config::CacheAwareConfig::default()
+            }),
+            sticky: None,
+        },
+        discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
+            urls: vec!["http://placeholder:0".into()],
+            bearer_keys: Vec::new(),
+        }),
+        proxy: ProxyConfig::default(),
+        active_load: ActiveLoadConfig::default(),
+        worker_introspect_key: None,
+        load_poll_interval_secs: Some(2),
+        cache_tree_page_size: Some(1),
+        cache_tree_bigram: false,
+        cache_tree_max_nodes: 1_000_000,
+        alias_fallback: None,
+    };
+    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
+    let registry = Arc::new(WorkerRegistry::default());
+    for (idx, url) in urls.iter().enumerate() {
+        let id = WorkerId(format!("w{idx}"));
+        registry
+            .add(WorkerSpec {
+                id: id.clone(),
+                url: (*url).to_string(),
+                mode: WorkerMode::Plain,
+                model_ids: vec![ModelId("tiny".into())],
+                bootstrap_port: None,
+                min_priority: None,
+                bearer_token: None,
+            })
+            .unwrap();
+        registry
+            .get(&id)
+            .expect("worker was registered")
+            .set_reported_load(if idx == 0 { 0 } else { 10 });
+    }
+    let block_size_oracle = sgl_router::policies::kv_events::BlockSizeOracle::new();
+    block_size_oracle
+        .try_set(1)
+        .expect("test block size should seed");
+    let policies = Arc::new(
+        sgl_router::policies::factory::build_registry(
+            &cfg,
+            Arc::new(sgl_router::policies::kv_events::HashTree::new()),
+            Arc::clone(&tokenizers),
+            block_size_oracle,
+        )
+        .unwrap(),
+    );
+    let proxy = Arc::new(Proxy::new(TEST_TIMEOUT).unwrap());
+    Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies))
+}
+
+async fn send_messages(app: axum::Router, body: Value) -> StatusCode {
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    app.oneshot(req).await.unwrap().status()
 }
 
 #[tokio::test]
@@ -246,7 +328,7 @@ async fn messages_missing_model_returns_400() {
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     // Router-originated errors on this endpoint are Anthropic-shaped.
     let bytes = res.into_body().collect().await.unwrap().to_bytes();
-    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(v["type"], "error", "envelope type must be 'error'");
     assert_eq!(v["error"]["type"], "invalid_request_error");
     assert!(v["error"]["message"].as_str().unwrap().contains("model"));
@@ -277,11 +359,45 @@ async fn messages_body_forwarded_unchanged_no_input_ids() {
     assert_eq!(res.status(), StatusCode::OK);
 
     let forwarded = worker.captured.lock().unwrap().last_body.clone();
-    let fwd: serde_json::Value = serde_json::from_slice(&forwarded.unwrap()).unwrap();
+    let fwd: Value = serde_json::from_slice(&forwarded.unwrap()).unwrap();
     assert!(fwd.get("input_ids").is_none(), "must not inject input_ids");
+    assert_eq!(fwd, serde_json::from_slice::<Value>(&sent).unwrap());
+}
+
+#[tokio::test]
+async fn messages_prompt_tokens_feed_cache_aware_route_history() {
+    let first = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let second = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let ctx = build_cache_aware_ctx_with_workers([&first.url, &second.url]);
+    let app = build_router(ctx);
+
+    let body = json!({
+        "model": "tiny",
+        "system": "shared messages system",
+        "messages": [{"role": "user", "content": "repeatable messages prefix"}],
+        "max_tokens": 16,
+        "stream": false,
+    });
     assert_eq!(
-        fwd,
-        serde_json::from_slice::<serde_json::Value>(&sent).unwrap()
+        send_messages(app.clone(), body.clone()).await,
+        StatusCode::OK
+    );
+    {
+        let first_seen = first.captured.lock().unwrap().last_body.is_some();
+        let second_seen = second.captured.lock().unwrap().last_body.is_some();
+        assert!(
+            first_seen && !second_seen,
+            "first request should use min-load"
+        );
+    }
+
+    first.captured.lock().unwrap().last_body = None;
+    assert_eq!(send_messages(app, body).await, StatusCode::OK);
+    let first_seen = first.captured.lock().unwrap().last_body.is_some();
+    let second_seen = second.captured.lock().unwrap().last_body.is_some();
+    assert!(
+        first_seen && !second_seen,
+        "second request should reuse the route-history prefix hit"
     );
 }
 
@@ -408,7 +524,7 @@ async fn messages_upstream_error_is_anthropic_shaped_and_does_not_leak_url() {
     let bytes = res.into_body().collect().await.unwrap().to_bytes();
     let text = String::from_utf8_lossy(&bytes);
     assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["type"],
+        serde_json::from_slice::<Value>(&bytes).unwrap()["type"],
         "error",
         "envelope must be Anthropic-shaped: {text}"
     );

@@ -286,7 +286,7 @@ async fn passthrough_primary(
         Err(_) => RequestOutcome::Error,
     };
     ctx.metrics
-        .record_request(&metrics_worker_url, &metrics_model, metrics_mode, outcome);
+        .record_worker_request(&metrics_worker_url, &metrics_model, metrics_mode, outcome);
 
     let elapsed = start.elapsed();
     if !streaming {
@@ -297,7 +297,6 @@ async fn passthrough_primary(
         Ok(resp) => resp.status().as_u16(),
         Err(e) => e.status_code().as_u16(),
     };
-    ctx.metrics.record_response(http_status);
     let request_id = headers
         .get("x-request-id")
         .and_then(|v| v.to_str().ok())

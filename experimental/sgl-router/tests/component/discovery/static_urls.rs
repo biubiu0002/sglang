@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use sgl_router::config::StaticUrlsDiscoveryConfig;
+use sgl_router::config::{StaticUrlsDiscoveryConfig, WorkerBearerKeyConfig};
 use sgl_router::discovery::{DiscoveryEvent, WorkerMode};
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,6 +11,7 @@ use tokio::sync::mpsc;
 async fn emits_one_added_per_url_with_plain_seed() {
     let cfg = StaticUrlsDiscoveryConfig {
         urls: vec!["http://x:30000".into(), "http://y:30000".into()],
+        bearer_keys: Vec::new(),
     };
     let (tx, mut rx) = mpsc::channel(16);
     let _h = sgl_router::discovery::static_urls::spawn(cfg, tx)
@@ -56,6 +57,7 @@ async fn emits_one_added_per_url_with_plain_seed() {
 async fn emits_one_event_and_parks_until_receiver_dropped() {
     let cfg = StaticUrlsDiscoveryConfig {
         urls: vec!["http://x:30000".into()],
+        bearer_keys: Vec::new(),
     };
     let (tx, mut rx) = mpsc::channel(16);
     let h = sgl_router::discovery::static_urls::spawn(cfg, tx)
@@ -136,6 +138,7 @@ async fn static_urls_pd_role_resolved_end_to_end() {
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec![url.clone()],
+            bearer_keys: Vec::new(),
         }),
         proxy: ProxyConfig::default(),
         active_load: ActiveLoadConfig::default(),
@@ -144,6 +147,7 @@ async fn static_urls_pd_role_resolved_end_to_end() {
         cache_tree_page_size: None,
         cache_tree_bigram: false,
         cache_tree_max_nodes: 1_000_000,
+        alias_fallback: None,
     };
 
     let registry = Arc::new(WorkerRegistry::default());
@@ -175,4 +179,31 @@ async fn static_urls_pd_role_resolved_end_to_end() {
     );
 
     let _ = shutdown_tx.send(());
+}
+
+#[tokio::test]
+async fn emits_worker_bearer_token_for_matching_url() {
+    let cfg = StaticUrlsDiscoveryConfig {
+        urls: vec!["http://x:30000/".into()],
+        bearer_keys: vec![WorkerBearerKeyConfig {
+            worker_url: "http://x:30000".into(),
+            bearer_token: "sk-worker".into(),
+        }],
+    };
+    let (tx, mut rx) = mpsc::channel(16);
+    let _h = sgl_router::discovery::static_urls::spawn(cfg, tx)
+        .await
+        .unwrap();
+
+    let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    match event {
+        DiscoveryEvent::Added(spec) => {
+            assert_eq!(spec.url, "http://x:30000/");
+            assert_eq!(spec.bearer_token.as_deref(), Some("sk-worker"));
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
 }

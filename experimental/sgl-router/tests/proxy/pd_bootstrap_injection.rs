@@ -52,6 +52,7 @@ fn config() -> Config {
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec!["http://placeholder:0".into()],
+            bearer_keys: Vec::new(),
         }),
         proxy: ProxyConfig::default(),
         active_load: ActiveLoadConfig::default(),
@@ -60,6 +61,7 @@ fn config() -> Config {
         cache_tree_page_size: None,
         cache_tree_bigram: false,
         cache_tree_max_nodes: 1_000_000,
+        alias_fallback: None,
     }
 }
 
@@ -148,6 +150,7 @@ async fn pd_mode_chat_injects_bootstrap_fields_into_both_bodies() {
             model_ids: vec![ModelId("tiny".into())],
             bootstrap_port: Some(8997),
             min_priority: None,
+            bearer_token: None,
         },
         WorkerSpec {
             id: WorkerId("d1".into()),
@@ -156,6 +159,7 @@ async fn pd_mode_chat_injects_bootstrap_fields_into_both_bodies() {
             model_ids: vec![ModelId("tiny".into())],
             bootstrap_port: None,
             min_priority: None,
+            bearer_token: None,
         },
     ]);
     let app = build_router(ctx);
@@ -206,6 +210,7 @@ async fn plain_mode_chat_does_not_inject_bootstrap_fields() {
         model_ids: vec![ModelId("tiny".into())],
         bootstrap_port: None,
         min_priority: None,
+        bearer_token: None,
     }]);
     let app = build_router(ctx);
 
@@ -244,6 +249,7 @@ async fn pd_mode_bootstrap_port_matches_chosen_prefill_worker() {
             model_ids: vec![ModelId("tiny".into())],
             bootstrap_port: Some(11111),
             min_priority: None,
+            bearer_token: None,
         },
         WorkerSpec {
             id: WorkerId("pB".into()),
@@ -252,6 +258,7 @@ async fn pd_mode_bootstrap_port_matches_chosen_prefill_worker() {
             model_ids: vec![ModelId("tiny".into())],
             bootstrap_port: Some(22222),
             min_priority: None,
+            bearer_token: None,
         },
         WorkerSpec {
             id: WorkerId("d1".into()),
@@ -260,6 +267,7 @@ async fn pd_mode_bootstrap_port_matches_chosen_prefill_worker() {
             model_ids: vec![ModelId("tiny".into())],
             bootstrap_port: None,
             min_priority: None,
+            bearer_token: None,
         },
     ]);
     let app = build_router(ctx);
@@ -311,6 +319,7 @@ async fn pd_mode_prefill_5xx_does_not_poison_decode_response() {
             model_ids: vec![ModelId("tiny".into())],
             bootstrap_port: Some(8997),
             min_priority: None,
+            bearer_token: None,
         },
         WorkerSpec {
             id: WorkerId("d1".into()),
@@ -319,6 +328,7 @@ async fn pd_mode_prefill_5xx_does_not_poison_decode_response() {
             model_ids: vec![ModelId("tiny".into())],
             bootstrap_port: None,
             min_priority: None,
+            bearer_token: None,
         },
     ]);
     let app = build_router(ctx);

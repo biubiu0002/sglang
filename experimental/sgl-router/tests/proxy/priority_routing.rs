@@ -52,6 +52,7 @@ fn config() -> Config {
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec!["http://placeholder:0".into()],
+            bearer_keys: Vec::new(),
         }),
         proxy: ProxyConfig::default(),
         active_load: ActiveLoadConfig::default(),
@@ -60,6 +61,7 @@ fn config() -> Config {
         cache_tree_page_size: None,
         cache_tree_bigram: false,
         cache_tree_max_nodes: 1_000_000,
+        alias_fallback: None,
     }
 }
 
@@ -83,6 +85,7 @@ fn plain_spec(id: &str, url: &str, min_priority: Option<i64>) -> WorkerSpec {
         model_ids: vec![ModelId("tiny".into())],
         bootstrap_port: None,
         min_priority,
+        bearer_token: None,
     }
 }
 
@@ -214,6 +217,7 @@ async fn unknown_model_with_gated_worker_is_404_not_503() {
         model_ids: vec![ModelId("ghost".into())],
         bootstrap_port: None,
         min_priority: Some(100),
+        bearer_token: None,
     };
     let ctx = build_ctx(vec![spec]);
 

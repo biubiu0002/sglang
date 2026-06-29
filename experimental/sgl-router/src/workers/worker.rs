@@ -3,6 +3,8 @@
 
 use crate::discovery::{ModelId, WorkerId, WorkerMode};
 use crate::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+use axum::http::{header, HeaderMap, HeaderValue};
+use std::borrow::Cow;
 use std::sync::atomic::{AtomicI64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -145,6 +147,7 @@ pub struct Worker {
     /// `Arc<AtomicI64>` so the poller updates it lock-free without a
     /// registry write-lock.
     reported_load: Arc<AtomicI64>,
+    bearer_token: Option<String>,
 }
 
 /// `reported_load` sentinel: no real data (poller off / not yet polled).
@@ -182,6 +185,7 @@ impl Worker {
             bootstrap_port: spec.bootstrap_port,
             min_priority: spec.min_priority,
             reported_load: Arc::new(AtomicI64::new(REPORTED_LOAD_UNSET)),
+            bearer_token: spec.bearer_token,
         }
     }
 
@@ -202,6 +206,30 @@ impl Worker {
     /// [`crate::policies::registry::filter_eligible`]).
     pub fn min_priority(&self) -> Option<i64> {
         self.min_priority
+    }
+
+    /// Optional per-worker bearer token. Shared-key pools leave this unset
+    /// and forward the inbound client Authorization header unchanged.
+    pub fn bearer_token(&self) -> Option<&str> {
+        self.bearer_token.as_deref()
+    }
+
+    /// Headers to use for an upstream request to this worker. For legacy
+    /// per-worker-key pools this clones the inbound header map and replaces
+    /// Authorization with the worker's own key; otherwise it borrows the
+    /// inbound headers unchanged.
+    pub fn headers_for<'a>(
+        &self,
+        headers: &'a HeaderMap,
+    ) -> Result<Cow<'a, HeaderMap>, header::InvalidHeaderValue> {
+        let Some(token) = self.bearer_token() else {
+            return Ok(Cow::Borrowed(headers));
+        };
+        let mut outbound = headers.clone();
+        let mut value = HeaderValue::from_str(&format!("Bearer {token}"))?;
+        value.set_sensitive(true);
+        outbound.insert(header::AUTHORIZATION, value);
+        Ok(Cow::Owned(outbound))
     }
 
     /// Returns the current [`WorkerMode`] of this worker.
@@ -300,6 +328,7 @@ mod tests {
             model_ids: vec![ModelId("m".into())],
             bootstrap_port: None,
             min_priority: None,
+            bearer_token: None,
         });
         assert_eq!(w.active_load(), 0);
         let g = w.load_guard();
@@ -321,6 +350,7 @@ mod tests {
             model_ids: vec![],
             bootstrap_port: None,
             min_priority: None,
+            bearer_token: None,
         });
         // Seed router-side in-flight = 2.
         let _g1 = w.load_guard();
@@ -367,6 +397,7 @@ mod tests {
                 model_ids: vec![],
                 bootstrap_port: None,
                 min_priority: None,
+                bearer_token: None,
             });
             assert_eq!(w.mode(), m);
         }
@@ -381,6 +412,7 @@ mod tests {
             model_ids: vec![],
             bootstrap_port: None,
             min_priority: None,
+            bearer_token: None,
         });
         assert_eq!(w.mode(), WorkerMode::Prefill);
         w.set_mode(WorkerMode::Decode);
@@ -398,6 +430,7 @@ mod tests {
             model_ids: vec![ModelId("m".into())],
             bootstrap_port: Some(8997),
             min_priority: None,
+            bearer_token: None,
         });
         assert_eq!(w.bootstrap_port(), Some(8997));
     }
@@ -411,6 +444,7 @@ mod tests {
             model_ids: vec![],
             bootstrap_port: None,
             min_priority: None,
+            bearer_token: None,
         });
         assert_eq!(w.bootstrap_port(), None);
     }
@@ -424,6 +458,7 @@ mod tests {
             model_ids: vec![],
             bootstrap_port: Some(8997),
             min_priority: None,
+            bearer_token: None,
         });
         assert_eq!(w.bootstrap_host(), "10.0.0.1");
     }
@@ -437,6 +472,7 @@ mod tests {
             model_ids: vec![],
             bootstrap_port: Some(8997),
             min_priority: None,
+            bearer_token: None,
         });
         assert_eq!(w.bootstrap_host(), "prefill-0.svc.cluster.local");
     }
@@ -454,6 +490,7 @@ mod tests {
             model_ids: vec![],
             bootstrap_port: Some(8997),
             min_priority: None,
+            bearer_token: None,
         });
         assert_eq!(w.bootstrap_host(), "localhost");
     }

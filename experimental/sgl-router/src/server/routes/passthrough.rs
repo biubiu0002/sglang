@@ -1,24 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! OpenAI `/v1/responses` passthrough route.
+//! Generic OpenAI-compatible passthrough routes.
 //!
-//! Forwards the OpenAI Responses request body to a selected SGLang worker at
-//! `/v1/responses` without translating to/from chat completions — the worker
-//! natively serves `/v1/responses`. The router only needs `model` and `stream`
-//! from the body for worker selection and buffered-vs-SSE routing.
-//!
-//! Mirrors `messages.rs` exactly except for the forward path and the error
-//! envelope: router-originated `ApiError`s use the default OpenAI-shaped
-//! `IntoResponse` (`{"error":{"type","code","message"}}`) — the same shape the
-//! `/v1/chat/completions` path returns — so OpenAI SDK / Codex clients parse
-//! router-side failures uniformly. Worker-originated errors are forwarded
-//! verbatim and are already OpenAI-shaped.
-//!
-//! Deliberately does NOT replicate chat.rs's `input_ids` forwarding, PD
-//! bootstrap injection, or decode-peer resolution (see design.md). It DOES
-//! register active-load + hold the per-worker LoadGuard so load-aware policies
-//! (`power_of_two`, `cache_aware_zmq`) see accurate in-flight counts.
+//! These endpoints keep the worker-facing path and request schema unchanged,
+//! while still applying router-side model selection, priority gating, active
+//! load accounting, and alias fallback.
 
 use crate::discovery::{ModelId, WorkerMode};
 use crate::policies::registry::{filter_eligible, PdPoolResolver, PdResolveError};
@@ -37,42 +24,51 @@ use bytes::Bytes;
 use serde::Deserialize;
 use std::sync::Arc;
 
-/// Per-route body cap, mirroring chat/messages. Same rationale: bound heap
-/// allocation before forwarding while accommodating long contexts.
-pub const MAX_RESPONSES_BODY_BYTES: usize = 5 << 20;
+/// Same cap as chat/messages. These routes are raw passthrough, so the worker
+/// remains authoritative for schema validation.
+pub const MAX_PASSTHROUGH_BODY_BYTES: usize = 5 << 20;
 
-/// Minimal probe: `model` selects the worker, `stream` picks buffered vs SSE.
-/// The worker is authoritative for the full Responses schema. `#[serde(default)]`
-/// keeps it tolerant of optional fields — only `model` is required.
 #[derive(Debug, Deserialize)]
-struct ResponsesProbe {
+struct PassthroughProbe {
     #[serde(default)]
     stream: Option<bool>,
     model: Option<String>,
-    /// Request priority, captured as a raw JSON value so a malformed value
-    /// is tolerated (treated as `0`) rather than rejected. Gates
-    /// capacity-restricted workers (see [`filter_eligible`]).
     #[serde(default)]
     priority: Option<serde_json::Value>,
 }
 
-fn parse_probe(body: &Bytes) -> Result<ResponsesProbe, ApiError> {
+fn parse_probe(body: &Bytes) -> Result<PassthroughProbe, ApiError> {
     serde_json::from_slice(body)
         .map_err(|_| ApiError::BadRequest("invalid request: body must be a JSON object".into()))
 }
 
-/// POST /v1/responses — select a worker via the per-model policy and proxy the
-/// raw Responses body to `<worker>/v1/responses`. Router-side failures map to
-/// the default OpenAI error envelope via `ApiError`'s `IntoResponse`.
+pub async fn completions(
+    State(ctx): State<Arc<AppContext>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response<Body>, ApiError> {
+    passthrough(State(ctx), headers, body, "/v1/completions", "completions").await
+}
+
 pub async fn responses(
     State(ctx): State<Arc<AppContext>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
+    passthrough(State(ctx), headers, body, "/v1/responses", "responses").await
+}
+
+async fn passthrough(
+    State(ctx): State<Arc<AppContext>>,
+    headers: HeaderMap,
+    body: Bytes,
+    path: &'static str,
+    log_name: &'static str,
+) -> Result<Response<Body>, ApiError> {
     let probe = parse_probe(&body)?;
+    let streaming = probe.stream.unwrap_or(false);
     let model_str = probe
         .model
-        .clone()
         .ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?;
     let Some(cfg) = ctx
         .config
@@ -81,8 +77,9 @@ pub async fn responses(
         .filter(|cfg| cfg.alias_model_id == model_str)
         .cloned()
     else {
-        return responses_inner(State(ctx), headers, body).await;
+        return passthrough_primary(State(ctx), headers, body, path, log_name).await;
     };
+
     let request_id = headers
         .get("x-request-id")
         .and_then(|v| v.to_str().ok())
@@ -95,22 +92,23 @@ pub async fn responses(
         alias = %cfg.alias_model_id,
         route = "primary",
         primary_model = %cfg.primary_model_id,
-        path = "/v1/responses",
+        path,
         "alias primary selected",
     );
-    let primary = responses_inner(State(Arc::clone(&ctx)), headers.clone(), primary_body).await;
+
+    let primary = passthrough_primary(
+        State(Arc::clone(&ctx)),
+        headers.clone(),
+        primary_body,
+        path,
+        log_name,
+    )
+    .await;
     match primary {
         Ok(resp) => {
             if let Some(reason) = fallback_reason_for_response(resp.status()) {
                 forward_to_fallback(
-                    &ctx,
-                    &cfg,
-                    &headers,
-                    &body,
-                    "/v1/responses",
-                    probe.stream.unwrap_or(false),
-                    request_id,
-                    reason,
+                    &ctx, &cfg, &headers, &body, path, streaming, request_id, reason,
                 )
                 .await
             } else {
@@ -120,14 +118,7 @@ pub async fn responses(
         Err(e) => {
             if let Some(reason) = fallback_reason_for_error(&e) {
                 forward_to_fallback(
-                    &ctx,
-                    &cfg,
-                    &headers,
-                    &body,
-                    "/v1/responses",
-                    probe.stream.unwrap_or(false),
-                    request_id,
-                    reason,
+                    &ctx, &cfg, &headers, &body, path, streaming, request_id, reason,
                 )
                 .await
             } else {
@@ -137,10 +128,12 @@ pub async fn responses(
     }
 }
 
-async fn responses_inner(
+async fn passthrough_primary(
     State(ctx): State<Arc<AppContext>>,
     headers: HeaderMap,
     body: Bytes,
+    path: &'static str,
+    log_name: &'static str,
 ) -> Result<Response<Body>, ApiError> {
     let start = std::time::Instant::now();
     let probe = parse_probe(&body)?;
@@ -150,7 +143,6 @@ async fn responses_inner(
         .ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?;
     let model_id = ModelId(model_str.clone());
 
-    // Same candidate set as chat (prefill pool for PD; full set for plain).
     let resolver = PdPoolResolver::new(Arc::clone(&ctx.registry));
     let workers = resolver
         .prefill_candidates(&model_id)
@@ -166,32 +158,17 @@ async fn responses_inner(
             },
         })?;
 
-    // Resolve the model's policy BEFORE priority filtering — see the
-    // `/v1/chat/completions` path: an unknown model must 404 `ModelNotFound`
-    // rather than be masked by a 503 from the eligibility filter emptying a
-    // gated-but-policyless model's candidate set.
     let policy = ctx
         .policies
         .get(&model_id)
         .ok_or_else(|| ApiError::ModelNotFound(model_str.clone()))?;
 
-    // PD-disaggregated mode is unsupported on this route (same rationale as
-    // /v1/messages): this passthrough forwards to a single worker and does NOT
-    // replicate chat.rs's decode-peer resolution + bootstrap body injection, so
-    // silently forwarding to a prefill worker would hang. Reject (400) BEFORE
-    // priority filtering so the honest "PD not supported" error surfaces rather
-    // than a misleading 503 from the filter emptying the candidate set.
     if workers.iter().any(|w| w.mode() != WorkerMode::Plain) {
-        return Err(ApiError::BadRequest(
-            "/v1/responses passthrough does not support PD-disaggregated mode yet; use /v1/chat/completions".into(),
-        ));
+        return Err(ApiError::BadRequest(format!(
+            "{path} passthrough does not support PD-disaggregated mode yet; use /v1/chat/completions"
+        )));
     }
 
-    // Priority-eligibility filtering — identical semantics to the
-    // `/v1/chat/completions` and `/v1/messages` paths: capacity-restricted
-    // workers are removed for sub-threshold requests before policy selection.
-    // Hard isolation: if filtering empties the candidate set, reject with 503
-    // rather than spill the request onto a gated worker.
     let request_priority = crate::policies::priority_from_value(probe.priority.as_ref());
     let eligible = filter_eligible(&workers, request_priority);
     if eligible.excluded_all {
@@ -199,6 +176,7 @@ async fn responses_inner(
             model = %model_str,
             request_priority,
             healthy_workers = workers.len(),
+            path,
             "priority filter removed all candidates; rejecting request (no eligible-capacity worker healthy for this priority)",
         );
         ctx.metrics
@@ -212,18 +190,6 @@ async fn responses_inner(
     }
     let workers = eligible.workers;
 
-    // Deliberately do NOT produce routing tokens for /v1/responses.
-    //
-    // Same rationale as /v1/messages: the worker's Responses serving path
-    // tokenizes the `input` (and folds any instructions/system) itself before
-    // generation, and the router never forwards input_ids on this route. The
-    // router's chat-encoder tokenization would not match the engine's cached
-    // blocks for a Responses body, so router-side hashing risks false-locality
-    // hits. We skip router-side tokenization: cache_aware_zmq falls back to
-    // min-load for /v1/responses (honest trade-off, costs cache affinity on
-    // this route until the engine exposes its Responses block hashes).
-    let request_tokens: Option<crate::policies::RequestTokens> = None;
-
     let routing_key = ctx
         .config
         .model
@@ -232,12 +198,7 @@ async fn responses_inner(
         .and_then(|s| headers.get(s.header_name.as_str()))
         .and_then(|v| v.to_str().ok())
         .filter(|s| !s.is_empty());
-    // Pass NO body to the selection context (see /v1/messages): with
-    // `request_tokens = None` AND no body, CacheAwareZmqPolicy::select falls
-    // back to min-load rather than tokenizing the body. `routing_key` is still
-    // honored by the sticky policy (it reads headers, not body).
-    let selection_ctx = SelectionContext::with_routing_key(&model_id, None, routing_key)
-        .with_request_tokens(request_tokens.as_ref().map(|t| t.ids.as_slice()));
+    let selection_ctx = SelectionContext::with_routing_key(&model_id, None, routing_key);
     let (worker, pending_guard) = {
         let _selection_guard = ctx.selection_lock.lock().await;
         let worker = policy.select(&workers, &selection_ctx).ok_or_else(|| {
@@ -252,14 +213,8 @@ async fn responses_inner(
         .headers_for(&headers)
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("build worker auth header: {e}")))?;
 
-    // Hold the per-worker in-flight guard + register active load so load-aware
-    // policies see this request. prefill_load uses the byte heuristic (we never
-    // tokenize on this route), same as chat's fallback.
     let guard = worker.load_guard();
-    let prefill_load = request_tokens
-        .as_ref()
-        .map(|t| t.ids.len().max(1))
-        .unwrap_or_else(|| crate::server::routes::chat::estimate_prefill_tokens(&body));
+    let prefill_load = crate::server::routes::chat::estimate_prefill_tokens(&body);
     let active_guard =
         ctx.active_load
             .register(worker.id.clone(), worker.url.clone(), prefill_load, 0);
@@ -273,14 +228,11 @@ async fn responses_inner(
     };
 
     let result = if streaming {
-        // Mirror /v1/messages: skip chat's TTFT hook + streaming-duration RAII
-        // guard (v1 measures header-time only). Guards move into stream_guards
-        // so load stays accurate for the stream's lifetime.
         let stream_guards: Box<dyn Send + 'static> = Box::new((guard, active_guard, pending_guard));
         let fetch = ctx.proxy.forward_streaming_to(
             &worker.url,
             &worker.breaker,
-            "/v1/responses",
+            path,
             worker_headers.as_ref(),
             body,
             Some(stream_guards),
@@ -296,7 +248,7 @@ async fn responses_inner(
         let fetch = ctx.proxy.forward_json_to(
             &worker.url,
             &worker.breaker,
-            "/v1/responses",
+            path,
             worker_headers.as_ref(),
             body,
         );
@@ -336,7 +288,7 @@ async fn responses_inner(
     tracing::info!(
         request_id = %request_id,
         method = "POST",
-        path = "/v1/responses",
+        path,
         model = %metrics_model,
         worker = %metrics_worker_url,
         outcome = match outcome {
@@ -347,55 +299,7 @@ async fn responses_inner(
         http_status,
         stream = streaming,
         latency_ms = elapsed.as_millis() as u64,
-        "responses",
+        "{log_name}",
     );
     result
-}
-
-#[cfg(test)]
-mod tests {
-    use super::parse_probe;
-    use bytes::Bytes;
-
-    #[test]
-    fn probe_reads_stream_and_model() {
-        let b = Bytes::from(r#"{"model":"glm","stream":true,"input":"hi"}"#);
-        let p = parse_probe(&b).unwrap();
-        assert_eq!(p.stream, Some(true));
-        assert_eq!(p.model.as_deref(), Some("glm"));
-    }
-
-    #[test]
-    fn probe_stream_defaults_to_false() {
-        let b = Bytes::from(r#"{"model":"glm","input":"hi"}"#);
-        let p = parse_probe(&b).unwrap();
-        assert_eq!(p.stream, None);
-        assert_eq!(p.model.as_deref(), Some("glm"));
-    }
-
-    #[test]
-    fn probe_rejects_non_object() {
-        let b = Bytes::from(b"\"hi\"".as_ref());
-        assert!(parse_probe(&b).is_err(), "string body must not parse");
-    }
-
-    #[test]
-    fn probe_allows_responses_shape_without_stream() {
-        // Real Responses body has input/max_output_tokens; only model is required here.
-        let b = Bytes::from(
-            r#"{"model":"gpt","input":"hi","max_output_tokens":256,"reasoning":{"effort":"low"}}"#,
-        );
-        let p = parse_probe(&b).unwrap();
-        assert_eq!(p.model.as_deref(), Some("gpt"));
-        assert_eq!(p.stream, None);
-    }
-
-    #[test]
-    fn probe_missing_model_parses_then_handler_rejects() {
-        // parse_probe only requires valid JSON object; `model` absence is
-        // enforced in responses_inner (returns 400 missing `model`).
-        let b = Bytes::from(r#"{"input":"hi"}"#);
-        let p = parse_probe(&b).unwrap();
-        assert_eq!(p.model, None);
-    }
 }

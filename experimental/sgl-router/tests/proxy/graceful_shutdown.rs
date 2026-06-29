@@ -50,6 +50,7 @@ fn build_ctx_with_worker(worker_url: &str) -> Arc<AppContext> {
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec!["http://placeholder:0".into()],
+            bearer_keys: Vec::new(),
         }),
         proxy: ProxyConfig::default(),
         active_load: ActiveLoadConfig::default(),
@@ -58,6 +59,7 @@ fn build_ctx_with_worker(worker_url: &str) -> Arc<AppContext> {
         cache_tree_page_size: None,
         cache_tree_bigram: false,
         cache_tree_max_nodes: 1_000_000,
+        alias_fallback: None,
     };
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     let registry = Arc::new(WorkerRegistry::default());
@@ -69,6 +71,7 @@ fn build_ctx_with_worker(worker_url: &str) -> Arc<AppContext> {
             model_ids: vec![ModelId("tiny".into())],
             bootstrap_port: None,
             min_priority: None,
+            bearer_token: None,
         })
         .expect("test worker accepted");
     let policies = Arc::new(build_registry_with_defaults(&cfg).unwrap());

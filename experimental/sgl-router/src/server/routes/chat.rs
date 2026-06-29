@@ -9,6 +9,9 @@ use crate::server::error::ApiError;
 use crate::server::metrics::{
     MetricsRegistry, PriorityFilterOutcome, RequestOutcome, StaleRequestOutcome, WorkerModeLabel,
 };
+use crate::server::routes::alias_fallback::{
+    fallback_reason_for_error, fallback_reason_for_response, forward_to_fallback, rewrite_model,
+};
 use crate::workers::{LoadGuard, Worker};
 use axum::body::Body;
 use axum::extract::State;
@@ -100,6 +103,81 @@ impl Drop for RecordDurationOnDrop {
 /// request opts into streaming (`stream: true`), we pipe SSE bytes back;
 /// otherwise buffer.
 pub async fn chat_completions(
+    State(ctx): State<Arc<AppContext>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response<Body>, ApiError> {
+    let probe = parse_probe(&body)?;
+    let model_str = probe
+        .model
+        .clone()
+        .ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?;
+    let Some(cfg) = ctx
+        .config
+        .alias_fallback
+        .as_ref()
+        .filter(|cfg| cfg.alias_model_id == model_str)
+        .cloned()
+    else {
+        return chat_completions_inner(State(ctx), headers, body).await;
+    };
+
+    let request_id = headers
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-");
+    let primary_body = rewrite_model(&body, &cfg.primary_model_id)?;
+    ctx.metrics
+        .record_alias_route(&cfg.alias_model_id, "primary", "selected");
+    tracing::info!(
+        request_id = %request_id,
+        alias = %cfg.alias_model_id,
+        route = "primary",
+        primary_model = %cfg.primary_model_id,
+        path = "/v1/chat/completions",
+        "alias primary selected",
+    );
+    let primary =
+        chat_completions_inner(State(Arc::clone(&ctx)), headers.clone(), primary_body).await;
+    match primary {
+        Ok(resp) => {
+            if let Some(reason) = fallback_reason_for_response(resp.status()) {
+                forward_to_fallback(
+                    &ctx,
+                    &cfg,
+                    &headers,
+                    &body,
+                    "/v1/chat/completions",
+                    probe.stream.unwrap_or(false),
+                    request_id,
+                    reason,
+                )
+                .await
+            } else {
+                Ok(resp)
+            }
+        }
+        Err(e) => {
+            if let Some(reason) = fallback_reason_for_error(&e) {
+                forward_to_fallback(
+                    &ctx,
+                    &cfg,
+                    &headers,
+                    &body,
+                    "/v1/chat/completions",
+                    probe.stream.unwrap_or(false),
+                    request_id,
+                    reason,
+                )
+                .await
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+async fn chat_completions_inner(
     State(ctx): State<Arc<AppContext>>,
     headers: HeaderMap,
     body: Bytes,
@@ -293,6 +371,9 @@ pub async fn chat_completions(
         }
     }
     let headers = request_headers;
+    let worker_headers = worker
+        .headers_for(&headers)
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("build worker auth header: {e}")))?;
 
     // Per-worker guards. `pending_guard` was created inside the selection
     // critical section, so the next concurrent selection sees this dispatch
@@ -440,7 +521,7 @@ pub async fn chat_completions(
 
         let prefill_url = worker.url.clone();
         let prefill_breaker = Arc::clone(&worker.breaker);
-        let prefill_headers = headers.clone();
+        let prefill_headers = worker_headers.as_ref().clone();
         let prefill_body = outgoing_body.clone();
         let prefill_proxy = Arc::clone(&ctx.proxy);
         let prefill_holds: (LoadGuard, _, _) = (guard, active_guard, pending_guard);
@@ -480,6 +561,9 @@ pub async fn chat_completions(
         // the client sees. The decode side gets its own LoadGuard so
         // per-worker `active_requests` reflects decode-pool load for
         // cache-aware-zmq decisions on the decode side.
+        let decode_headers = decode_worker
+            .headers_for(&headers)
+            .map_err(|e| ApiError::Internal(anyhow::anyhow!("build worker auth header: {e}")))?;
         let decode_guard = decode_worker.load_guard();
         if streaming {
             let stream_guards: Box<dyn Send + 'static> =
@@ -488,7 +572,7 @@ pub async fn chat_completions(
                 &decode_worker.url,
                 &decode_worker.breaker,
                 "/v1/chat/completions",
-                &headers,
+                decode_headers.as_ref(),
                 outgoing_body,
                 Some(stream_guards),
                 Some(make_ttft_hook()),
@@ -504,7 +588,7 @@ pub async fn chat_completions(
                 &decode_worker.url,
                 &decode_worker.breaker,
                 "/v1/chat/completions",
-                &headers,
+                decode_headers.as_ref(),
                 outgoing_body,
             );
             tokio::select! {
@@ -523,7 +607,7 @@ pub async fn chat_completions(
             &worker.url,
             &worker.breaker,
             "/v1/chat/completions",
-            &headers,
+            worker_headers.as_ref(),
             outgoing_body,
             Some(stream_guards),
             Some(make_ttft_hook()),
@@ -551,7 +635,7 @@ pub async fn chat_completions(
             &worker.url,
             &worker.breaker,
             "/v1/chat/completions",
-            &headers,
+            worker_headers.as_ref(),
             outgoing_body,
         );
         // Same `biased` order as the streaming arm.

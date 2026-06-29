@@ -44,6 +44,7 @@ fn config(_worker_url: &str) -> Config {
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec!["http://placeholder:0".into()],
+            bearer_keys: Vec::new(),
         }),
         proxy: ProxyConfig::default(),
         active_load: ActiveLoadConfig::default(),
@@ -52,6 +53,7 @@ fn config(_worker_url: &str) -> Config {
         cache_tree_page_size: None,
         cache_tree_bigram: false,
         cache_tree_max_nodes: 1_000_000,
+        alias_fallback: None,
     }
 }
 
@@ -70,6 +72,7 @@ async fn non_streaming_request_times_out_when_worker_hangs() {
         model_ids: vec![ModelId("tiny".into())],
         bootstrap_port: None,
         min_priority: None,
+        bearer_token: None,
     });
     let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(Duration::from_millis(200)).unwrap());

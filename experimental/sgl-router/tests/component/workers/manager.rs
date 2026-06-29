@@ -46,6 +46,7 @@ fn spec_for(id: &str, url: &str, mode: WorkerMode) -> WorkerSpec {
         model_ids: Vec::new(),
         bootstrap_port: None,
         min_priority: None,
+        bearer_token: None,
     }
 }
 

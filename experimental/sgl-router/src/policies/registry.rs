@@ -414,6 +414,7 @@ mod tests {
             model_ids: vec![ModelId(model.into())],
             bootstrap_port: None,
             min_priority: None,
+            bearer_token: None,
         }
     }
 
@@ -699,6 +700,7 @@ mod tests {
             model_ids: vec![ModelId(model.into())],
             bootstrap_port: None,
             min_priority: None,
+            bearer_token: None,
         }
     }
 

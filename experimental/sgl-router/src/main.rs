@@ -118,8 +118,14 @@ async fn main() -> Result<()> {
     if route_history {
         if let Some(ps) = cfg.cache_tree_page_size {
             match block_size_oracle.try_set(ps) {
-                Ok(v) => tracing::info!(page_size = v, bigram = cfg.cache_tree_bigram, "route-history tree: seeded block-size oracle"),
-                Err(e) => tracing::error!(error = ?e, "route-history tree: failed to seed block size"),
+                Ok(v) => tracing::info!(
+                    page_size = v,
+                    bigram = cfg.cache_tree_bigram,
+                    "route-history tree: seeded block-size oracle"
+                ),
+                Err(e) => {
+                    tracing::error!(error = ?e, "route-history tree: failed to seed block size")
+                }
             }
             block_size_oracle.set_bigram(cfg.cache_tree_bigram);
         } else {
@@ -136,9 +142,8 @@ async fn main() -> Result<()> {
         let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(2));
         if let Some(token) = cfg.worker_introspect_key.as_deref() {
             let mut headers = reqwest::header::HeaderMap::new();
-            let mut value =
-                reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
-                    .expect("worker introspect key must be a valid HTTP header value");
+            let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+                .expect("worker introspect key must be a valid HTTP header value");
             value.set_sensitive(true);
             headers.insert(reqwest::header::AUTHORIZATION, value);
             builder = builder.default_headers(headers);
@@ -187,7 +192,10 @@ async fn main() -> Result<()> {
     let tree_evict_handle = if route_history {
         let tree = kv_index.tree();
         let max_nodes = cfg.cache_tree_max_nodes;
-        tracing::info!(max_nodes, "route-history tree: spawning LRU eviction sweeper");
+        tracing::info!(
+            max_nodes,
+            "route-history tree: spawning LRU eviction sweeper"
+        );
         Some(sgl_router::policies::active_load::spawn_sweeper(
             move || tree.evict_lru(max_nodes),
             std::time::Duration::from_secs(10),
@@ -202,7 +210,10 @@ async fn main() -> Result<()> {
     // cache_aware_zmq (instead of the router-side in-flight count). Reuses the
     // worker introspect key for auth. None => not spawned (in-flight count).
     let load_poller_handle = cfg.load_poll_interval_secs.map(|secs| {
-        tracing::info!(interval_secs = secs, "spawning worker load poller (/get_load)");
+        tracing::info!(
+            interval_secs = secs,
+            "spawning worker load poller (/get_load)"
+        );
         sgl_router::policies::load_poller::spawn_load_poller(
             Arc::clone(&registry),
             std::time::Duration::from_secs(secs),
@@ -219,7 +230,8 @@ async fn main() -> Result<()> {
     // subscribers, which is exactly what route-history avoids. The policy still
     // shares the same tree handle (built above) — it's just fed by routing
     // decisions instead of ZMQ events.
-    let kv_index_opt: Option<Arc<sgl_router::policies::kv_events::KvEventIndex>> = if route_history {
+    let kv_index_opt: Option<Arc<sgl_router::policies::kv_events::KvEventIndex>> = if route_history
+    {
         None
     } else {
         Some(Arc::clone(&kv_index))

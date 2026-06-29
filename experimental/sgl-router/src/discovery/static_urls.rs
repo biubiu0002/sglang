@@ -23,7 +23,8 @@
 
 use crate::config::StaticUrlsDiscoveryConfig;
 use crate::discovery::{DiscoveryEvent, WorkerId, WorkerMode, WorkerSpec};
-use anyhow::Result;
+use anyhow::{anyhow, Result};
+use std::collections::HashMap;
 use tokio::sync::mpsc;
 
 /// Token separating a worker URL from an optional minimum-priority
@@ -62,6 +63,17 @@ pub(crate) fn parse_worker_entry(entry: &str) -> Result<(String, Option<i64>)> {
     }
 }
 
+/// Normalize worker URLs for config-key matching. This mirrors
+/// `Config::validate`: strip capability suffixes, parse as an HTTP URL, and
+/// drop a trailing slash so `http://x:30000` and `http://x:30000/` match the
+/// same bearer-key entry.
+pub(crate) fn normalize_worker_url(entry: &str) -> Result<String> {
+    let (base, _min_priority) = parse_worker_entry(entry)?;
+    let parsed = url::Url::parse(&base)
+        .map_err(|e| anyhow!("worker URL entry {entry:?} is not a valid URL: {e}"))?;
+    Ok(parsed.as_str().trim_end_matches('/').to_string())
+}
+
 /// Spawn the static-URLs producer task and return its `JoinHandle`.
 ///
 /// Returns `Result` for parity with [`crate::discovery::k8s::spawn`] (which
@@ -78,8 +90,21 @@ pub async fn spawn(
         .iter()
         .map(|e| parse_worker_entry(e))
         .collect::<Result<_>>()?;
+    let bearer_keys: HashMap<String, String> = cfg
+        .bearer_keys
+        .iter()
+        .map(|entry| {
+            Ok((
+                normalize_worker_url(&entry.worker_url)?,
+                entry.bearer_token.clone(),
+            ))
+        })
+        .collect::<Result<_>>()?;
     let handle = tokio::spawn(async move {
         for (url, min_priority) in parsed {
+            let bearer_token = normalize_worker_url(&url)
+                .ok()
+                .and_then(|normalized| bearer_keys.get(&normalized).cloned());
             let spec = WorkerSpec {
                 id: WorkerId(url.clone()),
                 url,
@@ -87,6 +112,7 @@ pub async fn spawn(
                 model_ids: Vec::new(),
                 bootstrap_port: None,
                 min_priority,
+                bearer_token,
             };
             if tx.send(DiscoveryEvent::Added(spec)).await.is_err() {
                 tracing::info!(
@@ -164,6 +190,7 @@ mod tests {
     async fn exits_when_receiver_dropped() {
         let cfg = StaticUrlsDiscoveryConfig {
             urls: (0..10).map(|i| format!("http://w{i}:30000")).collect(),
+            bearer_keys: Vec::new(),
         };
         let (tx, rx) = mpsc::channel(1);
         drop(rx);
@@ -187,6 +214,7 @@ mod tests {
 
         let cfg = StaticUrlsDiscoveryConfig {
             urls: vec!["http://w0:30000".into(), "http://w1:30000".into()],
+            bearer_keys: Vec::new(),
         };
         let (tx, mut rx) = mpsc::channel(8);
         let h = spawn(cfg, tx).await.unwrap();

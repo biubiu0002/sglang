@@ -33,6 +33,7 @@
 //! | `sgl_router_sticky_total` | Counter | `outcome` |
 //! | `sgl_router_ingress_tokenize_errors_total` | Counter | `model_id` |
 //! | `sgl_router_priority_filtered_total` | Counter | `reason` |
+//! | `sgl_router_alias_route_total` | Counter | `alias_model_id`, `route`, `reason` |
 //!
 //! The four `sgl_router_worker*` gauges and `sgl_router_workers` are sampled
 //! at scrape time from the live [`crate::workers::WorkerRegistry`] (passed to
@@ -246,6 +247,7 @@ pub struct MetricsRegistry {
     sticky_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     ingress_tokenize_errors_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
     priority_filtered_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
+    alias_route_total: Mutex<HashMap<AliasRouteKey, Arc<AtomicU64>>>,
 }
 
 #[derive(Debug, Hash, Eq, PartialEq, Clone)]
@@ -254,6 +256,13 @@ struct RequestKey {
     model_id: String,
     mode: &'static str,
     outcome: &'static str,
+}
+
+#[derive(Debug, Hash, Eq, PartialEq, Clone)]
+struct AliasRouteKey {
+    alias_model_id: String,
+    route: &'static str,
+    reason: &'static str,
 }
 
 /// Per-worker state sampled from the [`crate::workers::WorkerRegistry`] at
@@ -506,6 +515,27 @@ impl MetricsRegistry {
         let mut guard = self.priority_filtered_total.lock();
         let counter = guard
             .entry(outcome.as_str())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump `sgl_router_alias_route_total{alias_model_id,route,reason}`.
+    pub fn record_alias_route(
+        &self,
+        alias_model_id: &str,
+        route: &'static str,
+        reason: &'static str,
+    ) {
+        let key = AliasRouteKey {
+            alias_model_id: alias_model_id.to_owned(),
+            route,
+            reason,
+        };
+        let mut guard = self.alias_route_total.lock();
+        let counter = guard
+            .entry(key)
             .or_insert_with(|| Arc::new(AtomicU64::new(0)))
             .clone();
         drop(guard);
@@ -813,6 +843,33 @@ impl MetricsRegistry {
             out.push_str(&format!(
                 "sgl_router_priority_filtered_total{{reason=\"{}\"}} {}\n",
                 reason, value,
+            ));
+        }
+        drop(guard);
+
+        // alias_route_total
+        out.push_str(
+            "# HELP sgl_router_alias_route_total Explicit model-alias routing decisions.\n",
+        );
+        out.push_str("# TYPE sgl_router_alias_route_total counter\n");
+        let guard = self.alias_route_total.lock();
+        let mut entries: Vec<(&AliasRouteKey, u64)> = guard
+            .iter()
+            .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by(|a, b| {
+            a.0.alias_model_id
+                .cmp(&b.0.alias_model_id)
+                .then(a.0.route.cmp(b.0.route))
+                .then(a.0.reason.cmp(b.0.reason))
+        });
+        for (key, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_alias_route_total{{alias_model_id=\"{}\",route=\"{}\",reason=\"{}\"}} {}\n",
+                escape_label(&key.alias_model_id),
+                key.route,
+                key.reason,
+                value,
             ));
         }
         drop(guard);

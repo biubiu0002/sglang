@@ -11,9 +11,10 @@ use std::num::NonZeroU32;
 
 use crate::config::{
     default_cb_cool_down, default_proxy_request_timeout_secs, default_stale_request_timeout_secs,
-    resolve_mode, ActiveLoadConfig, CacheAwareConfig, CacheTreeSource, CircuitBreakerConfig, Config,
-    DiscoveryBackend, K8sDiscoveryConfig, LogFormat, ModelConfig, ObservabilityConfig, PolicyKind,
-    ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig, StickyConfig,
+    resolve_mode, ActiveLoadConfig, AliasFallbackConfig, CacheAwareConfig, CacheTreeSource,
+    CircuitBreakerConfig, Config, DiscoveryBackend, K8sDiscoveryConfig, LogFormat, ModelConfig,
+    ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
+    StickyConfig, WorkerBearerKeyConfig,
 };
 
 /// `sgl-router` — slim KV-aware OpenAI-compatible router for SGLang workers.
@@ -142,6 +143,16 @@ pub struct Cli {
     #[arg(long, num_args = 1..)]
     pub worker_urls: Vec<String>,
 
+    /// Optional per-worker bearer-token mapping for static discovery.
+    /// Format: `<worker-url>=<token>`, e.g.
+    /// `http://10.0.0.2:30000=sk-worker-02`. When present, proxied `/v1/*`
+    /// traffic to that worker uses this token instead of forwarding the
+    /// inbound client Authorization header, and router-owned `/server_info`
+    /// / `/get_load` calls use the same per-worker token. This is intended
+    /// for legacy pools whose SGLang workers still have distinct api-keys.
+    #[arg(long, num_args = 1..)]
+    pub worker_bearer_keys: Vec<String>,
+
     // ---- discovery: kubernetes ----
     /// Enable Kubernetes EndpointSlice discovery.
     #[arg(long)]
@@ -202,6 +213,22 @@ pub struct Cli {
     /// `--policy cache_aware_zmq`.
     #[arg(long)]
     pub load_poll_interval_secs: Option<u64>,
+
+    // ---- alias fallback (optional) ----
+    /// Public model alias that should first be rewritten to
+    /// `--alias-primary-model-id`, then fallback to
+    /// `--alias-fallback-model-id` at `--alias-fallback-url` on retryable
+    /// primary failures.
+    #[arg(long)]
+    pub alias_model_id: Option<String>,
+    #[arg(long)]
+    pub alias_primary_model_id: Option<String>,
+    #[arg(long)]
+    pub alias_fallback_model_id: Option<String>,
+    #[arg(long)]
+    pub alias_fallback_url: Option<String>,
+    #[arg(long)]
+    pub alias_fallback_bearer_token: Option<String>,
 
     // ---- observability ----
     /// Default tracing level (overridden by `RUST_LOG`).
@@ -391,6 +418,39 @@ impl Cli {
             None
         };
 
+        let alias_fallback = match (
+            self.alias_model_id,
+            self.alias_primary_model_id,
+            self.alias_fallback_model_id,
+            self.alias_fallback_url,
+        ) {
+            (None, None, None, None) => {
+                if self.alias_fallback_bearer_token.is_some() {
+                    return Err(anyhow!(
+                        "--alias-fallback-bearer-token requires alias fallback to be configured"
+                    ));
+                }
+                None
+            }
+            (
+                Some(alias_model_id),
+                Some(primary_model_id),
+                Some(fallback_model_id),
+                Some(fallback_base_url),
+            ) => Some(AliasFallbackConfig {
+                alias_model_id,
+                primary_model_id,
+                fallback_model_id,
+                fallback_base_url,
+                fallback_bearer_token: self.alias_fallback_bearer_token,
+            }),
+            _ => {
+                return Err(anyhow!(
+                    "--alias-model-id / --alias-primary-model-id / --alias-fallback-model-id / --alias-fallback-url must be set together"
+                ));
+            }
+        };
+
         let config = Config {
             server: ServerConfig {
                 host: self.host,
@@ -422,6 +482,7 @@ impl Cli {
             cache_tree_page_size: self.cache_tree_page_size,
             cache_tree_bigram: self.cache_tree_bigram,
             cache_tree_max_nodes: self.cache_tree_max_nodes.unwrap_or(1_000_000),
+            alias_fallback,
         };
         config.validate()?;
         Ok(config)
@@ -463,9 +524,19 @@ impl Cli {
                 }
                 DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
                     urls: self.worker_urls.clone(),
+                    bearer_keys: self
+                        .worker_bearer_keys
+                        .iter()
+                        .map(|raw| parse_worker_bearer_key(raw))
+                        .collect::<Result<_>>()?,
                 })
             }
             (false, true) => {
+                if !self.worker_bearer_keys.is_empty() {
+                    return Err(anyhow!(
+                        "--worker-bearer-keys require --worker-urls static discovery"
+                    ));
+                }
                 // Resolve (and validate) the selector flags into a
                 // K8sDiscoveryMode here, so an invalid combination can't be
                 // stored. Surfaces ConfigError as anyhow for the CLI.
@@ -495,6 +566,23 @@ fn join_selector(terms: &[String]) -> Option<String> {
     } else {
         Some(terms.join(","))
     }
+}
+
+fn parse_worker_bearer_key(raw: &str) -> Result<WorkerBearerKeyConfig> {
+    let (worker_url, bearer_token) = raw.split_once('=').ok_or_else(|| {
+        anyhow!("--worker-bearer-keys entries must have format <worker-url>=<token>, got {raw:?}")
+    })?;
+    let worker_url = worker_url.trim();
+    let bearer_token = bearer_token.trim();
+    if worker_url.is_empty() || bearer_token.is_empty() {
+        return Err(anyhow!(
+            "--worker-bearer-keys entries require non-empty URL and token, got {raw:?}"
+        ));
+    }
+    Ok(WorkerBearerKeyConfig {
+        worker_url: worker_url.to_string(),
+        bearer_token: bearer_token.to_string(),
+    })
 }
 
 #[cfg(test)]

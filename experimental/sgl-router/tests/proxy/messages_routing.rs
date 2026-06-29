@@ -46,6 +46,7 @@ fn build_ctx_with_worker(url: &str) -> Arc<AppContext> {
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec!["http://placeholder:0".into()],
+            bearer_keys: Vec::new(),
         }),
         proxy: ProxyConfig::default(),
         active_load: ActiveLoadConfig::default(),
@@ -54,6 +55,7 @@ fn build_ctx_with_worker(url: &str) -> Arc<AppContext> {
         cache_tree_page_size: None,
         cache_tree_bigram: false,
         cache_tree_max_nodes: 1_000_000,
+        alias_fallback: None,
     };
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     let registry = Arc::new(WorkerRegistry::default());
@@ -64,6 +66,7 @@ fn build_ctx_with_worker(url: &str) -> Arc<AppContext> {
         model_ids: vec![ModelId("tiny".into())],
         bootstrap_port: None,
         min_priority: None,
+        bearer_token: None,
     });
     let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(TEST_TIMEOUT).unwrap());
@@ -89,6 +92,7 @@ fn build_ctx_with_prefill_worker(url: &str) -> Arc<AppContext> {
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec!["http://placeholder:0".into()],
+            bearer_keys: Vec::new(),
         }),
         proxy: ProxyConfig::default(),
         active_load: ActiveLoadConfig::default(),
@@ -97,6 +101,7 @@ fn build_ctx_with_prefill_worker(url: &str) -> Arc<AppContext> {
         cache_tree_page_size: None,
         cache_tree_bigram: false,
         cache_tree_max_nodes: 1_000_000,
+        alias_fallback: None,
     };
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     let registry = Arc::new(WorkerRegistry::default());
@@ -107,6 +112,7 @@ fn build_ctx_with_prefill_worker(url: &str) -> Arc<AppContext> {
         model_ids: vec![ModelId("tiny".into())],
         bootstrap_port: None,
         min_priority: None,
+        bearer_token: None,
     });
     let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(TEST_TIMEOUT).unwrap());
@@ -329,6 +335,7 @@ async fn messages_pd_rejection_wins_over_priority_filter() {
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec!["http://placeholder:0".into()],
+            bearer_keys: Vec::new(),
         }),
         proxy: ProxyConfig::default(),
         active_load: ActiveLoadConfig::default(),
@@ -337,6 +344,7 @@ async fn messages_pd_rejection_wins_over_priority_filter() {
         cache_tree_page_size: None,
         cache_tree_bigram: false,
         cache_tree_max_nodes: 1_000_000,
+        alias_fallback: None,
     };
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     let registry = Arc::new(WorkerRegistry::default());
@@ -347,6 +355,7 @@ async fn messages_pd_rejection_wins_over_priority_filter() {
         model_ids: vec![ModelId("tiny".into())],
         bootstrap_port: None,
         min_priority: Some(100),
+        bearer_token: None,
     });
     let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(TEST_TIMEOUT).unwrap());

@@ -59,7 +59,14 @@ fn parse_total_waiting(body: &str) -> Option<i64> {
 async fn poll_one(client: &reqwest::Client, worker: &Arc<crate::workers::worker::Worker>) {
     let url = format!("{}/get_load", worker.url.trim_end_matches('/'));
     let outcome = async {
-        let resp = client.get(&url).timeout(GET_LOAD_TIMEOUT).send().await.ok()?;
+        let mut req = client.get(&url).timeout(GET_LOAD_TIMEOUT);
+        if let Some(token) = worker.bearer_token() {
+            let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+                .expect("worker bearer token must be a valid HTTP header value");
+            value.set_sensitive(true);
+            req = req.header(reqwest::header::AUTHORIZATION, value);
+        }
+        let resp = req.send().await.ok()?;
         if !resp.status().is_success() {
             return None;
         }

@@ -72,6 +72,13 @@ pub struct WorkerSpec {
     /// mode/bootstrap) nor dropped on reconcile re-introspection.
     #[serde(default)]
     pub min_priority: Option<i64>,
+    /// Optional worker-local bearer token. When set, the router uses it
+    /// for its own `/server_info` and `/get_load` calls and overrides the
+    /// proxied request's `Authorization` header for this worker. This keeps
+    /// legacy pools with per-worker SGLang keys compatible while leaving
+    /// shared-key pools on normal inbound Authorization forwarding.
+    #[serde(default)]
+    pub bearer_token: Option<String>,
 }
 
 /// Event produced by a discovery backend and consumed by `WorkerManager`.
@@ -112,6 +119,7 @@ mod tests {
             model_ids: vec![ModelId("qwen".into())],
             bootstrap_port: None,
             min_priority: None,
+            bearer_token: None,
         };
         let s = serde_json::to_string(&w).unwrap();
         let d: WorkerSpec = serde_json::from_str(&s).unwrap();
@@ -127,6 +135,7 @@ mod tests {
             model_ids: vec![ModelId("qwen".into())],
             bootstrap_port: Some(8997),
             min_priority: None,
+            bearer_token: None,
         };
         let s = serde_json::to_string(&w).unwrap();
         assert!(s.contains("\"bootstrap_port\":8997"));
@@ -143,6 +152,7 @@ mod tests {
             model_ids: vec![ModelId("glm".into())],
             bootstrap_port: None,
             min_priority: Some(100),
+            bearer_token: None,
         };
         let s = serde_json::to_string(&w).unwrap();
         assert!(s.contains("\"min_priority\":100"));
@@ -194,6 +204,7 @@ mod tests {
             model_ids: vec![ModelId("m1".into())],
             bootstrap_port: None,
             min_priority: None,
+            bearer_token: None,
         });
         let s = serde_json::to_string(&e).unwrap();
         let d: DiscoveryEvent = serde_json::from_str(&s).unwrap();

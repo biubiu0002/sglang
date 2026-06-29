@@ -53,6 +53,7 @@ fn build_sticky_ctx(header_name: &str, worker_urls: &[String]) -> Arc<AppContext
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec!["http://placeholder:0".into()],
+            bearer_keys: Vec::new(),
         }),
         proxy: ProxyConfig::default(),
         active_load: ActiveLoadConfig::default(),
@@ -61,6 +62,7 @@ fn build_sticky_ctx(header_name: &str, worker_urls: &[String]) -> Arc<AppContext
         cache_tree_page_size: None,
         cache_tree_bigram: false,
         cache_tree_max_nodes: 1_000_000,
+        alias_fallback: None,
     };
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     let registry = Arc::new(WorkerRegistry::default());
@@ -72,6 +74,7 @@ fn build_sticky_ctx(header_name: &str, worker_urls: &[String]) -> Arc<AppContext
             model_ids: vec![ModelId("tiny".into())],
             bootstrap_port: None,
             min_priority: None,
+            bearer_token: None,
         });
     }
     let policies = Arc::new(build_policy_registry(&cfg).unwrap());
@@ -300,6 +303,7 @@ async fn adding_a_worker_does_not_redistribute_existing_key() {
             model_ids: vec![ModelId("tiny".into())],
             bootstrap_port: None,
             min_priority: None,
+            bearer_token: None,
         })
         .unwrap();
     // Guard the premise: w2 really is an eligible candidate now, so the

@@ -44,6 +44,7 @@ async fn failover_when_one_worker_dies() {
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec![w1.url.clone(), w2.url.clone(), w3.url.clone()],
+            bearer_keys: Vec::new(),
         }),
         proxy: ProxyConfig::default(),
         active_load: ActiveLoadConfig::default(),
@@ -52,6 +53,7 @@ async fn failover_when_one_worker_dies() {
         cache_tree_page_size: None,
         cache_tree_bigram: false,
         cache_tree_max_nodes: 1_000_000,
+        alias_fallback: None,
     };
 
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());

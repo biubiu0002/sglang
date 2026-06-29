@@ -3,6 +3,7 @@
 
 use crate::config::Config;
 
+use crate::health::circuit_breaker::CircuitBreaker;
 use crate::policies::active_load::ActiveLoadRegistry;
 use crate::policies::PolicyRegistry;
 use crate::proxy::Proxy;
@@ -36,6 +37,7 @@ pub struct AppContext {
     /// the same stale `/get_load` snapshot before any of them increments the
     /// local pending counter.
     pub selection_lock: Mutex<()>,
+    pub alias_fallback_breaker: Option<Arc<CircuitBreaker>>,
     ready: AtomicBool,
 }
 
@@ -80,6 +82,10 @@ impl AppContext {
         // after the policy registry, so inject it now. No-op for policies
         // that don't emit metrics.
         policies.attach_metrics(Arc::clone(&metrics));
+        let alias_fallback_breaker = config
+            .alias_fallback
+            .as_ref()
+            .map(|_| Arc::new(CircuitBreaker::new()));
         Self {
             config,
             tokenizers,
@@ -89,6 +95,7 @@ impl AppContext {
             active_load,
             metrics,
             selection_lock: Mutex::new(()),
+            alias_fallback_breaker,
             ready: AtomicBool::new(false),
         }
     }
@@ -123,6 +130,7 @@ impl AppContext {
                 discovery: crate::config::DiscoveryBackend::StaticUrls(
                     crate::config::StaticUrlsDiscoveryConfig {
                         urls: vec!["http://placeholder:0".into()],
+                        bearer_keys: Vec::new(),
                     },
                 ),
                 proxy: crate::config::ProxyConfig::default(),
@@ -132,6 +140,7 @@ impl AppContext {
                 cache_tree_page_size: None,
                 cache_tree_bigram: false,
                 cache_tree_max_nodes: 1_000_000,
+                alias_fallback: None,
             },
             tokenizers: Arc::new(TokenizerRegistry::default()),
             proxy: Arc::new(Proxy::new(std::time::Duration::from_secs(60)).expect("stub proxy")),
@@ -140,6 +149,7 @@ impl AppContext {
             active_load: ActiveLoadRegistry::with_defaults(),
             metrics: MetricsRegistry::new(),
             selection_lock: Mutex::new(()),
+            alias_fallback_breaker: None,
             ready: AtomicBool::new(false),
         }
     }

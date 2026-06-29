@@ -244,6 +244,7 @@ mod tests {
             model_ids: models.iter().map(|m| ModelId((*m).into())).collect(),
             bootstrap_port: None,
             min_priority: None,
+            bearer_token: None,
         }
     }
 

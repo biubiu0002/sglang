@@ -52,6 +52,7 @@ fn config() -> Config {
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec!["http://placeholder:0".into()],
+            bearer_keys: Vec::new(),
         }),
         proxy: ProxyConfig::default(),
         active_load: ActiveLoadConfig::default(),
@@ -60,6 +61,7 @@ fn config() -> Config {
         cache_tree_page_size: None,
         cache_tree_bigram: false,
         cache_tree_max_nodes: 1_000_000,
+        alias_fallback: None,
     }
 }
 
@@ -77,6 +79,7 @@ fn build_ctx(urls: [&str; 2]) -> Arc<AppContext> {
                 model_ids: vec![ModelId(MODEL.into())],
                 bootstrap_port: None,
                 min_priority: None,
+                bearer_token: None,
             })
             .unwrap();
         registry

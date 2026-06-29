@@ -175,6 +175,7 @@ mod tests {
             },
             discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
                 urls: vec!["http://placeholder:0".into()],
+                bearer_keys: Vec::new(),
             }),
             proxy: ProxyConfig::default(),
             active_load: ActiveLoadConfig::default(),
@@ -183,6 +184,7 @@ mod tests {
             cache_tree_page_size: None,
             cache_tree_bigram: false,
             cache_tree_max_nodes: 1_000_000,
+            alias_fallback: None,
         }
     }
 

@@ -4,6 +4,7 @@
 use crate::server::app_context::AppContext;
 use crate::server::routes::chat::MAX_CHAT_BODY_BYTES;
 use crate::server::routes::messages::MAX_MESSAGES_BODY_BYTES;
+use crate::server::routes::passthrough::MAX_PASSTHROUGH_BODY_BYTES;
 use crate::server::routes::responses::MAX_RESPONSES_BODY_BYTES;
 use axum::extract::{DefaultBodyLimit, Request};
 use axum::http::StatusCode;
@@ -53,6 +54,12 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
             "/v1/chat/completions",
             post(crate::server::routes::chat::chat_completions)
                 .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(middleware::from_fn(log_413)),
+        )
+        .route(
+            "/v1/completions",
+            post(crate::server::routes::passthrough::completions)
+                .layer(DefaultBodyLimit::max(MAX_PASSTHROUGH_BODY_BYTES))
                 .layer(middleware::from_fn(log_413)),
         )
         .route(

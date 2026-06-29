@@ -37,10 +37,10 @@
 
 use crate::config::{CacheAwareConfig, CacheTreeSource};
 
+use crate::policies::kv_events::tree::KvWorkerId;
 use crate::policies::kv_events::{
     compute_block_hashes, compute_block_hashes_bigram, BlockSizeOracle, HashTree,
 };
-use crate::policies::kv_events::tree::KvWorkerId;
 use crate::policies::{request_tokens_for, Policy, SelectionContext};
 use crate::server::metrics::MetricsRegistry;
 use crate::tokenizer::TokenizerRegistry;
@@ -303,7 +303,8 @@ impl Policy for CacheAwareZmqPolicy {
         // Divert to the globally least-loaded worker when the hit worker
         // leads it past both thresholds. OFF by default (rel = INFINITY).
         let best_matched = best_matched.map(|hot| self.apply_hit_load_guard(hot, workers));
-        let chosen = best_matched.or_else(|| Self::pick_min_load(workers, self.config.use_reported_load));
+        let chosen =
+            best_matched.or_else(|| Self::pick_min_load(workers, self.config.use_reported_load));
         if let Some(w) = &chosen {
             tracing::debug!(
                 model = %ctx.model(),
@@ -367,6 +368,7 @@ mod tests {
             model_ids: vec![ModelId(model_id.into())],
             bootstrap_port: None,
             min_priority: None,
+            bearer_token: None,
         }))
     }
 
@@ -388,6 +390,7 @@ mod tests {
             discovery: crate::config::DiscoveryBackend::StaticUrls(
                 crate::config::StaticUrlsDiscoveryConfig {
                     urls: vec!["http://placeholder:0".into()],
+                    bearer_keys: Vec::new(),
                 },
             ),
             proxy: crate::config::ProxyConfig::default(),
@@ -397,6 +400,7 @@ mod tests {
             cache_tree_page_size: None,
             cache_tree_bigram: false,
             cache_tree_max_nodes: 1_000_000,
+            alias_fallback: None,
         };
         Arc::new(TokenizerRegistry::load_from_config(&cfg).expect("load tiny tokenizer"))
     }
@@ -1432,7 +1436,7 @@ mod tests {
         tree.insert(&KvWorkerId::new(hit_url.into(), 0), None, &hashes);
         let policy = CacheAwareZmqPolicy::new(
             CacheAwareConfig {
-                cache_threshold: 0.0, // any overlap counts as a hit
+                cache_threshold: 0.0,              // any overlap counts as a hit
                 balance_abs_threshold: usize::MAX, // disable global fast-path
                 balance_rel_threshold: f32::INFINITY,
                 hit_load_abs_threshold,
@@ -1461,7 +1465,10 @@ mod tests {
         let model = ModelId("tiny".into());
         let ctx = SelectionContext::new(&model, None).with_request_tokens(Some(&ids));
         let chosen = policy.select(&workers, &ctx).expect("must pick");
-        assert_eq!(chosen.url, "http://w0:30000", "guard OFF keeps the cache hit");
+        assert_eq!(
+            chosen.url, "http://w0:30000",
+            "guard OFF keeps the cache hit"
+        );
     }
 
     /// Guard ARMED as `min_load + 1`: a cache hit may be one request
@@ -1478,7 +1485,10 @@ mod tests {
         let model = ModelId("tiny".into());
         let ctx = SelectionContext::new(&model, None).with_request_tokens(Some(&ids));
         let chosen = policy.select(&workers, &ctx).expect("must pick");
-        assert_eq!(chosen.url, "http://w1:30000", "armed guard diverts to coolest");
+        assert_eq!(
+            chosen.url, "http://w1:30000",
+            "armed guard diverts to coolest"
+        );
     }
 
     /// Guard ARMED but the hit worker is only one request above the coolest
@@ -1495,7 +1505,10 @@ mod tests {
         let model = ModelId("tiny".into());
         let ctx = SelectionContext::new(&model, None).with_request_tokens(Some(&ids));
         let chosen = policy.select(&workers, &ctx).expect("must pick");
-        assert_eq!(chosen.url, "http://w0:30000", "below abs threshold keeps hit");
+        assert_eq!(
+            chosen.url, "http://w0:30000",
+            "below abs threshold keeps hit"
+        );
     }
 
     /// Guard ARMED, abs gap exceeded, but the relative ratio is not: keep
@@ -1531,7 +1544,10 @@ mod tests {
         let model = ModelId("tiny".into());
         let ctx = SelectionContext::new(&model, None).with_request_tokens(Some(&ids));
         let chosen = policy.select(&workers, &ctx).expect("must pick");
-        assert_eq!(chosen.url, "http://w0:30000", "hit already coolest, keep it");
+        assert_eq!(
+            chosen.url, "http://w0:30000",
+            "hit already coolest, keep it"
+        );
     }
 
     /// Route-history mode: the tree starts EMPTY (no ZMQ feed). The first
@@ -1550,7 +1566,7 @@ mod tests {
 
         let policy = CacheAwareZmqPolicy::new(
             CacheAwareConfig {
-                cache_threshold: 0.0, // any overlap counts as a hit
+                cache_threshold: 0.0,              // any overlap counts as a hit
                 balance_abs_threshold: usize::MAX, // disable imbalance fast-path
                 balance_rel_threshold: f32::INFINITY,
                 hit_load_abs_threshold: 0,
@@ -1572,7 +1588,10 @@ mod tests {
         assert_eq!(tree.node_count(), 0, "tree starts empty (no ZMQ)");
         let ctx = SelectionContext::new(&model, None).with_request_tokens(Some(&ids));
         let first = policy.select(&workers, &ctx).expect("must pick");
-        assert!(tree.node_count() > 0, "route-history must have fed the tree");
+        assert!(
+            tree.node_count() > 0,
+            "route-history must have fed the tree"
+        );
 
         // Second identical request: now the tree has this prefix on `first`,
         // so the cache-overlap path must select the same worker.

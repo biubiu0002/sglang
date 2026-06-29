@@ -365,6 +365,7 @@ fn reconcile_unresolved_workers(
             model_ids: Vec::new(),
             bootstrap_port: worker.bootstrap_port(),
             min_priority: worker.min_priority(),
+            bearer_token: worker.bearer_token().map(ToOwned::to_owned),
         };
         // `debug!` not `info!`: this fires every interval for each
         // still-unresolved worker, so info-level would spam for a worker
@@ -400,7 +401,9 @@ async fn register_one(
     introspector: Arc<WorkerIntrospector>,
 ) {
     let worker_url = spec.url.clone();
-    let info = introspector.fetch(&worker_url).await;
+    let info = introspector
+        .fetch_with_bearer(&worker_url, spec.bearer_token.as_deref())
+        .await;
     if let Some(name) = info.served_model_name {
         spec.model_ids = vec![ModelId(name)];
     }
@@ -490,6 +493,7 @@ mod tests {
             },
             discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
                 urls: vec!["http://test:30000".into()],
+                bearer_keys: Vec::new(),
             }),
             proxy: ProxyConfig::default(),
             active_load: ActiveLoadConfig::default(),
@@ -498,6 +502,7 @@ mod tests {
             cache_tree_page_size: None,
             cache_tree_bigram: false,
             cache_tree_max_nodes: 1_000_000,
+            alias_fallback: None,
         }
     }
 
@@ -511,6 +516,7 @@ mod tests {
             model_ids: vec![ModelId("m".into())],
             bootstrap_port: None,
             min_priority: None,
+            bearer_token: None,
         };
         let cb = cb_config_for_spec(&spec, &cfg).expect("model has cb config");
         assert_eq!(cb.threshold.get(), 5);
@@ -579,6 +585,7 @@ mod tests {
             model_ids: Vec::new(),
             bootstrap_port: None,
             min_priority: None,
+            bearer_token: None,
         };
         tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
 
@@ -624,6 +631,7 @@ mod tests {
             model_ids: Vec::new(),
             bootstrap_port: None,
             min_priority: None,
+            bearer_token: None,
         };
         tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
 
@@ -674,6 +682,7 @@ mod tests {
                 model_ids: Vec::new(),
                 bootstrap_port: None,
                 min_priority: None,
+                bearer_token: None,
             };
             tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
             let registered = tokio::time::timeout(Duration::from_secs(2), async {
@@ -745,6 +754,7 @@ mod tests {
             model_ids: Vec::new(),
             bootstrap_port: None,
             min_priority: None,
+            bearer_token: None,
         };
         tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
         // Wait until the manager has both registered the worker AND
@@ -847,6 +857,7 @@ mod tests {
             model_ids: Vec::new(),
             bootstrap_port: None,
             min_priority: None,
+            bearer_token: None,
         };
         tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
         // Wait for the manager to land the registry write so the
@@ -928,6 +939,7 @@ mod tests {
             model_ids: Vec::new(),
             bootstrap_port: None,
             min_priority: None,
+            bearer_token: None,
         };
         tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
 
@@ -1032,6 +1044,7 @@ mod tests {
             model_ids: Vec::new(),
             bootstrap_port: None,
             min_priority: None,
+            bearer_token: None,
         };
         tx.send(DiscoveryEvent::Added(spec)).await.unwrap();
 
@@ -1118,6 +1131,7 @@ mod tests {
             model_ids: Vec::new(),
             bootstrap_port: None,
             min_priority: Some(100),
+            bearer_token: None,
         };
         tx.send(DiscoveryEvent::Added(spec)).await.unwrap();
 
@@ -1233,6 +1247,7 @@ mod tests {
             model_ids: Vec::new(),
             bootstrap_port: None,
             min_priority: None,
+            bearer_token: None,
         }))
         .await
         .unwrap();
@@ -1361,6 +1376,7 @@ mod tests {
             model_ids: Vec::new(),
             bootstrap_port: None,
             min_priority: None,
+            bearer_token: None,
         }))
         .await
         .unwrap();
@@ -1433,6 +1449,7 @@ mod tests {
             model_ids: Vec::new(),
             bootstrap_port: None,
             min_priority: None,
+            bearer_token: None,
         }))
         .await
         .unwrap();

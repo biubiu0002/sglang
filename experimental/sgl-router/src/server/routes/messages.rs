@@ -20,6 +20,9 @@ use crate::policies::SelectionContext;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{PriorityFilterOutcome, RequestOutcome, WorkerModeLabel};
+use crate::server::routes::alias_fallback::{
+    fallback_reason_for_error, fallback_reason_for_response, forward_to_fallback, rewrite_model,
+};
 use crate::workers::LoadGuard;
 use axum::body::Body;
 use axum::extract::State;
@@ -59,7 +62,82 @@ pub async fn messages(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response<Body> {
-    match messages_inner(State(ctx), headers, body, "/v1/messages").await {
+    let result = async {
+        let probe = parse_probe(&body)?;
+        let model_str = probe
+            .model
+            .clone()
+            .ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?;
+        let Some(cfg) = ctx
+            .config
+            .alias_fallback
+            .as_ref()
+            .filter(|cfg| cfg.alias_model_id == model_str)
+            .cloned()
+        else {
+            return messages_inner(State(ctx), headers, body, "/v1/messages").await;
+        };
+        let request_id = headers
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("-");
+        let primary_body = rewrite_model(&body, &cfg.primary_model_id)?;
+        ctx.metrics
+            .record_alias_route(&cfg.alias_model_id, "primary", "selected");
+        tracing::info!(
+            request_id = %request_id,
+            alias = %cfg.alias_model_id,
+            route = "primary",
+            primary_model = %cfg.primary_model_id,
+            path = "/v1/messages",
+            "alias primary selected",
+        );
+        let primary = messages_inner(
+            State(Arc::clone(&ctx)),
+            headers.clone(),
+            primary_body,
+            "/v1/messages",
+        )
+        .await;
+        match primary {
+            Ok(resp) => {
+                if let Some(reason) = fallback_reason_for_response(resp.status()) {
+                    forward_to_fallback(
+                        &ctx,
+                        &cfg,
+                        &headers,
+                        &body,
+                        "/v1/messages",
+                        probe.stream.unwrap_or(false),
+                        request_id,
+                        reason,
+                    )
+                    .await
+                } else {
+                    Ok(resp)
+                }
+            }
+            Err(e) => {
+                if let Some(reason) = fallback_reason_for_error(&e) {
+                    forward_to_fallback(
+                        &ctx,
+                        &cfg,
+                        &headers,
+                        &body,
+                        "/v1/messages",
+                        probe.stream.unwrap_or(false),
+                        request_id,
+                        reason,
+                    )
+                    .await
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+    .await;
+    match result {
         Ok(resp) => resp,
         Err(e) => anthropic_error_response(e),
     }
@@ -257,6 +335,9 @@ async fn messages_inner(
         let pending_guard = worker.pending_guard();
         (worker, pending_guard)
     };
+    let worker_headers = worker
+        .headers_for(&headers)
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("build worker auth header: {e}")))?;
 
     // Hold the per-worker in-flight guard + register active load so load-aware
     // policies see this request. prefill_load uses the real token count when we
@@ -287,7 +368,7 @@ async fn messages_inner(
             &worker.url,
             &worker.breaker,
             forward_path,
-            &headers,
+            worker_headers.as_ref(),
             body,
             Some(stream_guards),
             None,
@@ -299,9 +380,13 @@ async fn messages_inner(
         }
     } else {
         let _holds: (LoadGuard, _, _) = (guard, active_guard, pending_guard);
-        let fetch =
-            ctx.proxy
-                .forward_json_to(&worker.url, &worker.breaker, forward_path, &headers, body);
+        let fetch = ctx.proxy.forward_json_to(
+            &worker.url,
+            &worker.breaker,
+            forward_path,
+            worker_headers.as_ref(),
+            body,
+        );
         tokio::select! {
             biased;
             r = fetch => r,

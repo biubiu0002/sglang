@@ -68,6 +68,35 @@ impl Config {
                         ));
                     }
                 }
+                let mut seen_bearer = std::collections::HashSet::new();
+                for entry in &s.bearer_keys {
+                    if entry.bearer_token.trim().is_empty() {
+                        return Err(anyhow!(
+                            "discovery.static_urls.bearer_keys contains an empty bearer token for {:?}",
+                            entry.worker_url
+                        ));
+                    }
+                    let normalized = crate::discovery::static_urls::normalize_worker_url(
+                        entry.worker_url.trim(),
+                    )
+                    .map_err(|e| {
+                        anyhow!(
+                            "discovery.static_urls.bearer_keys entry {:?} is invalid: {e}",
+                            entry.worker_url
+                        )
+                    })?;
+                    if !seen_bearer.insert(normalized.clone()) {
+                        return Err(anyhow!(
+                            "discovery.static_urls.bearer_keys contains duplicate entry for normalized worker URL {normalized:?}"
+                        ));
+                    }
+                    if !seen.contains(&normalized) {
+                        return Err(anyhow!(
+                            "discovery.static_urls.bearer_keys entry {:?} does not match any --worker-urls entry (normalized: {normalized:?})",
+                            entry.worker_url
+                        ));
+                    }
+                }
             }
             // K8s selector validity is resolved at construction time
             // (`resolve_mode` in `Cli::build_discovery`), so the stored
@@ -104,6 +133,7 @@ mod tests {
             },
             discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
                 urls: urls.iter().map(|s| s.to_string()).collect(),
+                bearer_keys: Vec::new(),
             }),
             proxy: ProxyConfig::default(),
             active_load: ActiveLoadConfig::default(),
@@ -112,6 +142,7 @@ mod tests {
             cache_tree_page_size: None,
             cache_tree_bigram: false,
             cache_tree_max_nodes: 1_000_000,
+            alias_fallback: None,
         }
     }
 

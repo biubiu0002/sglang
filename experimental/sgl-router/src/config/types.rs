@@ -38,6 +38,16 @@ pub struct Config {
     pub cache_tree_page_size: Option<u32>,
     pub cache_tree_bigram: bool,
     pub cache_tree_max_nodes: usize,
+    pub alias_fallback: Option<AliasFallbackConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AliasFallbackConfig {
+    pub alias_model_id: String,
+    pub primary_model_id: String,
+    pub fallback_model_id: String,
+    pub fallback_base_url: String,
+    pub fallback_bearer_token: Option<String>,
 }
 
 /// Outbound proxy tuning. Default mirrors SGLang's typical prefill /
@@ -347,6 +357,17 @@ pub enum DiscoveryBackend {
 #[derive(Debug, Clone)]
 pub struct StaticUrlsDiscoveryConfig {
     pub urls: Vec<String>,
+    /// Optional worker URL -> bearer-token mapping. Keys are normalized in
+    /// config validation/discovery after stripping the optional worker-entry
+    /// suffixes and trailing slash. Tokens are never included in the worker
+    /// URL string itself so logs and metrics do not expose credentials.
+    pub bearer_keys: Vec<WorkerBearerKeyConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkerBearerKeyConfig {
+    pub worker_url: String,
+    pub bearer_token: String,
 }
 
 /// Configuration for the Kubernetes `EndpointSlice` discovery backend.

@@ -16,6 +16,7 @@ fn worker(id: &str) -> Arc<Worker> {
         model_ids: vec![ModelId("m".into())],
         bootstrap_port: None,
         min_priority: None,
+        bearer_token: None,
     }))
 }
 

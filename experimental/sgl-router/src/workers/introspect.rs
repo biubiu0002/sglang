@@ -135,8 +135,20 @@ impl WorkerIntrospector {
     /// responses and JSON-parse errors short-circuit immediately —
     /// the worker answered authoritatively, retrying won't help.
     pub async fn fetch(&self, worker_url: &str) -> ServerInfo {
+        self.fetch_with_bearer(worker_url, None).await
+    }
+
+    /// Fetch `/server_info`, optionally overriding the client's default
+    /// Authorization header with a worker-specific bearer token.
+    pub async fn fetch_with_bearer(&self, worker_url: &str, bearer: Option<&str>) -> ServerInfo {
         let server_info_url = format!("{}/server_info", worker_url.trim_end_matches('/'));
-        let parsed = match Self::fetch_with_retry(&self.client, &server_info_url, worker_url).await
+        let parsed = match Self::fetch_with_retry(
+            &self.client,
+            &server_info_url,
+            worker_url,
+            bearer,
+        )
+        .await
         {
             Some(p) => p,
             None => return ServerInfo::default(),
@@ -184,10 +196,18 @@ impl WorkerIntrospector {
         client: &reqwest::Client,
         server_info_url: &str,
         worker_url: &str,
+        bearer: Option<&str>,
     ) -> Option<ServerInfoBody> {
         let mut delay = FETCH_BACKOFF_BASE;
         for attempt in 1..=FETCH_MAX_ATTEMPTS {
-            match client.get(server_info_url).send().await {
+            let mut req = client.get(server_info_url);
+            if let Some(token) = bearer {
+                let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+                    .expect("worker bearer token must be a valid HTTP header value");
+                value.set_sensitive(true);
+                req = req.header(reqwest::header::AUTHORIZATION, value);
+            }
+            match req.send().await {
                 Err(e) => {
                     warn!(
                         worker_url = %worker_url,
@@ -733,12 +753,12 @@ mod tests {
     /// being configured (no accidental default credential).
     #[tokio::test]
     async fn fetch_without_key_is_unauthorized_on_protected_worker() {
-        let (url, _shutdown) = spawn_key_protected_worker(
-            "Bearer secret-pool-key",
-            json!({"served_model_name": "m"}),
-        )
-        .await;
-        let got = WorkerIntrospector::with_optional_key(None).fetch(&url).await;
+        let (url, _shutdown) =
+            spawn_key_protected_worker("Bearer secret-pool-key", json!({"served_model_name": "m"}))
+                .await;
+        let got = WorkerIntrospector::with_optional_key(None)
+            .fetch(&url)
+            .await;
         assert!(
             got.served_model_name.is_none() && got.event_config.is_none(),
             "unauthenticated introspect against a key-protected worker must yield empty ServerInfo"

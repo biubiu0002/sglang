@@ -18,6 +18,10 @@ crate-type = ["rlib"]
 name = "sgl-router"
 path = "src/main.rs"
 
+[[bin]]
+name = "cache-event-agent"
+path = "src/bin/cache_event_agent.rs"
+
 [lints.rust]
 unused_qualifications = "warn"
 

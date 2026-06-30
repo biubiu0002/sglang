@@ -72,6 +72,12 @@ async fn half_open_failure_reopens() {
     b.record_failure();
     // Back to Open.
     assert!(!b.allow(), "back to open");
+
+    tokio::time::advance(Duration::from_millis(150)).await;
+    assert!(
+        b.allow(),
+        "a failed half-open probe must not leave probe_in_flight stuck forever"
+    );
 }
 
 #[tokio::test(start_paused = true)]

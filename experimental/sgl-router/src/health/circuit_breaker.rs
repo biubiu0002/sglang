@@ -157,13 +157,19 @@ impl CircuitBreaker {
     pub fn record_failure(&self) {
         let mut g = self.inner.lock().unwrap();
         match g.state {
-            State::Closed | State::HalfOpen { .. } => {
+            State::Closed => {
                 g.consecutive_failures += 1;
                 if g.consecutive_failures >= self.config.threshold.get() {
                     g.state = State::Open {
                         opened_at: Instant::now(),
                     };
                 }
+            }
+            State::HalfOpen { .. } => {
+                g.consecutive_failures = self.config.threshold.get();
+                g.state = State::Open {
+                    opened_at: Instant::now(),
+                };
             }
             State::Open { .. } => {
                 // Already open: ticking consecutive_failures or refreshing opened_at

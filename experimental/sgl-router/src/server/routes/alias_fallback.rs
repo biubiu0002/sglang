@@ -15,6 +15,9 @@ use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderValue, Response, StatusCode};
 use bytes::Bytes;
 use std::sync::Arc;
+use std::time::Duration;
+
+const FALLBACK_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy)]
 pub enum AliasFallbackReason {
@@ -127,9 +130,59 @@ pub async fn forward_to_fallback(
         fallback_url = %cfg.fallback_base_url,
         "alias fallback selected",
     );
+    let snapshot = breaker.snapshot();
+    if snapshot.state_code == 0 {
+        if !breaker.allow() {
+            return Err(ApiError::BreakerOpen {
+                worker: cfg.fallback_base_url.clone(),
+            });
+        }
+    } else {
+        if !breaker.allow() {
+            return Err(ApiError::BreakerOpen {
+                worker: cfg.fallback_base_url.clone(),
+            });
+        }
+        tracing::warn!(
+            request_id = %request_id,
+            alias = %cfg.alias_model_id,
+            fallback_url = %cfg.fallback_base_url,
+            fallback_model = %cfg.fallback_model_id,
+            breaker_state = snapshot.state_code,
+            "alias fallback breaker probing with synthetic generation",
+        );
+        if let Err(err) = ctx
+            .proxy
+            .probe_chat_completion(
+                &cfg.fallback_base_url,
+                breaker,
+                &headers,
+                &cfg.fallback_model_id,
+                FALLBACK_PROBE_TIMEOUT,
+            )
+            .await
+        {
+            tracing::warn!(
+                request_id = %request_id,
+                alias = %cfg.alias_model_id,
+                fallback_url = %cfg.fallback_base_url,
+                error = ?err,
+                "alias fallback synthetic generation probe failed",
+            );
+            return Err(ApiError::BreakerOpen {
+                worker: cfg.fallback_base_url.clone(),
+            });
+        }
+        tracing::info!(
+            request_id = %request_id,
+            alias = %cfg.alias_model_id,
+            fallback_url = %cfg.fallback_base_url,
+            "alias fallback synthetic generation probe recovered breaker",
+        );
+    }
     if streaming {
         ctx.proxy
-            .forward_streaming_to(
+            .forward_streaming_to_without_admission(
                 &cfg.fallback_base_url,
                 breaker,
                 path,
@@ -141,7 +194,13 @@ pub async fn forward_to_fallback(
             .await
     } else {
         ctx.proxy
-            .forward_json_to(&cfg.fallback_base_url, breaker, path, &headers, body)
+            .forward_json_to_without_admission(
+                &cfg.fallback_base_url,
+                breaker,
+                path,
+                &headers,
+                body,
+            )
             .await
     }
 }

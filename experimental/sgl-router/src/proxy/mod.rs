@@ -13,6 +13,7 @@ use axum::body::Body;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
 use bytes::Bytes;
 use reqwest::{Client, Url};
+use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -101,6 +102,18 @@ impl Proxy {
                 worker: worker_url.to_string(),
             });
         }
+        self.forward_json_to_without_admission(worker_url, breaker, path, headers, body)
+            .await
+    }
+
+    pub async fn forward_json_to_without_admission(
+        &self,
+        worker_url: &str,
+        breaker: &CircuitBreaker,
+        path: &str,
+        headers: &HeaderMap,
+        body: Bytes,
+    ) -> Result<Response<Body>, ApiError> {
         let worker_url = parse_worker_url(worker_url, breaker)?;
         let url = worker_url.join(path).map_err(|e| {
             ApiError::Internal(anyhow::Error::new(e).context(format!("join worker path {path}")))
@@ -152,6 +165,72 @@ impl Proxy {
         Ok(out)
     }
 
+    /// Lightweight synthetic generation probe used to recover an open
+    /// upstream breaker without binding recovery to a real user request.
+    ///
+    /// The probe sends a non-streaming, max_tokens=1 chat completion and
+    /// records the breaker outcome from the complete short response. It is
+    /// intentionally separate from `forward_json_to` because callers use it
+    /// only after `breaker.allow()` admitted the half-open probe slot.
+    pub async fn probe_chat_completion(
+        &self,
+        worker_url: &str,
+        breaker: &CircuitBreaker,
+        headers: &HeaderMap,
+        model_id: &str,
+        timeout: Duration,
+    ) -> Result<(), ApiError> {
+        let worker_url = parse_worker_url(worker_url, breaker)?;
+        let url = worker_url.join("/v1/chat/completions").map_err(|e| {
+            ApiError::Internal(anyhow::Error::new(e).context("join probe chat path"))
+        })?;
+        let body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "model": model_id,
+                "messages": [{"role": "user", "content": "ping"}],
+                "max_tokens": 1,
+                "stream": false
+            }))
+            .map_err(|e| ApiError::Internal(anyhow::Error::new(e).context("build probe body")))?,
+        );
+        let mut req = self.client.post(url.clone()).body(body);
+        for (k, v) in headers {
+            if should_forward_request_header(k) {
+                req = req.header(k, v);
+            }
+        }
+        let resp = req
+            .header("content-type", "application/json")
+            .timeout(timeout)
+            .send()
+            .await
+            .map_err(|e| {
+                breaker.record_failure();
+                Self::classify_reqwest_error_for(worker_url.clone(), e, "/v1/chat/completions")
+            })?;
+        let status = resp.status();
+        match resp.bytes().await {
+            Ok(_) if status.is_success() => {
+                breaker.record_success();
+                Ok(())
+            }
+            Ok(_) => {
+                breaker.record_failure();
+                Err(ApiError::UpstreamStatus { status })
+            }
+            Err(e) => {
+                tracing::warn!(
+                    upstream = %url,
+                    status = %status,
+                    error = ?e,
+                    "alias fallback probe body read failed",
+                );
+                breaker.record_failure();
+                Err(ApiError::UpstreamStatus { status })
+            }
+        }
+    }
+
     /// Breaker-gated streaming POST: checks `breaker.allow()` first, records
     /// success/failure, and returns `ApiError::BreakerOpen` when Open.
     ///
@@ -183,6 +262,29 @@ impl Proxy {
                 worker: worker_url.to_string(),
             });
         }
+        self.forward_streaming_to_without_admission(
+            worker_url,
+            breaker,
+            path,
+            headers,
+            body,
+            stream_guards,
+            on_first_byte,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn forward_streaming_to_without_admission(
+        &self,
+        worker_url: &str,
+        breaker: &Arc<CircuitBreaker>,
+        path: &str,
+        headers: &HeaderMap,
+        body: Bytes,
+        stream_guards: Option<Box<dyn Send + 'static>>,
+        on_first_byte: Option<Box<dyn FnOnce() + Send + 'static>>,
+    ) -> Result<Response<Body>, ApiError> {
         let worker_url = parse_worker_url(worker_url, breaker)?;
         let url = worker_url.join(path).map_err(|e| {
             ApiError::Internal(anyhow::Error::new(e).context(format!("join worker path {path}")))

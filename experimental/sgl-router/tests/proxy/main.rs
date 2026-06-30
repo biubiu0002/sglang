@@ -10,6 +10,7 @@
 
 mod common;
 
+mod alias_fallback_probe;
 mod cache_aware_input_ids;
 mod cache_aware_pending_pressure;
 mod chat_routing;

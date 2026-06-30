@@ -29,6 +29,7 @@ pub enum AliasFallbackReason {
     WorkerMisconfigured,
     UpstreamUnreachable,
     UpstreamTimeout,
+    StaleRequestExpired,
     UpstreamStatus(StatusCode),
     RetryableStatus(StatusCode),
 }
@@ -44,6 +45,7 @@ impl AliasFallbackReason {
             Self::WorkerMisconfigured => "worker_misconfigured",
             Self::UpstreamUnreachable => "upstream_unreachable",
             Self::UpstreamTimeout => "upstream_timeout",
+            Self::StaleRequestExpired => "stale_request_expired",
             Self::UpstreamStatus(_) => "upstream_status",
             Self::RetryableStatus(_) => "retryable_status",
         }
@@ -83,6 +85,7 @@ pub fn fallback_reason_for_error(error: &ApiError) -> Option<AliasFallbackReason
         ApiError::WorkerMisconfigured { .. } => Some(AliasFallbackReason::WorkerMisconfigured),
         ApiError::UpstreamUnreachable { .. } => Some(AliasFallbackReason::UpstreamUnreachable),
         ApiError::UpstreamTimeout { .. } => Some(AliasFallbackReason::UpstreamTimeout),
+        ApiError::StaleRequestExpired { .. } => Some(AliasFallbackReason::StaleRequestExpired),
         ApiError::UpstreamStatus { status } if retryable_status(*status) => {
             Some(AliasFallbackReason::UpstreamStatus(*status))
         }
@@ -218,4 +221,21 @@ fn fallback_headers(
         headers.insert(header::AUTHORIZATION, value);
     }
     Ok(headers)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stale_request_expired_is_fallback_eligible() {
+        let reason = fallback_reason_for_error(&ApiError::StaleRequestExpired {
+            model: "macaron-0.6".to_string(),
+        });
+
+        assert_eq!(
+            reason.map(AliasFallbackReason::as_label),
+            Some("stale_request_expired")
+        );
+    }
 }

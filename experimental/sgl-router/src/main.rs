@@ -4,6 +4,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use sgl_router::config::{Cli, LogFormat, RuntimeMode};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::signal::unix::{signal, Signal, SignalKind};
 
@@ -85,6 +86,17 @@ fn build_worker_metadata_client(worker_introspect_key: Option<&str>) -> reqwest:
     builder.build().expect("default http client builds")
 }
 
+fn kv_event_endpoint_overrides_from_env(
+) -> Result<HashMap<String, sgl_router::policies::kv_events::KvEventEndpointOverride>> {
+    match std::env::var("KV_EVENT_ENDPOINT_OVERRIDES") {
+        Ok(raw) if !raw.trim().is_empty() => {
+            sgl_router::policies::kv_events::parse_endpoint_overrides(&raw)
+                .context("parse KV_EVENT_ENDPOINT_OVERRIDES")
+        }
+        _ => Ok(HashMap::new()),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -156,10 +168,19 @@ async fn main() -> Result<()> {
     // when one is configured — otherwise discovery gets 401, no ZMQ
     // subscriber is attached, and cache_aware_zmq degrades to min-load.
     let kv_discovery_client = build_worker_metadata_client(cfg.worker_introspect_key.as_deref());
-    let kv_index = sgl_router::policies::kv_events::KvEventIndex::new_with_http_and_oracle(
-        kv_discovery_client,
-        Arc::clone(&block_size_oracle),
-    );
+    let endpoint_overrides = kv_event_endpoint_overrides_from_env()?;
+    if !endpoint_overrides.is_empty() {
+        tracing::info!(
+            count = endpoint_overrides.len(),
+            "kv-events: endpoint overrides configured"
+        );
+    }
+    let kv_index =
+        sgl_router::policies::kv_events::KvEventIndex::new_with_http_oracle_and_endpoint_overrides(
+            kv_discovery_client,
+            Arc::clone(&block_size_oracle),
+            endpoint_overrides,
+        );
     let policies = Arc::new(
         sgl_router::policies::factory::build_registry(
             &cfg,
@@ -300,10 +321,19 @@ async fn main() -> Result<()> {
 
 async fn run_cache_state(cfg: sgl_router::config::Config) -> Result<()> {
     let block_size_oracle = sgl_router::policies::kv_events::BlockSizeOracle::new();
-    let kv_index = sgl_router::policies::kv_events::KvEventIndex::new_with_http_and_oracle(
-        build_worker_metadata_client(cfg.worker_introspect_key.as_deref()),
-        Arc::clone(&block_size_oracle),
-    );
+    let endpoint_overrides = kv_event_endpoint_overrides_from_env()?;
+    if !endpoint_overrides.is_empty() {
+        tracing::info!(
+            count = endpoint_overrides.len(),
+            "cache-state kv-events: endpoint overrides configured"
+        );
+    }
+    let kv_index =
+        sgl_router::policies::kv_events::KvEventIndex::new_with_http_oracle_and_endpoint_overrides(
+            build_worker_metadata_client(cfg.worker_introspect_key.as_deref()),
+            Arc::clone(&block_size_oracle),
+            endpoint_overrides,
+        );
     let service = Arc::new(sgl_router::cache_state::CacheStateService::new(
         kv_index.tree(),
     ));

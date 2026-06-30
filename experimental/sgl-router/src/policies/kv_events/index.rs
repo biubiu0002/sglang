@@ -28,6 +28,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::{anyhow, Result};
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -46,6 +47,15 @@ use super::wire::KvCacheEvent;
 /// per-worker event rates are < 1 kHz; a 1024-deep buffer absorbs a
 /// half-second burst at 2 kHz before back-pressuring the SUB sockets.
 const EVENT_CHANNEL_BUFFER: usize = 1024;
+
+/// Per-worker endpoint rewrite for environments where the worker advertises
+/// `tcp://<worker-public-ip>:5557`, but the router/cache-state service must
+/// subscribe through a local relay such as `ssh -L 127.0.0.1:15557:127.0.0.1:5557`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvEventEndpointOverride {
+    pub host: String,
+    pub port_base: u16,
+}
 
 /// Per-worker bookkeeping kept inside [`KvEventIndex`] so `remove_worker`
 /// knows which DP ranks were actually subscribed (not the advertised
@@ -88,6 +98,9 @@ pub struct KvEventIndex {
     /// rejected (logged + not subscribed). The policy reads it at routing
     /// time to size its `compute_block_hashes` call.
     block_size_oracle: Arc<BlockSizeOracle>,
+    /// Optional per-worker subscriber endpoint rewrites. Keyed by the same
+    /// worker URL used by discovery/registry.
+    endpoint_overrides: HashMap<String, KvEventEndpointOverride>,
 }
 
 impl KvEventIndex {
@@ -115,6 +128,14 @@ impl KvEventIndex {
         http: reqwest::Client,
         block_size_oracle: Arc<BlockSizeOracle>,
     ) -> Arc<Self> {
+        Self::new_with_http_oracle_and_endpoint_overrides(http, block_size_oracle, HashMap::new())
+    }
+
+    pub fn new_with_http_oracle_and_endpoint_overrides(
+        http: reqwest::Client,
+        block_size_oracle: Arc<BlockSizeOracle>,
+        endpoint_overrides: HashMap<String, KvEventEndpointOverride>,
+    ) -> Arc<Self> {
         let tree = Arc::new(HashTree::new());
         let (tx, rx) = mpsc::channel::<WorkerEvent>(EVENT_CHANNEL_BUFFER);
         let subscribers = Arc::new(KvEventSubscriberRegistry::new(tx));
@@ -138,6 +159,7 @@ impl KvEventIndex {
             live_workers,
             cursors,
             block_size_oracle,
+            endpoint_overrides,
         })
     }
 
@@ -166,7 +188,7 @@ impl KvEventIndex {
     /// logged no-op — the worker still routes via the non-cache-aware
     /// policies.
     pub async fn add_worker(&self, worker_url: &str, preresolved: Option<EventConfig>) {
-        let cfg: EventConfig = match preresolved {
+        let mut cfg: EventConfig = match preresolved {
             Some(c) => c,
             None => match fetch_event_config(worker_url, &self.http).await {
                 Ok(Some(c)) => c,
@@ -187,6 +209,18 @@ impl KvEventIndex {
                 }
             },
         };
+        if let Some(endpoint) = self.endpoint_overrides.get(worker_url) {
+            info!(
+                worker_url = %worker_url,
+                advertised_host = %cfg.host,
+                advertised_port_base = cfg.port_base,
+                relay_host = %endpoint.host,
+                relay_port_base = endpoint.port_base,
+                "kv-events: overriding subscriber endpoint",
+            );
+            cfg.host = endpoint.host.clone();
+            cfg.port_base = endpoint.port_base;
+        }
         // Reconcile this worker's `page_size` with the oracle BEFORE
         // any subscriber state is created. The first worker establishes
         // the value; later workers must agree. A mismatch means the
@@ -320,6 +354,54 @@ impl KvEventIndex {
     }
 }
 
+/// Parse `worker_url=host:port_base` entries separated by commas.
+///
+/// Example:
+/// `http://10.0.0.1:10100=127.0.0.1:15557,http://10.0.0.2:10100=127.0.0.1:15567`
+pub fn parse_endpoint_overrides(raw: &str) -> Result<HashMap<String, KvEventEndpointOverride>> {
+    let mut out = HashMap::new();
+    for entry in raw.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let (worker_url, endpoint) = entry.split_once('=').ok_or_else(|| {
+            anyhow!(
+                "invalid KV event endpoint override {entry:?}; expected worker_url=host:port_base"
+            )
+        })?;
+        let worker_url = worker_url.trim();
+        let endpoint = endpoint.trim();
+        if worker_url.is_empty() {
+            return Err(anyhow!(
+                "invalid KV event endpoint override {entry:?}; worker URL is empty"
+            ));
+        }
+        let (host, port) = endpoint.rsplit_once(':').ok_or_else(|| {
+            anyhow!(
+                "invalid KV event endpoint override {entry:?}; expected endpoint host:port_base"
+            )
+        })?;
+        let host = host.trim();
+        if host.is_empty() {
+            return Err(anyhow!(
+                "invalid KV event endpoint override {entry:?}; endpoint host is empty"
+            ));
+        }
+        let port_base: u16 = port.trim().parse().map_err(|e| {
+            anyhow!("invalid KV event endpoint override {entry:?}; port_base must be u16: {e}")
+        })?;
+        out.insert(
+            worker_url.to_string(),
+            KvEventEndpointOverride {
+                host: host.to_string(),
+                port_base,
+            },
+        );
+    }
+    Ok(out)
+}
+
 /// Drain `WorkerEvent`s and apply each batch to the tree. Out-of-order
 /// (seq ≤ last_applied) and stale (worker not in `live_workers`) batches
 /// are skipped. `PublisherReset` events clear the cursor so a publisher
@@ -419,6 +501,36 @@ mod tests {
             events,
             attn_dp_rank: None,
         }
+    }
+
+    #[test]
+    fn parses_endpoint_overrides() {
+        let overrides = parse_endpoint_overrides(
+            "http://w1:10100=127.0.0.1:15557, http://w2:10100=localhost:15567",
+        )
+        .unwrap();
+
+        assert_eq!(
+            overrides.get("http://w1:10100"),
+            Some(&KvEventEndpointOverride {
+                host: "127.0.0.1".into(),
+                port_base: 15557,
+            })
+        );
+        assert_eq!(
+            overrides.get("http://w2:10100"),
+            Some(&KvEventEndpointOverride {
+                host: "localhost".into(),
+                port_base: 15567,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_endpoint_override() {
+        assert!(parse_endpoint_overrides("http://w1:10100=127.0.0.1").is_err());
+        assert!(parse_endpoint_overrides("=127.0.0.1:15557").is_err());
+        assert!(parse_endpoint_overrides("http://w1:10100=127.0.0.1:not-a-port").is_err());
     }
 
     /// Bundle of plumbing returned by `spawn_pump` so individual tests

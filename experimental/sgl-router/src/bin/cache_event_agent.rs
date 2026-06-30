@@ -1,8 +1,13 @@
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use reqwest::Client;
+use sgl_router::cache_event_stream::{
+    encode_base64, KafkaKvEventProducer, KafkaKvEventStreamConfig, KvEventStreamRecord,
+    LocalKvEventStream, LocalKvEventStreamConfig,
+};
 use sgl_router::cache_state::CacheStateKvEventsRequest;
 use sgl_router::policies::kv_events::tree::KvWorkerId;
 use sgl_router::policies::kv_events::wire::decode_event_batch;
@@ -15,8 +20,36 @@ const END_SEQ_SENTINEL: i64 = -1;
 #[derive(Debug, Parser)]
 #[command(about = "Forward local SGLang KV events to a remote cache-state service")]
 struct Args {
-    #[arg(long, env = "CACHE_EVENT_AGENT_CACHE_STATE_URL")]
-    cache_state_url: String,
+    #[arg(
+        long,
+        env = "CACHE_EVENT_AGENT_CACHE_STATE_URL",
+        required_unless_present_any = ["stream_path", "kafka_bootstrap_servers"]
+    )]
+    cache_state_url: Option<String>,
+
+    #[arg(long, env = "CACHE_EVENT_AGENT_STREAM_PATH")]
+    stream_path: Option<PathBuf>,
+
+    #[arg(long, env = "CACHE_EVENT_AGENT_STREAM_RETENTION_SECS")]
+    stream_retention_secs: Option<u64>,
+
+    #[arg(long, env = "CACHE_EVENT_AGENT_STREAM_MAX_BYTES")]
+    stream_max_bytes: Option<u64>,
+
+    #[arg(long, env = "CACHE_EVENT_AGENT_KAFKA_BOOTSTRAP_SERVERS")]
+    kafka_bootstrap_servers: Option<String>,
+
+    #[arg(long, env = "CACHE_EVENT_AGENT_KAFKA_TOPIC")]
+    kafka_topic: Option<String>,
+
+    #[arg(long, env = "CACHE_EVENT_AGENT_KAFKA_USERNAME")]
+    kafka_username: Option<String>,
+
+    #[arg(long, env = "CACHE_EVENT_AGENT_KAFKA_PASSWORD")]
+    kafka_password: Option<String>,
+
+    #[arg(long, env = "CACHE_EVENT_AGENT_KAFKA_CLIENT_ID")]
+    kafka_client_id: Option<String>,
 
     #[arg(long, env = "CACHE_EVENT_AGENT_WORKER_URL")]
     worker_url: String,
@@ -66,8 +99,7 @@ async fn main() -> Result<()> {
     if args.dp_size == 0 {
         return Err(anyhow!("--dp-size must be greater than 0"));
     }
-    let base_url = args.cache_state_url.trim_end_matches('/').to_string();
-    let ingest_url = format!("{base_url}/v1/cache_state/kv_events");
+    let sinks = build_event_sinks(&args)?;
     let client = Client::builder()
         .timeout(Duration::from_millis(args.post_timeout_ms))
         .build()
@@ -84,7 +116,7 @@ async fn main() -> Result<()> {
         endpoint_host = %args.endpoint_host,
         port_base = args.port_base,
         dp_size = args.dp_size,
-        cache_state_url = %base_url,
+        sinks = %sinks.iter().map(EventSink::name).collect::<Vec<_>>().join(","),
         "cache-event-agent starting",
     );
 
@@ -104,7 +136,7 @@ async fn main() -> Result<()> {
         };
         let task = AgentTask {
             client: client.clone(),
-            ingest_url: ingest_url.clone(),
+            sinks: sinks.clone(),
             worker_url: args.worker_url.clone(),
             model_id: args.model_id.clone(),
             endpoint: format!("tcp://{}:{}", args.endpoint_host, port),
@@ -128,9 +160,84 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone)]
+enum EventSink {
+    Http {
+        ingest_url: String,
+        display_url: String,
+    },
+    Stream(LocalKvEventStream),
+    Kafka(KafkaKvEventProducer),
+}
+
+impl EventSink {
+    fn name(&self) -> &str {
+        match self {
+            Self::Http { display_url, .. } => display_url,
+            Self::Stream(_) => "local-event-stream",
+            Self::Kafka(producer) => producer.topic(),
+        }
+    }
+}
+
+fn build_event_sinks(args: &Args) -> Result<Vec<EventSink>> {
+    let mut sinks = Vec::new();
+    if let Some(base_url) = args
+        .cache_state_url
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        let base_url = base_url.trim_end_matches('/').to_string();
+        sinks.push(EventSink::Http {
+            ingest_url: format!("{base_url}/v1/cache_state/kv_events"),
+            display_url: base_url,
+        });
+    }
+    if let Some(stream_path) = args.stream_path.clone() {
+        sinks.push(EventSink::Stream(LocalKvEventStream::new(
+            LocalKvEventStreamConfig {
+                path: stream_path,
+                retention_secs: args.stream_retention_secs,
+                max_bytes: args.stream_max_bytes,
+            },
+        )));
+    }
+    if let Some(bootstrap_servers) = args
+        .kafka_bootstrap_servers
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        let topic = args
+            .kafka_topic
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| anyhow!("--kafka-topic is required when Kafka is enabled"))?
+            .to_string();
+        let producer = KafkaKvEventProducer::new(KafkaKvEventStreamConfig {
+            bootstrap_servers: bootstrap_servers.to_string(),
+            topic,
+            username: args.kafka_username.clone(),
+            password: args.kafka_password.clone(),
+            client_id: args.kafka_client_id.clone(),
+            consumer_group: None,
+            auto_offset_reset: "latest".to_string(),
+        })?;
+        sinks.push(EventSink::Kafka(producer));
+    }
+    if sinks.is_empty() {
+        return Err(anyhow!(
+            "configure at least one sink: cache-state URL, stream path, or Kafka"
+        ));
+    }
+    Ok(sinks)
+}
+
 struct AgentTask {
     client: Client,
-    ingest_url: String,
+    sinks: Vec<EventSink>,
     worker_url: String,
     model_id: String,
     endpoint: String,
@@ -238,41 +345,107 @@ impl AgentTask {
                 }
             };
             let n_events = batch.events.len();
-            let req = CacheStateKvEventsRequest {
-                model_id: self.model_id.clone(),
-                worker_url: worker.url.clone(),
-                dp_rank: worker.dp_rank,
-                seq,
-                payload_b64: encode_base64(payload),
-            };
-            let mut post = self.client.post(&self.ingest_url);
-            if let Some(token) = self.cache_state_api_token.as_ref() {
-                post = post.bearer_auth(token);
-            }
-            match post.json(&req).send().await {
-                Ok(resp) if resp.status().is_success() => {
-                    debug!(
-                        dp_rank = self.dp_rank,
-                        seq, n_events, "forwarded KV event batch"
-                    );
-                }
-                Ok(resp) => {
-                    warn!(
-                        dp_rank = self.dp_rank,
-                        seq,
-                        n_events,
-                        status = %resp.status(),
-                        "cache-state rejected KV event batch"
-                    );
-                }
-                Err(err) => {
-                    warn!(
-                        dp_rank = self.dp_rank,
-                        seq,
-                        n_events,
-                        error = %err,
-                        "failed to forward KV event batch"
-                    );
+            for sink in &self.sinks {
+                match sink {
+                    EventSink::Http { ingest_url, .. } => {
+                        let req = CacheStateKvEventsRequest {
+                            model_id: self.model_id.clone(),
+                            worker_url: worker.url.clone(),
+                            dp_rank: worker.dp_rank,
+                            seq,
+                            payload_b64: encode_base64(payload),
+                        };
+                        let mut post = self.client.post(ingest_url);
+                        if let Some(token) = self.cache_state_api_token.as_ref() {
+                            post = post.bearer_auth(token);
+                        }
+                        match post.json(&req).send().await {
+                            Ok(resp) if resp.status().is_success() => {
+                                debug!(
+                                    dp_rank = self.dp_rank,
+                                    seq, n_events, "forwarded KV event batch"
+                                );
+                            }
+                            Ok(resp) => {
+                                warn!(
+                                    dp_rank = self.dp_rank,
+                                    seq,
+                                    n_events,
+                                    status = %resp.status(),
+                                    "cache-state rejected KV event batch"
+                                );
+                            }
+                            Err(err) => {
+                                warn!(
+                                    dp_rank = self.dp_rank,
+                                    seq,
+                                    n_events,
+                                    error = %err,
+                                    "failed to forward KV event batch"
+                                );
+                            }
+                        }
+                    }
+                    EventSink::Stream(stream) => {
+                        let record = KvEventStreamRecord::from_payload(
+                            self.model_id.clone(),
+                            worker.url.clone(),
+                            worker.dp_rank,
+                            seq,
+                            payload,
+                        );
+                        match stream.append(&record) {
+                            Ok(stats) => {
+                                debug!(
+                                    dp_rank = self.dp_rank,
+                                    seq,
+                                    n_events,
+                                    stream_records = stats.records_after_compaction,
+                                    stream_bytes = stats.bytes_after_compaction,
+                                    "appended KV event batch to stream"
+                                );
+                            }
+                            Err(err) => {
+                                warn!(
+                                    dp_rank = self.dp_rank,
+                                    seq,
+                                    n_events,
+                                    error = %err,
+                                    "failed to append KV event batch to stream"
+                                );
+                            }
+                        }
+                    }
+                    EventSink::Kafka(producer) => {
+                        let record = KvEventStreamRecord::from_payload(
+                            self.model_id.clone(),
+                            worker.url.clone(),
+                            worker.dp_rank,
+                            seq,
+                            payload,
+                        );
+                        match producer.send(&record).await {
+                            Ok(()) => {
+                                debug!(
+                                    dp_rank = self.dp_rank,
+                                    seq,
+                                    n_events,
+                                    topic = producer.topic(),
+                                    "published KV event batch to Kafka stream"
+                                );
+                            }
+                            Err(err) => {
+                                warn!(
+                                    dp_rank = self.dp_rank,
+                                    seq,
+                                    n_events,
+                                    topic = producer.topic(),
+                                    error = %err,
+                                    "failed to publish KV event batch to Kafka stream"
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -302,29 +475,6 @@ fn decode_zmq_message(msg: &zeromq::ZmqMessage, dp_rank: u32) -> Option<(i64, &[
         }
     };
     Some((i64::from_be_bytes(seq_bytes), payload.as_ref()))
-}
-
-fn encode_base64(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0];
-        let b1 = *chunk.get(1).unwrap_or(&0);
-        let b2 = *chunk.get(2).unwrap_or(&0);
-        out.push(ALPHABET[(b0 >> 2) as usize] as char);
-        out.push(ALPHABET[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
-        if chunk.len() >= 2 {
-            out.push(ALPHABET[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
-        } else {
-            out.push('=');
-        }
-        if chunk.len() == 3 {
-            out.push(ALPHABET[(b2 & 0x3f) as usize] as char);
-        } else {
-            out.push('=');
-        }
-    }
-    out
 }
 
 fn install_signal_handlers(cancel: CancellationToken) -> Result<()> {

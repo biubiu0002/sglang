@@ -5,8 +5,10 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use sgl_router::config::{Cli, LogFormat, RuntimeMode};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::signal::unix::{signal, Signal, SignalKind};
+use tokio_util::sync::CancellationToken;
 
 /// Install the global tracing subscriber.
 ///
@@ -343,6 +345,18 @@ async fn run_cache_state(cfg: sgl_router::config::Config) -> Result<()> {
     if cache_state_api_token.is_some() {
         tracing::info!("cache-state HTTP API bearer token auth enabled");
     }
+    let stream_consumer_handle = spawn_cache_state_stream_consumer_if_configured(
+        Arc::clone(&service),
+        std::env::var("CACHE_STATE_EVENT_STREAM_PATH")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from),
+        env_u64("CACHE_STATE_EVENT_STREAM_RETENTION_SECS")?,
+        env_u64("CACHE_STATE_EVENT_STREAM_MAX_BYTES")?,
+        env_u64("CACHE_STATE_EVENT_STREAM_POLL_MS")?.unwrap_or(1000),
+    )?;
+    let kafka_consumer_handle =
+        spawn_cache_state_kafka_consumer_if_configured(Arc::clone(&service))?;
     let app = service.router_with_api_token(cache_state_api_token);
     let bind = format!("{}:{}", cfg.server.host, cfg.server.port);
     let listener = tokio::net::TcpListener::bind(&bind)
@@ -380,7 +394,171 @@ async fn run_cache_state(cfg: sgl_router::config::Config) -> Result<()> {
         discovery_handle.abort();
         manager_handle.abort();
     }
+    if let Some(handle) = stream_consumer_handle {
+        handle.shutdown().await;
+    }
+    if let Some(handle) = kafka_consumer_handle {
+        handle.shutdown().await;
+    }
     server_result
+}
+
+struct StreamConsumerHandle {
+    cancel: CancellationToken,
+    join: tokio::task::JoinHandle<()>,
+}
+
+impl StreamConsumerHandle {
+    async fn shutdown(self) {
+        self.cancel.cancel();
+        let _ = self.join.await;
+    }
+}
+
+fn spawn_cache_state_stream_consumer_if_configured(
+    service: Arc<sgl_router::cache_state::CacheStateService>,
+    path: Option<PathBuf>,
+    retention_secs: Option<u64>,
+    max_bytes: Option<u64>,
+    poll_ms: u64,
+) -> Result<Option<StreamConsumerHandle>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let stream = sgl_router::cache_event_stream::LocalKvEventStream::new(
+        sgl_router::cache_event_stream::LocalKvEventStreamConfig {
+            path: path.clone(),
+            retention_secs,
+            max_bytes,
+        },
+    );
+    let cancel = CancellationToken::new();
+    let task_cancel = cancel.clone();
+    let join = tokio::spawn(async move {
+        let mut last_applied_key: Option<String> = None;
+        let poll = std::time::Duration::from_millis(poll_ms.max(100));
+        tracing::info!(
+            path = %path.display(),
+            poll_ms,
+            retention_secs,
+            max_bytes,
+            "cache-state event-stream consumer starting"
+        );
+        loop {
+            if task_cancel.is_cancelled() {
+                break;
+            }
+            match stream.read_all() {
+                Ok(records) => {
+                    let start = last_applied_key
+                        .as_ref()
+                        .and_then(|key| {
+                            records
+                                .iter()
+                                .rposition(|record| record.dedupe_key() == *key)
+                                .map(|idx| idx + 1)
+                        })
+                        .unwrap_or(0);
+                    if start < records.len() {
+                        let to_apply = &records[start..];
+                        match service.apply_stream_records(to_apply) {
+                            Ok(resp) => {
+                                last_applied_key =
+                                    to_apply.last().map(|record| record.dedupe_key());
+                                tracing::debug!(
+                                    records = to_apply.len(),
+                                    applied_events = resp.applied_events,
+                                    "applied cache-state event-stream records"
+                                );
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    error = ?err,
+                                    records = to_apply.len(),
+                                    "failed to apply cache-state event-stream records"
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "failed to read cache-state event stream");
+                }
+            }
+            tokio::select! {
+                _ = task_cancel.cancelled() => break,
+                _ = tokio::time::sleep(poll) => {}
+            }
+        }
+        tracing::info!("cache-state event-stream consumer stopped");
+    });
+    Ok(Some(StreamConsumerHandle { cancel, join }))
+}
+
+fn spawn_cache_state_kafka_consumer_if_configured(
+    service: Arc<sgl_router::cache_state::CacheStateService>,
+) -> Result<Option<StreamConsumerHandle>> {
+    let Some(config) =
+        sgl_router::cache_event_stream::KafkaKvEventStreamConfig::consumer_from_env("CACHE_STATE")?
+    else {
+        return Ok(None);
+    };
+    let consumer = sgl_router::cache_event_stream::KafkaKvEventConsumer::new(config)?;
+    let topic = consumer.topic().to_string();
+    let cancel = CancellationToken::new();
+    let task_cancel = cancel.clone();
+    let join = tokio::spawn(async move {
+        tracing::info!(topic = %topic, "cache-state Kafka event-stream consumer starting");
+        loop {
+            tokio::select! {
+                _ = task_cancel.cancelled() => break,
+                recv = consumer.recv() => {
+                    match recv {
+                        Ok(record) => {
+                            match service.apply_stream_records(std::slice::from_ref(&record)) {
+                                Ok(resp) => {
+                                    tracing::debug!(
+                                        worker_url = %record.worker_url,
+                                        dp_rank = record.dp_rank,
+                                        seq = record.seq,
+                                        applied_events = resp.applied_events,
+                                        "applied cache-state Kafka event-stream record"
+                                    );
+                                }
+                                Err(err) => {
+                                    tracing::warn!(
+                                        worker_url = %record.worker_url,
+                                        dp_rank = record.dp_rank,
+                                        seq = record.seq,
+                                        error = ?err,
+                                        "failed to apply cache-state Kafka event-stream record"
+                                    );
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                error = %err,
+                                "failed to receive cache-state Kafka event-stream record"
+                            );
+                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        }
+                    }
+                }
+            }
+        }
+        tracing::info!("cache-state Kafka event-stream consumer stopped");
+    });
+    Ok(Some(StreamConsumerHandle { cancel, join }))
+}
+
+fn env_u64(name: &str) -> Result<Option<u64>> {
+    let Some(raw) = std::env::var(name).ok().filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    raw.parse::<u64>()
+        .with_context(|| format!("parse {name}={raw:?} as u64"))
+        .map(Some)
 }
 
 async fn shutdown_signal(mut sigterm: Signal, mut sigint: Signal) {

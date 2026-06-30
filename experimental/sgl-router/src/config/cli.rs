@@ -126,9 +126,11 @@ pub struct Cli {
     /// first-token pressure.
     #[arg(long)]
     pub ttft_cache_score_margin: Option<usize>,
-    /// Optional base URL of the distributed cache-state service. When set,
+    /// Optional base URL(s) of the distributed cache-state service. When set,
     /// cache-aware routing queries `<url>/v1/cache_state/match_prefix` for
-    /// prefix matches. Query failures degrade to cache misses.
+    /// prefix matches. Multiple URLs may be separated by comma or whitespace;
+    /// queries fail over across them and route-history feed broadcasts to all.
+    /// Query failures degrade to cache misses.
     #[arg(long)]
     pub cache_state_url: Option<String>,
     /// Timeout for remote cache-state prefix-match queries in milliseconds.

@@ -10,7 +10,7 @@
 //! failures as `false`, so routing never fails requests because cache-state is
 //! unavailable.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,6 +21,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
+use crate::cache_event_stream::KvEventStreamRecord;
 use crate::policies::kv_events::tree::{HashTree, KvWorkerId};
 use crate::policies::kv_events::wire::{decode_event_batch, DecodeError, KvCacheEvent};
 
@@ -131,6 +132,28 @@ impl CacheStateService {
         Ok(CacheStateKvEventsResponse { applied_events })
     }
 
+    pub fn apply_stream_records(
+        &self,
+        records: &[KvEventStreamRecord],
+    ) -> Result<CacheStateKvEventsResponse, CacheStateError> {
+        let mut seen = RecentDedupe::new(8192);
+        let mut applied_events = 0usize;
+        for record in records {
+            if !seen.insert(record.dedupe_key()) {
+                continue;
+            }
+            let resp = self.apply_kv_events(&CacheStateKvEventsRequest {
+                model_id: record.model_id.clone(),
+                worker_url: record.worker_url.clone(),
+                dp_rank: record.dp_rank,
+                seq: record.seq,
+                payload_b64: record.payload_b64.clone(),
+            })?;
+            applied_events += resp.applied_events;
+        }
+        Ok(CacheStateKvEventsResponse { applied_events })
+    }
+
     pub fn router(self: Arc<Self>) -> Router {
         self.router_with_api_token(None)
     }
@@ -146,6 +169,36 @@ impl CacheStateService {
             .route("/v1/cache_state/insert", post(insert_prefix))
             .route("/v1/cache_state/kv_events", post(kv_events))
             .with_state(state)
+    }
+}
+
+struct RecentDedupe {
+    max_entries: usize,
+    order: VecDeque<String>,
+    set: HashSet<String>,
+}
+
+impl RecentDedupe {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            max_entries,
+            order: VecDeque::new(),
+            set: HashSet::new(),
+        }
+    }
+
+    fn insert(&mut self, key: String) -> bool {
+        if self.set.contains(&key) {
+            return false;
+        }
+        self.set.insert(key.clone());
+        self.order.push_back(key);
+        while self.order.len() > self.max_entries {
+            if let Some(old) = self.order.pop_front() {
+                self.set.remove(&old);
+            }
+        }
+        true
     }
 }
 
@@ -278,7 +331,7 @@ fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
 
 #[derive(Debug, Clone)]
 pub struct RemoteCacheStateClient {
-    base_url: String,
+    base_urls: Vec<String>,
     agent: ureq::Agent,
     api_token: Option<String>,
 }
@@ -287,7 +340,7 @@ impl RemoteCacheStateClient {
     pub fn new(base_url: String, timeout: Duration) -> Self {
         let agent = ureq::AgentBuilder::new().timeout(timeout).build();
         Self {
-            base_url: base_url.trim_end_matches('/').to_string(),
+            base_urls: parse_cache_state_urls(&base_url),
             agent,
             api_token: std::env::var("CACHE_STATE_API_TOKEN")
                 .ok()
@@ -296,28 +349,50 @@ impl RemoteCacheStateClient {
     }
 
     pub fn match_prefix(&self, req: &CacheStateMatchRequest) -> Option<CacheStateMatchResponse> {
-        let url = format!("{}/v1/cache_state/match_prefix", self.base_url);
-        self.post(&url)
-            .send_json(req)
-            .ok()?
-            .into_json::<CacheStateMatchResponse>()
-            .ok()
+        for base_url in &self.base_urls {
+            let url = format!("{base_url}/v1/cache_state/match_prefix");
+            if let Some(resp) = self
+                .post(&url)
+                .send_json(req)
+                .ok()
+                .and_then(|resp| resp.into_json::<CacheStateMatchResponse>().ok())
+            {
+                return Some(resp);
+            }
+        }
+        None
     }
 
     pub fn insert(&self, req: &CacheStateInsertRequest) -> bool {
-        let url = format!("{}/v1/cache_state/insert", self.base_url);
-        self.post(&url)
-            .send_json(req)
-            .map(|resp| (200..300).contains(&resp.status()))
-            .unwrap_or(false)
+        let mut any_success = false;
+        for base_url in &self.base_urls {
+            let url = format!("{base_url}/v1/cache_state/insert");
+            if self
+                .post(&url)
+                .send_json(req)
+                .map(|resp| (200..300).contains(&resp.status()))
+                .unwrap_or(false)
+            {
+                any_success = true;
+            }
+        }
+        any_success
     }
 
     pub fn kv_events(&self, req: &CacheStateKvEventsRequest) -> bool {
-        let url = format!("{}/v1/cache_state/kv_events", self.base_url);
-        self.post(&url)
-            .send_json(req)
-            .map(|resp| (200..300).contains(&resp.status()))
-            .unwrap_or(false)
+        let mut any_success = false;
+        for base_url in &self.base_urls {
+            let url = format!("{base_url}/v1/cache_state/kv_events");
+            if self
+                .post(&url)
+                .send_json(req)
+                .map(|resp| (200..300).contains(&resp.status()))
+                .unwrap_or(false)
+            {
+                any_success = true;
+            }
+        }
+        any_success
     }
 
     fn post(&self, url: &str) -> ureq::Request {
@@ -327,6 +402,14 @@ impl RemoteCacheStateClient {
             None => req,
         }
     }
+}
+
+fn parse_cache_state_urls(raw: &str) -> Vec<String> {
+    raw.split(|c: char| c == ',' || c.is_whitespace())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim_end_matches('/').to_string())
+        .collect()
 }
 
 #[cfg(test)]
@@ -401,6 +484,83 @@ mod tests {
                 dp_rank: 1,
             }]
         );
+    }
+
+    #[test]
+    fn remote_cache_state_client_parses_multiple_urls() {
+        assert_eq!(
+            parse_cache_state_urls(" https://a.example/ ,https://b.example/  https://c.example "),
+            vec![
+                "https://a.example".to_string(),
+                "https://b.example".to_string(),
+                "https://c.example".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn stream_replay_converges_two_services() {
+        let records = vec![KvEventStreamRecord {
+            schema_version: 1,
+            model_id: "m".into(),
+            worker_url: "http://w0:30000".into(),
+            dp_rank: 0,
+            seq: 1,
+            observed_at_ms: 1,
+            payload_hash: "hash".into(),
+            payload_b64: encode_base64_for_test(&block_stored_payload(&[10, 20])),
+        }];
+        let a = CacheStateService::with_empty_tree();
+        let b = CacheStateService::with_empty_tree();
+
+        a.apply_stream_records(&records).unwrap();
+        b.apply_stream_records(&records).unwrap();
+
+        let req = CacheStateMatchRequest {
+            model_id: "m".into(),
+            block_hashes: vec![10, 20, 30],
+        };
+        assert_eq!(a.match_prefix(&req), b.match_prefix(&req));
+    }
+
+    #[test]
+    fn stream_replay_dedupes_duplicate_records() {
+        let payload = block_stored_payload(&[10, 20]);
+        let record = KvEventStreamRecord {
+            schema_version: 1,
+            model_id: "m".into(),
+            worker_url: "http://w0:30000".into(),
+            dp_rank: 0,
+            seq: 1,
+            observed_at_ms: 1,
+            payload_hash: "hash".into(),
+            payload_b64: encode_base64_for_test(&payload),
+        };
+        let service = CacheStateService::with_empty_tree();
+        let resp = service
+            .apply_stream_records(&[record.clone(), record])
+            .unwrap();
+        assert_eq!(resp.applied_events, 1);
+    }
+
+    fn block_stored_payload(block_hashes: &[i64]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        rmp::encode::write_array_len(&mut buf, 3).unwrap();
+        rmp::encode::write_f64(&mut buf, 1.0).unwrap();
+        rmp::encode::write_array_len(&mut buf, 1).unwrap();
+        rmp::encode::write_array_len(&mut buf, 7).unwrap();
+        rmp::encode::write_str(&mut buf, "BlockStored").unwrap();
+        rmp::encode::write_array_len(&mut buf, block_hashes.len() as u32).unwrap();
+        for hash in block_hashes {
+            rmp::encode::write_sint(&mut buf, *hash).unwrap();
+        }
+        rmp::encode::write_nil(&mut buf).unwrap();
+        rmp::encode::write_array_len(&mut buf, 0).unwrap();
+        rmp::encode::write_uint(&mut buf, 64).unwrap();
+        rmp::encode::write_nil(&mut buf).unwrap();
+        rmp::encode::write_nil(&mut buf).unwrap();
+        rmp::encode::write_uint(&mut buf, 1).unwrap();
+        buf
     }
 
     fn encode_base64_for_test(bytes: &[u8]) -> String {

@@ -39,8 +39,9 @@ pub struct Config {
     pub cache_tree_page_size: Option<u32>,
     pub cache_tree_bigram: bool,
     pub cache_tree_max_nodes: usize,
-    /// Optional remote distributed cache-state service used by
-    /// cache-aware routing. When unset, the router uses its in-process
+    /// Optional remote distributed cache-state service URL(s) used by
+    /// cache-aware routing. Multiple URLs are allowed for fixed A/B
+    /// cache-state instances. When unset, the router uses its in-process
     /// HashTree exactly as before.
     pub cache_state_url: Option<String>,
     pub cache_state_timeout_ms: u64,

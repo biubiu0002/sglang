@@ -92,7 +92,8 @@ async fn static_urls_pd_role_resolved_end_to_end() {
     use axum::{routing::get, Json, Router};
     use serde_json::json;
     use sgl_router::config::{
-        ActiveLoadConfig, Config, DiscoveryBackend, ObservabilityConfig, ProxyConfig, ServerConfig,
+        ActiveLoadConfig, Config, DiscoveryBackend, ObservabilityConfig, ProxyConfig, RuntimeMode,
+        ServerConfig,
     };
     use sgl_router::discovery::{spawn_discovery, WorkerId};
     use sgl_router::workers::{manager, WorkerRegistry};
@@ -123,6 +124,7 @@ async fn static_urls_pd_role_resolved_end_to_end() {
     });
 
     let cfg = Config {
+        runtime_mode: RuntimeMode::Gateway,
         server: ServerConfig {
             host: "127.0.0.1".into(),
             port: 0,
@@ -147,6 +149,8 @@ async fn static_urls_pd_role_resolved_end_to_end() {
         cache_tree_page_size: None,
         cache_tree_bigram: false,
         cache_tree_max_nodes: 1_000_000,
+        cache_state_url: None,
+        cache_state_timeout_ms: 20,
         alias_fallback: None,
     };
 

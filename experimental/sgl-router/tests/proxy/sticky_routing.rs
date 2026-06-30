@@ -33,6 +33,7 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// out so the background sweeper never fires mid-test.
 fn build_sticky_ctx(header_name: &str, worker_urls: &[String]) -> Arc<AppContext> {
     let cfg = Config {
+        runtime_mode: sgl_router::config::RuntimeMode::Gateway,
         server: ServerConfig {
             host: "0".into(),
             port: 0,
@@ -62,6 +63,8 @@ fn build_sticky_ctx(header_name: &str, worker_urls: &[String]) -> Arc<AppContext
         cache_tree_page_size: None,
         cache_tree_bigram: false,
         cache_tree_max_nodes: 1_000_000,
+        cache_state_url: None,
+        cache_state_timeout_ms: 20,
         alias_fallback: None,
     };
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());

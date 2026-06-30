@@ -3,7 +3,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use sgl_router::config::{Cli, LogFormat};
+use sgl_router::config::{Cli, LogFormat, RuntimeMode};
 use std::sync::Arc;
 use tokio::signal::unix::{signal, Signal, SignalKind};
 
@@ -72,6 +72,19 @@ fn install_signal_handlers() -> Result<(Signal, Signal)> {
     Ok((sigterm, sigint))
 }
 
+fn build_worker_metadata_client(worker_introspect_key: Option<&str>) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(2));
+    if let Some(token) = worker_introspect_key {
+        let mut headers = reqwest::header::HeaderMap::new();
+        let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+            .expect("worker introspect key must be a valid HTTP header value");
+        value.set_sensitive(true);
+        headers.insert(reqwest::header::AUTHORIZATION, value);
+        builder = builder.default_headers(headers);
+    }
+    builder.build().expect("default http client builds")
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -91,6 +104,10 @@ async fn main() -> Result<()> {
         cfg.server.host,
         cfg.server.port
     );
+
+    if cfg.runtime_mode == RuntimeMode::CacheState {
+        return run_cache_state(cfg).await;
+    }
 
     let tokenizers = Arc::new(
         sgl_router::tokenizer::TokenizerRegistry::load_from_config(&cfg)
@@ -138,18 +155,7 @@ async fn main() -> Result<()> {
     // carry the pool's shared worker key as a default Authorization header
     // when one is configured — otherwise discovery gets 401, no ZMQ
     // subscriber is attached, and cache_aware_zmq degrades to min-load.
-    let kv_discovery_client = {
-        let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(2));
-        if let Some(token) = cfg.worker_introspect_key.as_deref() {
-            let mut headers = reqwest::header::HeaderMap::new();
-            let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
-                .expect("worker introspect key must be a valid HTTP header value");
-            value.set_sensitive(true);
-            headers.insert(reqwest::header::AUTHORIZATION, value);
-            builder = builder.default_headers(headers);
-        }
-        builder.build().expect("default http client builds")
-    };
+    let kv_discovery_client = build_worker_metadata_client(cfg.worker_introspect_key.as_deref());
     let kv_index = sgl_router::policies::kv_events::KvEventIndex::new_with_http_and_oracle(
         kv_discovery_client,
         Arc::clone(&block_size_oracle),
@@ -288,6 +294,55 @@ async fn main() -> Result<()> {
     }
     if let Some(h) = load_poller_handle {
         h.shutdown().await;
+    }
+    server_result
+}
+
+async fn run_cache_state(cfg: sgl_router::config::Config) -> Result<()> {
+    let block_size_oracle = sgl_router::policies::kv_events::BlockSizeOracle::new();
+    let kv_index = sgl_router::policies::kv_events::KvEventIndex::new_with_http_and_oracle(
+        build_worker_metadata_client(cfg.worker_introspect_key.as_deref()),
+        Arc::clone(&block_size_oracle),
+    );
+    let service = Arc::new(sgl_router::cache_state::CacheStateService::new(
+        kv_index.tree(),
+    ));
+    let app = service.router();
+    let bind = format!("{}:{}", cfg.server.host, cfg.server.port);
+    let listener = tokio::net::TcpListener::bind(&bind)
+        .await
+        .with_context(|| format!("bind {bind}"))?;
+    let discovery_configured = match &cfg.discovery {
+        sgl_router::config::DiscoveryBackend::StaticUrls(s) => !s.urls.is_empty(),
+        sgl_router::config::DiscoveryBackend::K8s(_) => true,
+    };
+    let cache_state_manager = if discovery_configured {
+        let registry = Arc::new(sgl_router::workers::WorkerRegistry::default());
+        let (event_rx, discovery_handle) = sgl_router::discovery::spawn_discovery(&cfg)
+            .await
+            .context("spawn cache-state discovery")?;
+        let manager_handle = tokio::spawn(sgl_router::workers::manager::run_with_config(
+            event_rx,
+            registry,
+            Some(Arc::new(cfg.clone())),
+            Some(Arc::clone(&kv_index)),
+            None,
+        ));
+        tracing::info!("cache-state service subscribed to worker KV events");
+        Some((discovery_handle, manager_handle))
+    } else {
+        tracing::info!("cache-state service starting with empty tree and HTTP insert API only");
+        None
+    };
+    tracing::info!("cache-state service listening on {bind}");
+    let (sigterm, sigint) = install_signal_handlers()?;
+    let server_result = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal(sigterm, sigint))
+        .await
+        .context("axum serve cache-state");
+    if let Some((discovery_handle, manager_handle)) = cache_state_manager {
+        discovery_handle.abort();
+        manager_handle.abort();
     }
     server_result
 }

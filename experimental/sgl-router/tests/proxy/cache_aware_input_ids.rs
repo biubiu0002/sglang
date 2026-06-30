@@ -42,6 +42,7 @@ const MODEL: &str = "deepseek-v4-tiny";
 
 fn config() -> Config {
     Config {
+        runtime_mode: sgl_router::config::RuntimeMode::Gateway,
         server: ServerConfig {
             host: "0".into(),
             port: 0,
@@ -66,6 +67,8 @@ fn config() -> Config {
         cache_tree_page_size: None,
         cache_tree_bigram: false,
         cache_tree_max_nodes: 1_000_000,
+        cache_state_url: None,
+        cache_state_timeout_ms: 20,
         alias_fallback: None,
     }
 }

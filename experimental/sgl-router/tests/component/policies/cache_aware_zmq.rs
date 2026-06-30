@@ -62,6 +62,7 @@ async fn zmq_indexer_routes_to_publishing_worker_e2e() {
 
     // 1. Tokenizer registry — use the in-tree tiny fixture.
     let cfg = sgl_router::config::Config {
+        runtime_mode: sgl_router::config::RuntimeMode::Gateway,
         server: sgl_router::config::ServerConfig {
             host: "0".into(),
             port: 0,
@@ -88,6 +89,8 @@ async fn zmq_indexer_routes_to_publishing_worker_e2e() {
         cache_tree_page_size: None,
         cache_tree_bigram: false,
         cache_tree_max_nodes: 1_000_000,
+        cache_state_url: None,
+        cache_state_timeout_ms: 20,
         alias_fallback: None,
     };
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());

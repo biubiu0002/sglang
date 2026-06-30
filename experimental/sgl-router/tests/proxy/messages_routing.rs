@@ -32,6 +32,7 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn build_ctx_with_worker(url: &str) -> Arc<AppContext> {
     let cfg = Config {
+        runtime_mode: sgl_router::config::RuntimeMode::Gateway,
         server: ServerConfig {
             host: "0".into(),
             port: 0,
@@ -56,6 +57,8 @@ fn build_ctx_with_worker(url: &str) -> Arc<AppContext> {
         cache_tree_page_size: None,
         cache_tree_bigram: false,
         cache_tree_max_nodes: 1_000_000,
+        cache_state_url: None,
+        cache_state_timeout_ms: 20,
         alias_fallback: None,
     };
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
@@ -78,6 +81,7 @@ fn build_ctx_with_worker(url: &str) -> Arc<AppContext> {
 /// so the `/v1/messages` route hits its PD-reject guard instead of forwarding.
 fn build_ctx_with_prefill_worker(url: &str) -> Arc<AppContext> {
     let cfg = Config {
+        runtime_mode: sgl_router::config::RuntimeMode::Gateway,
         server: ServerConfig {
             host: "0".into(),
             port: 0,
@@ -102,6 +106,8 @@ fn build_ctx_with_prefill_worker(url: &str) -> Arc<AppContext> {
         cache_tree_page_size: None,
         cache_tree_bigram: false,
         cache_tree_max_nodes: 1_000_000,
+        cache_state_url: None,
+        cache_state_timeout_ms: 20,
         alias_fallback: None,
     };
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
@@ -122,6 +128,7 @@ fn build_ctx_with_prefill_worker(url: &str) -> Arc<AppContext> {
 
 fn build_cache_aware_ctx_with_workers(urls: [&str; 2]) -> Arc<AppContext> {
     let cfg = Config {
+        runtime_mode: sgl_router::config::RuntimeMode::Gateway,
         server: ServerConfig {
             host: "0".into(),
             port: 0,
@@ -152,6 +159,8 @@ fn build_cache_aware_ctx_with_workers(urls: [&str; 2]) -> Arc<AppContext> {
         cache_tree_page_size: Some(1),
         cache_tree_bigram: false,
         cache_tree_max_nodes: 1_000_000,
+        cache_state_url: None,
+        cache_state_timeout_ms: 20,
         alias_fallback: None,
     };
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
@@ -436,6 +445,7 @@ async fn messages_pd_rejection_wins_over_priority_filter() {
     // Anthropic clients and operators.
     let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let cfg = Config {
+        runtime_mode: sgl_router::config::RuntimeMode::Gateway,
         server: ServerConfig {
             host: "0".into(),
             port: 0,
@@ -460,6 +470,8 @@ async fn messages_pd_rejection_wins_over_priority_filter() {
         cache_tree_page_size: None,
         cache_tree_bigram: false,
         cache_tree_max_nodes: 1_000_000,
+        cache_state_url: None,
+        cache_state_timeout_ms: 20,
         alias_fallback: None,
     };
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());

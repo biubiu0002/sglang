@@ -5,6 +5,7 @@ use std::num::NonZeroU32;
 /// [`Config::validate`]. The router serves exactly one model.
 #[derive(Debug, Clone)]
 pub struct Config {
+    pub runtime_mode: RuntimeMode,
     pub server: ServerConfig,
     pub observability: ObservabilityConfig,
     pub model: ModelConfig,
@@ -38,7 +39,21 @@ pub struct Config {
     pub cache_tree_page_size: Option<u32>,
     pub cache_tree_bigram: bool,
     pub cache_tree_max_nodes: usize,
+    /// Optional remote distributed cache-state service used by
+    /// cache-aware routing. When unset, the router uses its in-process
+    /// HashTree exactly as before.
+    pub cache_state_url: Option<String>,
+    pub cache_state_timeout_ms: u64,
     pub alias_fallback: Option<AliasFallbackConfig>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum RuntimeMode {
+    #[default]
+    #[value(name = "gateway")]
+    Gateway,
+    #[value(name = "cache_state")]
+    CacheState,
 }
 
 #[derive(Debug, Clone)]

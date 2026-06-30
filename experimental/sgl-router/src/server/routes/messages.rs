@@ -935,6 +935,7 @@ mod tests {
     #[test]
     fn routing_tokens_include_system_but_ignore_metadata() {
         let cfg = Config {
+            runtime_mode: crate::config::RuntimeMode::Gateway,
             server: ServerConfig {
                 host: "0".into(),
                 port: 0,
@@ -959,6 +960,8 @@ mod tests {
             cache_tree_page_size: None,
             cache_tree_bigram: false,
             cache_tree_max_nodes: 1_000_000,
+            cache_state_url: None,
+            cache_state_timeout_ms: 20,
             alias_fallback: None,
         };
         let registry = TokenizerRegistry::load_from_config(&cfg).unwrap();

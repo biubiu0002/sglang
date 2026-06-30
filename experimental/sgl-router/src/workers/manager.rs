@@ -481,6 +481,7 @@ mod tests {
 
     fn cfg_with_model_cb(id: &str, threshold: u32, cool_down_secs: u64) -> Config {
         Config {
+            runtime_mode: crate::config::RuntimeMode::Gateway,
             server: ServerConfig {
                 host: "0".into(),
                 port: 0,
@@ -508,6 +509,8 @@ mod tests {
             cache_tree_page_size: None,
             cache_tree_bigram: false,
             cache_tree_max_nodes: 1_000_000,
+            cache_state_url: None,
+            cache_state_timeout_ms: 20,
             alias_fallback: None,
         }
     }

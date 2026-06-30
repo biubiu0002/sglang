@@ -13,8 +13,8 @@ use crate::config::{
     default_cb_cool_down, default_proxy_request_timeout_secs, default_stale_request_timeout_secs,
     resolve_mode, ActiveLoadConfig, AliasFallbackConfig, CacheAwareConfig, CacheTreeSource,
     CircuitBreakerConfig, Config, DiscoveryBackend, K8sDiscoveryConfig, LogFormat, ModelConfig,
-    ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
-    StickyConfig, WorkerBearerKeyConfig,
+    ObservabilityConfig, PolicyKind, ProxyConfig, RuntimeMode, ServerConfig,
+    StaticUrlsDiscoveryConfig, StickyConfig, WorkerBearerKeyConfig,
 };
 
 /// `sgl-router` — slim KV-aware OpenAI-compatible router for SGLang workers.
@@ -29,6 +29,12 @@ use crate::config::{
     about = "Slim KV-aware OpenAI-compatible router for SGLang workers"
 )]
 pub struct Cli {
+    /// Runtime mode. `gateway` is the normal OpenAI-compatible router.
+    /// `cache_state` runs only the distributed cache-state HTTP API for
+    /// internal gateway queries and does not require worker discovery.
+    #[arg(long, value_enum, default_value = "gateway")]
+    pub mode: RuntimeMode,
+
     // ---- server ----
     /// Address to bind the HTTP server to.
     #[arg(long, default_value = "127.0.0.1")]
@@ -120,6 +126,14 @@ pub struct Cli {
     /// first-token pressure.
     #[arg(long)]
     pub ttft_cache_score_margin: Option<usize>,
+    /// Optional base URL of the distributed cache-state service. When set,
+    /// cache-aware routing queries `<url>/v1/cache_state/match_prefix` for
+    /// prefix matches. Query failures degrade to cache misses.
+    #[arg(long)]
+    pub cache_state_url: Option<String>,
+    /// Timeout for remote cache-state prefix-match queries in milliseconds.
+    #[arg(long, default_value_t = 20)]
+    pub cache_state_timeout_ms: u64,
 
     // ---- sticky-session policy (only used by `--policy sticky`) ----
     /// Request header carrying the routing key for sticky-session routing.
@@ -262,7 +276,18 @@ impl Cli {
     /// [`Config::validate`] for the remaining value-level invariants
     /// (model id, static worker URLs).
     pub fn into_config(self) -> Result<Config> {
-        let discovery = self.build_discovery()?;
+        let discovery = if self.mode == RuntimeMode::CacheState {
+            if !self.worker_urls.is_empty() || self.service_discovery {
+                self.build_discovery()?
+            } else {
+                DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
+                    urls: Vec::new(),
+                    bearer_keys: Vec::new(),
+                })
+            }
+        } else {
+            self.build_discovery()?
+        };
 
         // Reject knobs that only take effect alongside another flag, rather
         // than silently dropping them — mirrors the discovery mutual-exclusion
@@ -285,15 +310,24 @@ impl Cli {
             || self.cache_tree_max_nodes.is_some()
             || self.ttft_first_routing
             || self.ttft_token_scale.is_some()
-            || self.ttft_cache_score_margin.is_some();
-        if tuned_cache_aware && self.policy != PolicyKind::CacheAwareZmq {
+            || self.ttft_cache_score_margin.is_some()
+            || self.cache_state_url.is_some()
+            || self.cache_state_timeout_ms != 20;
+        if self.mode == RuntimeMode::Gateway
+            && tuned_cache_aware
+            && self.policy != PolicyKind::CacheAwareZmq
+        {
             return Err(anyhow!(
                 "--cache-threshold / --balance-abs-threshold / --balance-rel-threshold \
                  / --hit-load-abs-threshold / --hit-load-rel-threshold \
                  / --cache-tree-source / --cache-tree-page-size / --cache-tree-bigram \
                  / --cache-tree-max-nodes / --ttft-first-routing / --ttft-token-scale \
-                 / --ttft-cache-score-margin require --policy cache_aware_zmq"
+                 / --ttft-cache-score-margin / --cache-state-url / --cache-state-timeout-ms \
+                 require --policy cache_aware_zmq"
             ));
+        }
+        if self.cache_state_timeout_ms == 0 {
+            return Err(anyhow!("--cache-state-timeout-ms must be greater than 0"));
         }
         if let Some(scale) = self.ttft_token_scale {
             if scale == 0 {
@@ -480,6 +514,7 @@ impl Cli {
         };
 
         let config = Config {
+            runtime_mode: self.mode,
             server: ServerConfig {
                 host: self.host,
                 port: self.port,
@@ -510,6 +545,8 @@ impl Cli {
             cache_tree_page_size: self.cache_tree_page_size,
             cache_tree_bigram: self.cache_tree_bigram,
             cache_tree_max_nodes: self.cache_tree_max_nodes.unwrap_or(1_000_000),
+            cache_state_url: self.cache_state_url,
+            cache_state_timeout_ms: self.cache_state_timeout_ms,
             alias_fallback,
         };
         config.validate()?;

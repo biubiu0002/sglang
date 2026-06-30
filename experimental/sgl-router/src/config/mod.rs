@@ -18,6 +18,9 @@ impl Config {
         match &self.discovery {
             DiscoveryBackend::StaticUrls(s) => {
                 if s.urls.is_empty() {
+                    if self.runtime_mode == RuntimeMode::CacheState {
+                        return Ok(());
+                    }
                     return Err(anyhow!(
                         "discovery.static_urls.urls must be a non-empty list"
                     ));
@@ -118,6 +121,7 @@ mod tests {
     /// the `cli` module tests; the k8s selector grammar in `types`.
     fn cfg(model_id: &str, urls: &[&str]) -> Config {
         Config {
+            runtime_mode: RuntimeMode::Gateway,
             server: ServerConfig {
                 host: "127.0.0.1".into(),
                 port: 30000,
@@ -142,6 +146,8 @@ mod tests {
             cache_tree_page_size: None,
             cache_tree_bigram: false,
             cache_tree_max_nodes: 1_000_000,
+            cache_state_url: None,
+            cache_state_timeout_ms: 20,
             alias_fallback: None,
         }
     }
@@ -164,6 +170,13 @@ mod tests {
     fn rejects_empty_static_urls_list() {
         let err = cfg("qwen3", &[]).validate().unwrap_err().to_string();
         assert!(err.contains("non-empty"), "got: {err}");
+    }
+
+    #[test]
+    fn accepts_empty_static_urls_for_cache_state_mode() {
+        let mut cfg = cfg("qwen3", &[]);
+        cfg.runtime_mode = RuntimeMode::CacheState;
+        cfg.validate().unwrap();
     }
 
     #[test]

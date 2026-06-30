@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::cache_state::RemoteCacheStateClient;
 use crate::config::{Config, ModelConfig, PolicyKind};
 use crate::discovery::ModelId;
 use crate::policies::{
@@ -58,6 +59,7 @@ pub fn build_policy(
     tree: Arc<HashTree>,
     tokenizers: Arc<TokenizerRegistry>,
     block_size_oracle: Arc<BlockSizeOracle>,
+    remote_cache_state: Option<Arc<RemoteCacheStateClient>>,
 ) -> Arc<dyn Policy> {
     match model.policy {
         PolicyKind::RoundRobin => Arc::new(RoundRobinPolicy::new()),
@@ -66,12 +68,12 @@ pub fn build_policy(
         PolicyKind::LoadBased => Arc::new(LoadBasedPolicy::new()),
         PolicyKind::CacheAwareZmq => {
             let cache_cfg = model.cache_aware.unwrap_or_default();
-            Arc::new(CacheAwareZmqPolicy::new(
-                cache_cfg,
-                tree,
-                tokenizers,
-                block_size_oracle,
-            ))
+            let policy = CacheAwareZmqPolicy::new(cache_cfg, tree, tokenizers, block_size_oracle);
+            let policy = match remote_cache_state {
+                Some(client) => policy.with_remote_cache_state(client),
+                None => policy,
+            };
+            Arc::new(policy)
         }
         PolicyKind::Sticky => build_sticky(model),
     }
@@ -119,6 +121,13 @@ pub fn build_registry(
 ) -> Result<PolicyRegistry> {
     let reg = PolicyRegistry::default();
     let m = &cfg.model;
+    let remote_cache_state = match cfg.cache_state_url.as_ref() {
+        Some(url) => Some(Arc::new(RemoteCacheStateClient::new(
+            url.clone(),
+            Duration::from_millis(cfg.cache_state_timeout_ms),
+        ))),
+        None => None,
+    };
     reg.insert(
         ModelId(m.id.clone()),
         build_policy(
@@ -126,6 +135,7 @@ pub fn build_registry(
             Arc::clone(&tree),
             Arc::clone(&tokenizers),
             Arc::clone(&block_size_oracle),
+            remote_cache_state,
         ),
     );
     Ok(reg)
@@ -160,6 +170,7 @@ mod tests {
 
     fn cfg_with_model(id: &str, policy: PolicyKind) -> Config {
         Config {
+            runtime_mode: crate::config::RuntimeMode::Gateway,
             server: ServerConfig {
                 host: "0".into(),
                 port: 0,
@@ -184,6 +195,8 @@ mod tests {
             cache_tree_page_size: None,
             cache_tree_bigram: false,
             cache_tree_max_nodes: 1_000_000,
+            cache_state_url: None,
+            cache_state_timeout_ms: 20,
             alias_fallback: None,
         }
     }

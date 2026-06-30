@@ -337,7 +337,13 @@ async fn run_cache_state(cfg: sgl_router::config::Config) -> Result<()> {
     let service = Arc::new(sgl_router::cache_state::CacheStateService::new(
         kv_index.tree(),
     ));
-    let app = service.router();
+    let cache_state_api_token = std::env::var("CACHE_STATE_API_TOKEN")
+        .ok()
+        .filter(|s| !s.is_empty());
+    if cache_state_api_token.is_some() {
+        tracing::info!("cache-state HTTP API bearer token auth enabled");
+    }
+    let app = service.router_with_api_token(cache_state_api_token);
     let bind = format!("{}:{}", cfg.server.host, cfg.server.port);
     let listener = tokio::net::TcpListener::bind(&bind)
         .await

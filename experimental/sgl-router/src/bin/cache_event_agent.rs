@@ -72,6 +72,9 @@ async fn main() -> Result<()> {
         .timeout(Duration::from_millis(args.post_timeout_ms))
         .build()
         .context("build HTTP client")?;
+    let cache_state_api_token = std::env::var("CACHE_STATE_API_TOKEN")
+        .ok()
+        .filter(|s| !s.is_empty());
     let cancel = CancellationToken::new();
     install_signal_handlers(cancel.clone())?;
 
@@ -107,6 +110,7 @@ async fn main() -> Result<()> {
             endpoint: format!("tcp://{}:{}", args.endpoint_host, port),
             topic: args.topic.clone(),
             dp_rank,
+            cache_state_api_token: cache_state_api_token.clone(),
             cancel: cancel.clone(),
         };
         handles.push(tokio::spawn(task.run()));
@@ -132,6 +136,7 @@ struct AgentTask {
     endpoint: String,
     topic: String,
     dp_rank: u32,
+    cache_state_api_token: Option<String>,
     cancel: CancellationToken,
 }
 
@@ -240,7 +245,11 @@ impl AgentTask {
                 seq,
                 payload_b64: encode_base64(payload),
             };
-            match self.client.post(&self.ingest_url).json(&req).send().await {
+            let mut post = self.client.post(&self.ingest_url);
+            if let Some(token) = self.cache_state_api_token.as_ref() {
+                post = post.bearer_auth(token);
+            }
+            match post.json(&req).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     debug!(
                         dp_rank = self.dp_rank,

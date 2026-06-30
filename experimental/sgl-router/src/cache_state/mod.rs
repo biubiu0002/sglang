@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -74,6 +74,12 @@ pub struct CacheStateService {
     tree: Arc<HashTree>,
 }
 
+#[derive(Debug, Clone)]
+struct CacheStateRouterState {
+    service: Arc<CacheStateService>,
+    api_token: Option<Arc<str>>,
+}
+
 impl CacheStateService {
     pub fn new(tree: Arc<HashTree>) -> Self {
         Self { tree }
@@ -126,12 +132,20 @@ impl CacheStateService {
     }
 
     pub fn router(self: Arc<Self>) -> Router {
+        self.router_with_api_token(None)
+    }
+
+    pub fn router_with_api_token(self: Arc<Self>, api_token: Option<String>) -> Router {
+        let state = CacheStateRouterState {
+            service: self,
+            api_token: api_token.map(Arc::from),
+        };
         Router::new()
             .route("/healthz", get(healthz))
             .route("/v1/cache_state/match_prefix", post(match_prefix))
             .route("/v1/cache_state/insert", post(insert_prefix))
             .route("/v1/cache_state/kv_events", post(kv_events))
-            .with_state(self)
+            .with_state(state)
     }
 }
 
@@ -156,40 +170,74 @@ async fn healthz() -> &'static str {
 }
 
 async fn match_prefix(
-    State(service): State<Arc<CacheStateService>>,
+    State(state): State<CacheStateRouterState>,
+    headers: HeaderMap,
     Json(req): Json<CacheStateMatchRequest>,
-) -> Json<CacheStateMatchResponse> {
-    Json(service.match_prefix(&req))
+) -> Result<Json<CacheStateMatchResponse>, CacheStateError> {
+    require_auth(&state, &headers)?;
+    Ok(Json(state.service.match_prefix(&req)))
 }
 
 async fn insert_prefix(
-    State(service): State<Arc<CacheStateService>>,
+    State(state): State<CacheStateRouterState>,
+    headers: HeaderMap,
     Json(req): Json<CacheStateInsertRequest>,
-) -> StatusCode {
-    service.insert(&req);
-    StatusCode::NO_CONTENT
+) -> Result<StatusCode, CacheStateError> {
+    require_auth(&state, &headers)?;
+    state.service.insert(&req);
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn kv_events(
-    State(service): State<Arc<CacheStateService>>,
+    State(state): State<CacheStateRouterState>,
+    headers: HeaderMap,
     Json(req): Json<CacheStateKvEventsRequest>,
 ) -> Result<Json<CacheStateKvEventsResponse>, CacheStateError> {
-    service.apply_kv_events(&req).map(Json)
+    require_auth(&state, &headers)?;
+    state.service.apply_kv_events(&req).map(Json)
 }
 
 #[derive(Debug)]
 pub enum CacheStateError {
+    Unauthorized,
     BadBase64(String),
     BadMsgpack(DecodeError),
 }
 
 impl IntoResponse for CacheStateError {
     fn into_response(self) -> Response {
-        let message = match self {
-            Self::BadBase64(err) => format!("invalid payload_b64: {err}"),
-            Self::BadMsgpack(err) => format!("invalid KV event msgpack payload: {err}"),
+        let (status, message) = match self {
+            Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized".to_string()),
+            Self::BadBase64(err) => (
+                StatusCode::BAD_REQUEST,
+                format!("invalid payload_b64: {err}"),
+            ),
+            Self::BadMsgpack(err) => (
+                StatusCode::BAD_REQUEST,
+                format!("invalid KV event msgpack payload: {err}"),
+            ),
         };
-        (StatusCode::BAD_REQUEST, message).into_response()
+        (status, message).into_response()
+    }
+}
+
+fn require_auth(state: &CacheStateRouterState, headers: &HeaderMap) -> Result<(), CacheStateError> {
+    let Some(expected) = state.api_token.as_ref() else {
+        return Ok(());
+    };
+    let Some(actual) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+    else {
+        return Err(CacheStateError::Unauthorized);
+    };
+    let Some(token) = actual.strip_prefix("Bearer ") else {
+        return Err(CacheStateError::Unauthorized);
+    };
+    if token == expected.as_ref() {
+        Ok(())
+    } else {
+        Err(CacheStateError::Unauthorized)
     }
 }
 
@@ -232,6 +280,7 @@ fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
 pub struct RemoteCacheStateClient {
     base_url: String,
     agent: ureq::Agent,
+    api_token: Option<String>,
 }
 
 impl RemoteCacheStateClient {
@@ -240,13 +289,15 @@ impl RemoteCacheStateClient {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             agent,
+            api_token: std::env::var("CACHE_STATE_API_TOKEN")
+                .ok()
+                .filter(|s| !s.is_empty()),
         }
     }
 
     pub fn match_prefix(&self, req: &CacheStateMatchRequest) -> Option<CacheStateMatchResponse> {
         let url = format!("{}/v1/cache_state/match_prefix", self.base_url);
-        self.agent
-            .post(&url)
+        self.post(&url)
             .send_json(req)
             .ok()?
             .into_json::<CacheStateMatchResponse>()
@@ -255,8 +306,7 @@ impl RemoteCacheStateClient {
 
     pub fn insert(&self, req: &CacheStateInsertRequest) -> bool {
         let url = format!("{}/v1/cache_state/insert", self.base_url);
-        self.agent
-            .post(&url)
+        self.post(&url)
             .send_json(req)
             .map(|resp| (200..300).contains(&resp.status()))
             .unwrap_or(false)
@@ -264,11 +314,18 @@ impl RemoteCacheStateClient {
 
     pub fn kv_events(&self, req: &CacheStateKvEventsRequest) -> bool {
         let url = format!("{}/v1/cache_state/kv_events", self.base_url);
-        self.agent
-            .post(&url)
+        self.post(&url)
             .send_json(req)
             .map(|resp| (200..300).contains(&resp.status()))
             .unwrap_or(false)
+    }
+
+    fn post(&self, url: &str) -> ureq::Request {
+        let req = self.agent.post(url);
+        match self.api_token.as_ref() {
+            Some(token) => req.set("Authorization", &format!("Bearer {token}")),
+            None => req,
+        }
     }
 }
 

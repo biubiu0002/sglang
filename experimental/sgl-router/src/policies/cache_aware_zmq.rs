@@ -35,7 +35,10 @@
 //! a misconfigured tree or tokenizer degrades to round-robin-with-load
 //! tiebreak, not a routing failure.
 
-use crate::cache_state::{CacheStateMatchRequest, CacheStateMatchResponse, RemoteCacheStateClient};
+use crate::cache_state::{
+    CacheStateInsertRequest, CacheStateMatchRequest, CacheStateMatchResponse,
+    RemoteCacheStateClient,
+};
 use crate::config::{CacheAwareConfig, CacheTreeSource};
 
 use crate::policies::kv_events::tree::KvWorkerId;
@@ -43,7 +46,9 @@ use crate::policies::kv_events::{
     compute_block_hashes, compute_block_hashes_bigram, BlockSizeOracle, HashTree,
 };
 use crate::policies::{request_tokens_for, Policy, SelectionContext};
-use crate::server::metrics::MetricsRegistry;
+use crate::server::metrics::{
+    MetricsRegistry, RemoteCacheStateFeedOutcome, RemoteCacheStateQueryOutcome,
+};
 use crate::tokenizer::TokenizerRegistry;
 use crate::workers::Worker;
 use std::collections::HashSet;
@@ -270,17 +275,62 @@ impl CacheAwareZmqPolicy {
                 block_hashes: block_hashes.to_vec(),
             };
             match client.match_prefix(&req) {
-                Some(resp) => return CacheMatch::from_remote(resp),
+                Some(resp) => {
+                    let remote_match = CacheMatch::from_remote(resp);
+                    if remote_match.is_useful() {
+                        self.record_remote_cache_state_query(RemoteCacheStateQueryOutcome::Hit);
+                        return remote_match;
+                    }
+                    let local_match =
+                        CacheMatch::from_local(self.tree.match_prefix(None, block_hashes));
+                    if local_match.is_useful() {
+                        self.record_remote_cache_state_query(
+                            RemoteCacheStateQueryOutcome::FallbackLocalHit,
+                        );
+                        tracing::debug!(
+                            model = %model,
+                            "cache-aware-zmq: remote cache-state returned no useful match; using local cache tree",
+                        );
+                    } else {
+                        self.record_remote_cache_state_query(RemoteCacheStateQueryOutcome::Miss);
+                    }
+                    return local_match;
+                }
                 None => {
+                    let local_match =
+                        CacheMatch::from_local(self.tree.match_prefix(None, block_hashes));
+                    if local_match.is_useful() {
+                        self.record_remote_cache_state_query(
+                            RemoteCacheStateQueryOutcome::FallbackLocalHit,
+                        );
+                        tracing::debug!(
+                            model = %model,
+                            "cache-aware-zmq: remote cache-state query failed; using local cache tree",
+                        );
+                    } else {
+                        self.record_remote_cache_state_query(RemoteCacheStateQueryOutcome::Failure);
+                    }
                     tracing::debug!(
                         model = %model,
-                        "cache-aware-zmq: remote cache-state query failed; treating as cache miss",
+                        "cache-aware-zmq: remote cache-state query failed",
                     );
-                    return CacheMatch::miss();
+                    return local_match;
                 }
             }
         }
         CacheMatch::from_local(self.tree.match_prefix(None, block_hashes))
+    }
+
+    fn record_remote_cache_state_query(&self, outcome: RemoteCacheStateQueryOutcome) {
+        if let Some(m) = self.metrics.get() {
+            m.record_remote_cache_state_query(outcome);
+        }
+    }
+
+    fn record_remote_cache_state_feed(&self, outcome: RemoteCacheStateFeedOutcome) {
+        if let Some(m) = self.metrics.get() {
+            m.record_remote_cache_state_feed(outcome);
+        }
     }
 
     /// Route-history tree feeding: in `RouteHistory` tree-source mode, record
@@ -290,7 +340,12 @@ impl CacheAwareZmqPolicy {
     /// double-feeding would corrupt the eviction-accurate state). `parent_hash
     /// = None` inserts the full chain from the root, mirroring how
     /// `match_prefix(None, ..)` queries it.
-    fn feed_route_history(&self, chosen: &Option<Arc<Worker>>, block_hashes: &[i64]) {
+    fn feed_route_history(
+        &self,
+        model: &crate::discovery::ModelId,
+        chosen: &Option<Arc<Worker>>,
+        block_hashes: &[i64],
+    ) {
         if self.config.tree_source != CacheTreeSource::RouteHistory {
             return;
         }
@@ -300,6 +355,29 @@ impl CacheAwareZmqPolicy {
         }
         let kw = KvWorkerId::new(w.url.clone(), 0);
         self.tree.insert(&kw, None, block_hashes);
+
+        if let Some(client) = &self.remote_cache_state {
+            let ok = client.insert(&CacheStateInsertRequest {
+                model_id: model.0.clone(),
+                worker_url: w.url.clone(),
+                dp_rank: 0,
+                parent_hash: None,
+                block_hashes: block_hashes.to_vec(),
+            });
+            let outcome = if ok {
+                RemoteCacheStateFeedOutcome::Success
+            } else {
+                RemoteCacheStateFeedOutcome::Failure
+            };
+            self.record_remote_cache_state_feed(outcome);
+            if !ok {
+                tracing::debug!(
+                    model = %model,
+                    worker = %w.url,
+                    "cache-aware-zmq: remote cache-state feed failed",
+                );
+            }
+        }
     }
 }
 
@@ -422,7 +500,7 @@ impl Policy for CacheAwareZmqPolicy {
                 ttft_matched_blocks,
                 &matched_urls,
             );
-            self.feed_route_history(&chosen, &block_hashes);
+            self.feed_route_history(ctx.model(), &chosen, &block_hashes);
             return chosen;
         }
         if match_rate <= self.config.cache_threshold || matched.worker_urls.is_empty() {
@@ -436,7 +514,7 @@ impl Policy for CacheAwareZmqPolicy {
             // prefix against the worker we actually send it to, so the next
             // request sharing the prefix can match it. (No-op in zmq mode.)
             let chosen = Self::pick_min_load(workers, self.config.use_reported_load);
-            self.feed_route_history(&chosen, &block_hashes);
+            self.feed_route_history(ctx.model(), &chosen, &block_hashes);
             return chosen;
         }
         // Among workers in the matched set, pick the lowest-load one.
@@ -466,7 +544,7 @@ impl Policy for CacheAwareZmqPolicy {
         // Route-history feeding: record this prefix against the chosen worker
         // so subsequent shared-prefix requests match it. No-op in zmq mode
         // (the worker's own ZMQ events own the tree there).
-        self.feed_route_history(&chosen, &block_hashes);
+        self.feed_route_history(ctx.model(), &chosen, &block_hashes);
         chosen
     }
 
@@ -486,13 +564,6 @@ struct CacheMatch {
 }
 
 impl CacheMatch {
-    fn miss() -> Self {
-        Self {
-            matched_blocks: 0,
-            worker_urls: HashSet::new(),
-        }
-    }
-
     fn from_local(matched: crate::policies::kv_events::tree::MatchResult) -> Self {
         Self {
             matched_blocks: matched.matched_blocks,
@@ -505,6 +576,10 @@ impl CacheMatch {
             matched_blocks: resp.matched_blocks,
             worker_urls: resp.workers.into_iter().map(|w| w.worker_url).collect(),
         }
+    }
+
+    fn is_useful(&self) -> bool {
+        self.matched_blocks > 0 && !self.worker_urls.is_empty()
     }
 }
 
@@ -523,11 +598,61 @@ fn matched_blocks_for_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache_state::{
+        CacheStateInsertRequest, CacheStateMatchRequest, CacheStateWorkerMatch,
+    };
     use crate::config::CacheAwareConfig;
     use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
     use crate::policies::kv_events::tree::KvWorkerId;
     use crate::policies::kv_events::HashTree;
     use crate::tokenizer::adapter;
+
+    async fn start_cache_state_service(
+        service: Arc<crate::cache_state::CacheStateService>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let app = service.router();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), server)
+    }
+
+    fn tiny_ids_and_hashes(registry: &TokenizerRegistry, text: &str) -> (Vec<u32>, Vec<i64>) {
+        let tok = registry.get("tiny").unwrap();
+        let ids = adapter::encode(&tok, text).unwrap();
+        let hashes = compute_block_hashes(&ids, 4);
+        assert!(!hashes.is_empty());
+        (ids, hashes)
+    }
+
+    fn ttft_remote_policy(
+        registry: Arc<TokenizerRegistry>,
+        tree: Arc<HashTree>,
+        client: Arc<RemoteCacheStateClient>,
+        metrics: Arc<MetricsRegistry>,
+    ) -> CacheAwareZmqPolicy {
+        CacheAwareZmqPolicy::new(
+            CacheAwareConfig {
+                cache_threshold: 0.0,
+                balance_abs_threshold: usize::MAX,
+                balance_rel_threshold: f32::INFINITY,
+                hit_load_abs_threshold: 0,
+                hit_load_rel_threshold: f32::INFINITY,
+                use_reported_load: true,
+                tree_source: CacheTreeSource::Zmq,
+                ttft_first_routing: true,
+                ttft_token_scale: 4,
+                ttft_cache_score_margin: 0,
+            },
+            tree,
+            registry,
+            oracle_for_tests(4),
+        )
+        .with_remote_cache_state(client)
+        .with_metrics(metrics)
+    }
 
     fn cfg_default() -> CacheAwareConfig {
         CacheAwareConfig {
@@ -1839,19 +1964,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn remote_cache_state_match_drives_ttft_first_selection() {
         let service = Arc::new(crate::cache_state::CacheStateService::with_empty_tree());
-        let app = service.clone().router();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
+        let (base_url, server) = start_cache_state_service(Arc::clone(&service)).await;
 
         let registry = tokenizer_registry_with_tiny();
         let text = "hello world hello world hello world";
-        let tok = registry.get("tiny").unwrap();
-        let ids = adapter::encode(&tok, text).unwrap();
-        let hashes = compute_block_hashes(&ids, 4);
-        service.insert(&crate::cache_state::CacheStateInsertRequest {
+        let (ids, hashes) = tiny_ids_and_hashes(&registry, text);
+        service.insert(&CacheStateInsertRequest {
             model_id: "tiny".into(),
             worker_url: "http://w0:30000".into(),
             dp_rank: 0,
@@ -1859,27 +1977,16 @@ mod tests {
             block_hashes: hashes,
         });
         let client = Arc::new(RemoteCacheStateClient::new(
-            format!("http://{addr}"),
+            base_url,
             std::time::Duration::from_millis(500),
         ));
-        let policy = CacheAwareZmqPolicy::new(
-            CacheAwareConfig {
-                cache_threshold: 0.0,
-                balance_abs_threshold: usize::MAX,
-                balance_rel_threshold: f32::INFINITY,
-                hit_load_abs_threshold: 0,
-                hit_load_rel_threshold: f32::INFINITY,
-                use_reported_load: true,
-                tree_source: CacheTreeSource::Zmq,
-                ttft_first_routing: true,
-                ttft_token_scale: 4,
-                ttft_cache_score_margin: 0,
-            },
-            Arc::new(HashTree::new()),
+        let metrics = MetricsRegistry::new();
+        let policy = ttft_remote_policy(
             registry,
-            oracle_for_tests(4),
-        )
-        .with_remote_cache_state(client);
+            Arc::new(HashTree::new()),
+            client,
+            Arc::clone(&metrics),
+        );
         let w0 = worker("http://w0:30000", "tiny");
         let w1 = worker("http://w1:30000", "tiny");
         w0.set_reported_load(0);
@@ -1892,6 +1999,11 @@ mod tests {
 
         server.abort();
         assert_eq!(chosen.url, "http://w0:30000");
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains(r#"sgl_router_remote_cache_state_query_total{outcome="hit"} 1"#),
+            "remote hit must be counted; got:\n{rendered}",
+        );
     }
 
     #[test]
@@ -1933,6 +2045,81 @@ mod tests {
         let chosen = policy.select(&workers, &ctx).expect("must pick");
 
         assert_eq!(chosen.url, "http://w1:30000");
+    }
+
+    #[test]
+    fn remote_cache_state_failure_falls_back_to_local_tree() {
+        let registry = tokenizer_registry_with_tiny();
+        let text = "hello world hello world hello world";
+        let (ids, hashes) = tiny_ids_and_hashes(&registry, text);
+        let tree = Arc::new(HashTree::new());
+        tree.insert(&KvWorkerId::new("http://w0:30000".into(), 0), None, &hashes);
+        let client = Arc::new(RemoteCacheStateClient::new(
+            "http://127.0.0.1:9".into(),
+            std::time::Duration::from_millis(10),
+        ));
+        let metrics = MetricsRegistry::new();
+        let policy = ttft_remote_policy(registry, tree, client, Arc::clone(&metrics));
+        let w0 = worker("http://w0:30000", "tiny");
+        let w1 = worker("http://w1:30000", "tiny");
+        w0.set_reported_load(0);
+        w1.set_reported_load(1);
+        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None).with_request_tokens(Some(&ids));
+
+        let chosen = policy.select(&workers, &ctx).expect("must pick");
+
+        assert_eq!(
+            chosen.url, "http://w0:30000",
+            "local tree hit must survive remote cache-state failure",
+        );
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains(
+                r#"sgl_router_remote_cache_state_query_total{outcome="fallback_local_hit"} 1"#
+            ),
+            "fallback-local-hit must be counted; got:\n{rendered}",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_cache_state_empty_match_falls_back_to_local_tree() {
+        let service = Arc::new(crate::cache_state::CacheStateService::with_empty_tree());
+        let (base_url, server) = start_cache_state_service(service).await;
+        let registry = tokenizer_registry_with_tiny();
+        let text = "hello world hello world hello world";
+        let (ids, hashes) = tiny_ids_and_hashes(&registry, text);
+        let tree = Arc::new(HashTree::new());
+        tree.insert(&KvWorkerId::new("http://w0:30000".into(), 0), None, &hashes);
+        let client = Arc::new(RemoteCacheStateClient::new(
+            base_url,
+            std::time::Duration::from_millis(500),
+        ));
+        let metrics = MetricsRegistry::new();
+        let policy = ttft_remote_policy(registry, tree, client, Arc::clone(&metrics));
+        let w0 = worker("http://w0:30000", "tiny");
+        let w1 = worker("http://w1:30000", "tiny");
+        w0.set_reported_load(0);
+        w1.set_reported_load(1);
+        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None).with_request_tokens(Some(&ids));
+
+        let chosen = policy.select(&workers, &ctx).expect("must pick");
+
+        server.abort();
+        assert_eq!(
+            chosen.url, "http://w0:30000",
+            "empty remote cache-state response must fall back to local tree",
+        );
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains(
+                r#"sgl_router_remote_cache_state_query_total{outcome="fallback_local_hit"} 1"#
+            ),
+            "fallback-local-hit must be counted for empty remote response; got:\n{rendered}",
+        );
     }
 
     /// Route-history mode: the tree starts EMPTY (no ZMQ feed). The first
@@ -1986,6 +2173,111 @@ mod tests {
         assert_eq!(
             second.url, first.url,
             "repeat request for the same prefix must match the worker it was fed to",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn route_history_feeds_remote_cache_state_service() {
+        let service = Arc::new(crate::cache_state::CacheStateService::with_empty_tree());
+        let (base_url, server) = start_cache_state_service(Arc::clone(&service)).await;
+        let registry = tokenizer_registry_with_tiny();
+        let text = "hello world hello world hello world";
+        let (ids, hashes) = tiny_ids_and_hashes(&registry, text);
+        let expected_matched_blocks = hashes.len();
+        let client = Arc::new(RemoteCacheStateClient::new(
+            base_url,
+            std::time::Duration::from_millis(500),
+        ));
+        let metrics = MetricsRegistry::new();
+        let policy = CacheAwareZmqPolicy::new(
+            CacheAwareConfig {
+                cache_threshold: 0.0,
+                balance_abs_threshold: usize::MAX,
+                balance_rel_threshold: f32::INFINITY,
+                hit_load_abs_threshold: 0,
+                hit_load_rel_threshold: f32::INFINITY,
+                use_reported_load: false,
+                tree_source: CacheTreeSource::RouteHistory,
+                ..CacheAwareConfig::default()
+            },
+            Arc::new(HashTree::new()),
+            registry,
+            oracle_for_tests(4),
+        )
+        .with_remote_cache_state(client)
+        .with_metrics(Arc::clone(&metrics));
+        let w0 = worker("http://w0:30000", "tiny");
+        let workers = vec![Arc::clone(&w0)];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None).with_request_tokens(Some(&ids));
+
+        let chosen = policy.select(&workers, &ctx).expect("must pick");
+
+        assert_eq!(chosen.url, "http://w0:30000");
+        let remote_match = service.match_prefix(&CacheStateMatchRequest {
+            model_id: "tiny".into(),
+            block_hashes: hashes,
+        });
+        server.abort();
+        assert_eq!(remote_match.matched_blocks, expected_matched_blocks);
+        assert_eq!(
+            remote_match.workers,
+            vec![CacheStateWorkerMatch {
+                worker_url: "http://w0:30000".into(),
+                dp_rank: 0,
+            }]
+        );
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains(r#"sgl_router_remote_cache_state_feed_total{outcome="success"} 1"#),
+            "remote feed success must be counted; got:\n{rendered}",
+        );
+    }
+
+    #[test]
+    fn route_history_remote_feed_failure_is_non_fatal_and_counted() {
+        let tree = Arc::new(HashTree::new());
+        let registry = tokenizer_registry_with_tiny();
+        let text = "hello world hello world hello world";
+        let (ids, _) = tiny_ids_and_hashes(&registry, text);
+        let client = Arc::new(RemoteCacheStateClient::new(
+            "http://127.0.0.1:9".into(),
+            std::time::Duration::from_millis(10),
+        ));
+        let metrics = MetricsRegistry::new();
+        let policy = CacheAwareZmqPolicy::new(
+            CacheAwareConfig {
+                cache_threshold: 0.0,
+                balance_abs_threshold: usize::MAX,
+                balance_rel_threshold: f32::INFINITY,
+                hit_load_abs_threshold: 0,
+                hit_load_rel_threshold: f32::INFINITY,
+                use_reported_load: false,
+                tree_source: CacheTreeSource::RouteHistory,
+                ..CacheAwareConfig::default()
+            },
+            Arc::clone(&tree),
+            registry,
+            oracle_for_tests(4),
+        )
+        .with_remote_cache_state(client)
+        .with_metrics(Arc::clone(&metrics));
+        let w0 = worker("http://w0:30000", "tiny");
+        let workers = vec![Arc::clone(&w0)];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None).with_request_tokens(Some(&ids));
+
+        let chosen = policy.select(&workers, &ctx).expect("must pick");
+
+        assert_eq!(chosen.url, "http://w0:30000");
+        assert!(
+            tree.node_count() > 0,
+            "local route-history feed must happen even when remote feed fails",
+        );
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains(r#"sgl_router_remote_cache_state_feed_total{outcome="failure"} 1"#),
+            "remote feed failure must be counted; got:\n{rendered}",
         );
     }
 

@@ -35,6 +35,8 @@
 //! | `sgl_router_ingress_tokenize_errors_total` | Counter | `model_id` |
 //! | `sgl_router_priority_filtered_total` | Counter | `reason` |
 //! | `sgl_router_alias_route_total` | Counter | `alias_model_id`, `route`, `reason` |
+//! | `sgl_router_remote_cache_state_query_total` | Counter | `outcome` |
+//! | `sgl_router_remote_cache_state_feed_total` | Counter | `outcome` |
 //!
 //! The four `sgl_router_worker*` gauges and `sgl_router_workers` are sampled
 //! at scrape time from the live [`crate::workers::WorkerRegistry`] (passed to
@@ -213,6 +215,43 @@ impl StaleRequestOutcome {
     }
 }
 
+/// Remote cache-state query outcome. Kept intentionally small so enabling the
+/// optional distributed service cannot introduce unbounded metric labels.
+#[derive(Debug, Clone, Copy)]
+pub enum RemoteCacheStateQueryOutcome {
+    Hit,
+    Miss,
+    Failure,
+    FallbackLocalHit,
+}
+
+impl RemoteCacheStateQueryOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Hit => "hit",
+            Self::Miss => "miss",
+            Self::Failure => "failure",
+            Self::FallbackLocalHit => "fallback_local_hit",
+        }
+    }
+}
+
+/// Remote cache-state feed outcome.
+#[derive(Debug, Clone, Copy)]
+pub enum RemoteCacheStateFeedOutcome {
+    Success,
+    Failure,
+}
+
+impl RemoteCacheStateFeedOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Failure => "failure",
+        }
+    }
+}
+
 /// Active-load kind label — separates the two axes of per-worker load.
 #[derive(Debug, Clone, Copy)]
 pub enum ActiveLoadKind {
@@ -256,6 +295,8 @@ pub struct MetricsRegistry {
     ingress_tokenize_errors_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
     priority_filtered_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     alias_route_total: Mutex<HashMap<AliasRouteKey, Arc<AtomicU64>>>,
+    remote_cache_state_query_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
+    remote_cache_state_feed_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
 }
 
 #[derive(Debug, Hash, Eq, PartialEq, Clone)]
@@ -581,6 +622,28 @@ impl MetricsRegistry {
         let mut guard = self.alias_route_total.lock();
         let counter = guard
             .entry(key)
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump `sgl_router_remote_cache_state_query_total{outcome}`.
+    pub fn record_remote_cache_state_query(&self, outcome: RemoteCacheStateQueryOutcome) {
+        let mut guard = self.remote_cache_state_query_total.lock();
+        let counter = guard
+            .entry(outcome.as_str())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump `sgl_router_remote_cache_state_feed_total{outcome}`.
+    pub fn record_remote_cache_state_feed(&self, outcome: RemoteCacheStateFeedOutcome) {
+        let mut guard = self.remote_cache_state_feed_total.lock();
+        let counter = guard
+            .entry(outcome.as_str())
             .or_insert_with(|| Arc::new(AtomicU64::new(0)))
             .clone();
         drop(guard);
@@ -949,6 +1012,44 @@ impl MetricsRegistry {
         }
         drop(guard);
 
+        // remote_cache_state_query_total
+        out.push_str(
+            "# HELP sgl_router_remote_cache_state_query_total Remote cache-state query outcomes from cache-aware routing.\n",
+        );
+        out.push_str("# TYPE sgl_router_remote_cache_state_query_total counter\n");
+        let guard = self.remote_cache_state_query_total.lock();
+        let mut entries: Vec<(&&str, u64)> = guard
+            .iter()
+            .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by_key(|e| *e.0);
+        for (outcome, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_remote_cache_state_query_total{{outcome=\"{}\"}} {}\n",
+                outcome, value,
+            ));
+        }
+        drop(guard);
+
+        // remote_cache_state_feed_total
+        out.push_str(
+            "# HELP sgl_router_remote_cache_state_feed_total Remote cache-state route-history feed outcomes.\n",
+        );
+        out.push_str("# TYPE sgl_router_remote_cache_state_feed_total counter\n");
+        let guard = self.remote_cache_state_feed_total.lock();
+        let mut entries: Vec<(&&str, u64)> = guard
+            .iter()
+            .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by_key(|e| *e.0);
+        for (outcome, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_remote_cache_state_feed_total{{outcome=\"{}\"}} {}\n",
+                outcome, value,
+            ));
+        }
+        drop(guard);
+
         out
     }
 }
@@ -1016,6 +1117,8 @@ mod tests {
         assert!(out.contains("# TYPE sgl_router_sticky_total counter"));
         assert!(out.contains("# TYPE sgl_router_ingress_tokenize_errors_total counter"));
         assert!(out.contains("# TYPE sgl_router_priority_filtered_total counter"));
+        assert!(out.contains("# TYPE sgl_router_remote_cache_state_query_total counter"));
+        assert!(out.contains("# TYPE sgl_router_remote_cache_state_feed_total counter"));
         // Pool-size series exist (at 0) for all three modes even with no
         // workers, so dashboards have a stable series to graph.
         assert!(out.contains(r#"sgl_router_workers{mode="plain"} 0"#));

@@ -6,8 +6,9 @@
 //! This module is intentionally small and HTTP-shaped for the first
 //! production trial: the same router binary can run as a standalone
 //! in-memory cache-state service, while gateway mode can query it as an
-//! optional optimization. Query failures are surfaced as `None` to the
-//! policy so routing degrades to a cache miss instead of failing requests.
+//! optional optimization. Query failures are surfaced as `None`, and feed
+//! failures as `false`, so routing never fails requests because cache-state is
+//! unavailable.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -145,6 +146,15 @@ impl RemoteCacheStateClient {
             .ok()?
             .into_json::<CacheStateMatchResponse>()
             .ok()
+    }
+
+    pub fn insert(&self, req: &CacheStateInsertRequest) -> bool {
+        let url = format!("{}/v1/cache_state/insert", self.base_url);
+        self.agent
+            .post(&url)
+            .send_json(req)
+            .map(|resp| (200..300).contains(&resp.status()))
+            .unwrap_or(false)
     }
 }
 

@@ -871,6 +871,81 @@ mod tests {
     }
 
     #[test]
+    fn routing_value_keeps_text_blocks_but_rejects_thinking_blocks() {
+        let text_only = Bytes::from(
+            r#"{
+                "model":"claude-3",
+                "system":[{"type":"text","text":"be terse"}],
+                "messages":[{"role":"user","content":[
+                    {"type":"text","text":"hello"},
+                    {"type":"text","text":"world"}
+                ]}]
+            }"#,
+        );
+        let routed = anthropic_routing_value(&text_only).expect("text routing value");
+        assert_eq!(
+            routed,
+            serde_json::json!({
+                "messages": [
+                    {"role":"system","content":"be terse"},
+                    {"role":"user","content":[
+                        {"type":"text","text":"hello"},
+                        {"type":"text","text":"world"}
+                    ]}
+                ]
+            })
+        );
+
+        let thinking = Bytes::from(
+            r#"{
+                "model":"claude-3",
+                "messages":[{"role":"assistant","content":[
+                    {"type":"text","text":"answer"},
+                    {"type":"thinking","thinking":"reasoning","signature":"sig"}
+                ]}]
+            }"#,
+        );
+        assert!(
+            anthropic_routing_value(&thinking).is_none(),
+            "thinking blocks are worker-owned Anthropic state; do not approximate a routing prompt"
+        );
+    }
+
+    #[test]
+    fn routing_value_rejects_redacted_thinking_and_bare_tool_result() {
+        let redacted = Bytes::from(
+            r#"{
+                "model":"claude-3",
+                "messages":[{"role":"assistant","content":[
+                    {"type":"redacted_thinking","data":"opaque"}
+                ]}]
+            }"#,
+        );
+        assert!(
+            anthropic_routing_value(&redacted).is_none(),
+            "redacted thinking must not contribute to routing text"
+        );
+
+        let bare_tool_result = Bytes::from(
+            r#"{
+                "model":"claude-3",
+                "messages":[{"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"call_1","content":"42"}
+                ]}]
+            }"#,
+        );
+        assert_eq!(
+            anthropic_routing_value(&bare_tool_result),
+            Some(serde_json::json!({
+                "messages": [
+                    {"role":"tool","tool_call_id":"call_1","content":"42"}
+                ]
+            })),
+            "tool_result text is represented as a tool message, not folded into user text"
+        );
+    }
+
+    #[test]
     fn routing_value_rejects_unsupported_multimodal_messages() {
         let b = Bytes::from(
             r#"{

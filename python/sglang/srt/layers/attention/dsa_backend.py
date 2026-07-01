@@ -2725,9 +2725,9 @@ class DeepseekSparseAttnBackend(
 
 class DeepseekSparseAttnMultiStepBackend:
 
-    # Per-step draft decode replays from precomputed GPU metadata; opt out so
-    # decide_needs_cpu_seq_lens' OR over the backends stays False.
-    needs_cpu_seq_lens: bool = False
+    # DSA indexer may run outside CUDA graph during draft decode and read the
+    # CPU mirror before paged top-k.
+    needs_cpu_seq_lens: bool = True
 
     def __init__(
         self, model_runner: ModelRunner, topk: int, speculative_num_steps: int

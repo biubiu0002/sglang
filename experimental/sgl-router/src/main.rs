@@ -119,8 +119,10 @@ async fn main() -> Result<()> {
         cfg.server.port
     );
 
-    if cfg.runtime_mode == RuntimeMode::CacheState {
-        return run_cache_state(cfg).await;
+    match cfg.runtime_mode {
+        RuntimeMode::CacheState => return run_cache_state(cfg).await,
+        RuntimeMode::RouterState => return run_router_state(cfg).await,
+        RuntimeMode::Gateway => {}
     }
 
     let tokenizers = Arc::new(
@@ -129,6 +131,71 @@ async fn main() -> Result<()> {
     );
 
     let registry = Arc::new(sgl_router::workers::WorkerRegistry::default());
+    let router_state_url = std::env::var("ROUTER_STATE_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let router_state_redis_url = std::env::var("ROUTER_STATE_REDIS_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let router_state_timeout_ms = env_u64("ROUTER_STATE_TIMEOUT_MS")?.unwrap_or(20).max(1);
+    let router_state_snapshot_interval_ms = env_u64("ROUTER_STATE_SNAPSHOT_INTERVAL_MS")?
+        .unwrap_or(200)
+        .max(1);
+    if router_state_url.is_some() && router_state_redis_url.is_some() {
+        anyhow::bail!("ROUTER_STATE_URL and ROUTER_STATE_REDIS_URL are mutually exclusive");
+    }
+    let (router_state_client, router_state_overlay, router_state_poller_handle) =
+        if let Some(redis_url) = router_state_redis_url {
+            let key_prefix = std::env::var("ROUTER_STATE_REDIS_KEY_PREFIX")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "sgl-router:router-state".to_string());
+            let client: Arc<dyn sgl_router::router_state::RouterStateClient> = Arc::new(
+                sgl_router::router_state::RedisRouterStateClient::new(
+                    &redis_url,
+                    &key_prefix,
+                    std::time::Duration::from_millis(router_state_timeout_ms),
+                )
+                .context("build Redis router-state client")?,
+            );
+            let overlay = sgl_router::router_state::RouterStateLoadOverlay::new();
+            registry.attach_router_state_overlay(Arc::clone(&overlay));
+            let handle = sgl_router::router_state::spawn_router_state_snapshot_poller(
+                Arc::clone(&client),
+                Arc::clone(&overlay),
+                std::time::Duration::from_millis(router_state_snapshot_interval_ms),
+            );
+            tracing::info!(
+                redis_url_configured = true,
+                key_prefix = %key_prefix,
+                timeout_ms = router_state_timeout_ms,
+                snapshot_interval_ms = router_state_snapshot_interval_ms,
+                "Redis router-state active-load overlay enabled"
+            );
+            (Some(client), Some(overlay), Some(handle))
+        } else if let Some(url) = router_state_url {
+            let client: Arc<dyn sgl_router::router_state::RouterStateClient> =
+                Arc::new(sgl_router::router_state::RemoteRouterStateClient::new(
+                    url.clone(),
+                    std::time::Duration::from_millis(router_state_timeout_ms),
+                ));
+            let overlay = sgl_router::router_state::RouterStateLoadOverlay::new();
+            registry.attach_router_state_overlay(Arc::clone(&overlay));
+            let handle = sgl_router::router_state::spawn_router_state_snapshot_poller(
+                Arc::clone(&client),
+                Arc::clone(&overlay),
+                std::time::Duration::from_millis(router_state_snapshot_interval_ms),
+            );
+            tracing::info!(
+                router_state_url = %url,
+                timeout_ms = router_state_timeout_ms,
+                snapshot_interval_ms = router_state_snapshot_interval_ms,
+                "router-state active-load overlay enabled"
+            );
+            (Some(client), Some(overlay), Some(handle))
+        } else {
+            (None, None, None)
+        };
 
     // Build the KV-event index up front so the cache-aware-zmq policy can
     // share its `HashTree` handle + `BlockSizeOracle`. When no model uses
@@ -234,18 +301,15 @@ async fn main() -> Result<()> {
         None
     };
 
-    // Optional background load poller: when --load-poll-interval-secs is set,
+    // Optional background load poller: when a load poll interval is set,
     // poll each worker's /get_load for its real queue depth and feed it to
     // cache_aware_zmq (instead of the router-side in-flight count). Reuses the
     // worker introspect key for auth. None => not spawned (in-flight count).
-    let load_poller_handle = cfg.load_poll_interval_secs.map(|secs| {
-        tracing::info!(
-            interval_secs = secs,
-            "spawning worker load poller (/get_load)"
-        );
+    let load_poller_handle = cfg.load_poll_interval_secs.map(|ms| {
+        tracing::info!(interval_ms = ms, "spawning worker load poller (/get_load)");
         sgl_router::policies::load_poller::spawn_load_poller(
             Arc::clone(&registry),
-            std::time::Duration::from_secs(secs),
+            std::time::Duration::from_millis(ms),
             cfg.worker_introspect_key.clone(),
         )
     });
@@ -281,13 +345,15 @@ async fn main() -> Result<()> {
     );
 
     let ctx = Arc::new(
-        sgl_router::server::app_context::AppContext::with_active_load(
+        sgl_router::server::app_context::AppContext::with_active_load_and_router_state(
             cfg.clone(),
             tokenizers,
             proxy,
             registry,
             policies,
             active_load,
+            router_state_client,
+            router_state_overlay,
         ),
     );
     ctx.mark_ready();
@@ -318,7 +384,31 @@ async fn main() -> Result<()> {
     if let Some(h) = load_poller_handle {
         h.shutdown().await;
     }
+    if let Some(h) = router_state_poller_handle {
+        h.shutdown().await;
+    }
     server_result
+}
+
+async fn run_router_state(cfg: sgl_router::config::Config) -> Result<()> {
+    let service = Arc::new(sgl_router::router_state::RouterStateService::new());
+    let router_state_api_token = std::env::var("ROUTER_STATE_API_TOKEN")
+        .ok()
+        .filter(|s| !s.is_empty());
+    if router_state_api_token.is_some() {
+        tracing::info!("router-state HTTP API bearer token auth enabled");
+    }
+    let app = service.router_with_api_token(router_state_api_token);
+    let bind = format!("{}:{}", cfg.server.host, cfg.server.port);
+    let listener = tokio::net::TcpListener::bind(&bind)
+        .await
+        .with_context(|| format!("bind {bind}"))?;
+    tracing::info!("router-state service listening on {bind}");
+    let (sigterm, sigint) = install_signal_handlers()?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal(sigterm, sigint))
+        .await
+        .context("axum serve router-state")
 }
 
 async fn run_cache_state(cfg: sgl_router::config::Config) -> Result<()> {

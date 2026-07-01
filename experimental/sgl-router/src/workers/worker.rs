@@ -3,6 +3,7 @@
 
 use crate::discovery::{ModelId, WorkerId, WorkerMode};
 use crate::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+use crate::router_state::RouterStateLoadOverlay;
 use axum::http::{header, HeaderMap, HeaderValue};
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicI64, AtomicU8, AtomicUsize, Ordering};
@@ -164,6 +165,9 @@ pub struct Worker {
     /// `Arc<AtomicI64>` so the poller updates it lock-free without a
     /// registry write-lock.
     reported_load: Arc<AtomicI64>,
+    /// Optional global pending snapshot from the single-writer router-state
+    /// service. Present only in multi-replica gateway deployments.
+    global_pending: Option<Arc<RouterStateLoadOverlay>>,
     bearer_token: Option<String>,
 }
 
@@ -203,8 +207,13 @@ impl Worker {
             bootstrap_port: spec.bootstrap_port,
             min_priority: spec.min_priority,
             reported_load: Arc::new(AtomicI64::new(REPORTED_LOAD_UNSET)),
+            global_pending: None,
             bearer_token: spec.bearer_token,
         }
+    }
+
+    pub fn attach_router_state_overlay(&mut self, overlay: Arc<RouterStateLoadOverlay>) {
+        self.global_pending = Some(overlay);
     }
 
     /// Hostname carried on PD-disagg request bodies as `bootstrap_host`.
@@ -278,6 +287,20 @@ impl Worker {
         self.pending_tokens.load(Ordering::Relaxed)
     }
 
+    pub fn global_pending_load(&self) -> usize {
+        self.global_pending
+            .as_ref()
+            .map(|overlay| overlay.pending_requests(&self.url))
+            .unwrap_or(0)
+    }
+
+    pub fn global_pending_token_load(&self) -> usize {
+        self.global_pending
+            .as_ref()
+            .map(|overlay| overlay.pending_tokens(&self.url))
+            .unwrap_or(0)
+    }
+
     /// Worker-reported real load, or a sentinel (`REPORTED_LOAD_UNSET` /
     /// `REPORTED_LOAD_FAILED`). Updated by the background load poller.
     pub fn reported_load(&self) -> i64 {
@@ -291,18 +314,20 @@ impl Worker {
     }
 
     /// Effective load for routing decisions, honoring the configured load
-    /// source. When `use_reported` is false (poller disabled), always the
-    /// router-side in-flight count. When true: the real reported load if
+    /// source. When `use_reported` is false (poller disabled), use router-side
+    /// in-flight plus pending reservations. When true: the real reported load if
     /// available (`>= 0`) plus router-local pending reservations; on poll
     /// failure (`REPORTED_LOAD_FAILED`) a very
     /// high value so spill-to-idle never targets a possibly-dead worker;
     /// before the first successful poll (`REPORTED_LOAD_UNSET`) fall back to
     /// in-flight plus pending so a just-started router still routes sanely.
     pub fn effective_load(&self, use_reported: bool) -> usize {
+        let pending = self
+            .pending_load()
+            .saturating_add(self.global_pending_load());
         if !use_reported {
-            return self.active_load();
+            return self.active_load().saturating_add(pending);
         }
-        let pending = self.pending_load();
         match self.reported_load() {
             REPORTED_LOAD_FAILED => usize::MAX / 2, // treat unreachable as very busy
             REPORTED_LOAD_UNSET => self.active_load().saturating_add(pending),
@@ -316,7 +341,10 @@ impl Worker {
     /// request-count local pending term with token-weighted pressure units.
     pub fn effective_ttft_load(&self, use_reported: bool, token_scale: usize) -> usize {
         let scale = token_scale.max(1);
-        let token_units = self.pending_token_load().saturating_add(scale - 1) / scale;
+        let pending_tokens = self
+            .pending_token_load()
+            .saturating_add(self.global_pending_token_load());
+        let token_units = pending_tokens.saturating_add(scale - 1) / scale;
         if !use_reported {
             return self.active_load().saturating_add(token_units);
         }
@@ -360,6 +388,11 @@ impl std::fmt::Debug for Worker {
             .field("active_load", &self.active_load())
             .field("pending_load", &self.pending_load())
             .field("pending_token_load", &self.pending_token_load())
+            .field("global_pending_load", &self.global_pending_load())
+            .field(
+                "global_pending_token_load",
+                &self.global_pending_token_load(),
+            )
             .finish()
     }
 }
@@ -368,6 +401,9 @@ impl std::fmt::Debug for Worker {
 mod tests {
     use super::*;
     use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
+    use crate::router_state::{
+        RouterStateLoadOverlay, RouterStateSnapshotResponse, RouterStateWorkerLoad,
+    };
 
     #[test]
     fn load_guard_increments_and_decrements() {
@@ -407,7 +443,7 @@ mod tests {
         let _g2 = w.load_guard();
         assert_eq!(w.active_load(), 2);
 
-        // Poller disabled: always the in-flight count, ignoring reported_load.
+        // Poller disabled: in-flight plus pending, ignoring reported_load.
         w.set_reported_load(99);
         assert_eq!(w.effective_load(false), 2);
 
@@ -419,9 +455,11 @@ mod tests {
         // real load is present.
         let pending = w.pending_guard();
         assert_eq!(w.pending_load(), 1);
+        assert_eq!(w.effective_load(false), 3);
         assert_eq!(w.effective_load(true), 8);
         drop(pending);
         assert_eq!(w.pending_load(), 0);
+        assert_eq!(w.effective_load(false), 2);
         assert_eq!(w.effective_load(true), 7);
 
         // Poller enabled, UNSET sentinel: fall back to in-flight plus pending.
@@ -467,6 +505,38 @@ mod tests {
         assert_eq!(w.pending_load(), 0);
         assert_eq!(w.pending_token_load(), 0);
         assert_eq!(w.effective_ttft_load(true, 64), 2);
+    }
+
+    #[test]
+    fn effective_load_includes_router_state_overlay_pending() {
+        let mut w = Worker::new(WorkerSpec {
+            id: WorkerId("w".into()),
+            url: "http://x".into(),
+            mode: WorkerMode::Plain,
+            model_ids: vec![],
+            bootstrap_port: None,
+            min_priority: None,
+            bearer_token: None,
+        });
+        let overlay = RouterStateLoadOverlay::new();
+        overlay.update(RouterStateSnapshotResponse {
+            workers: [(
+                "http://x".to_string(),
+                RouterStateWorkerLoad {
+                    pending_requests: 3,
+                    pending_tokens: 130,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        });
+        w.attach_router_state_overlay(overlay);
+        w.set_reported_load(2);
+
+        assert_eq!(w.global_pending_load(), 3);
+        assert_eq!(w.effective_load(false), 3);
+        assert_eq!(w.effective_load(true), 5);
+        assert_eq!(w.effective_ttft_load(true, 64), 5);
     }
 
     #[test]

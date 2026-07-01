@@ -7,6 +7,7 @@ use crate::health::circuit_breaker::CircuitBreaker;
 use crate::policies::active_load::ActiveLoadRegistry;
 use crate::policies::PolicyRegistry;
 use crate::proxy::Proxy;
+use crate::router_state::{RouterStateClient, RouterStateLoadOverlay};
 use crate::server::metrics::MetricsRegistry;
 use crate::tokenizer::TokenizerRegistry;
 use crate::workers::WorkerRegistry;
@@ -37,6 +38,13 @@ pub struct AppContext {
     /// the same stale `/get_load` snapshot before any of them increments the
     /// local pending counter.
     pub selection_lock: Mutex<()>,
+    /// Optional single-writer cross-router reservation client. When set,
+    /// request handlers reserve pending work in router-state before proxying,
+    /// and release it when the local pending guard is dropped.
+    pub router_state_client: Option<Arc<dyn RouterStateClient>>,
+    /// Snapshot overlay populated from router-state and attached to workers
+    /// so TTFT-first scoring sees pending work from sibling gateway replicas.
+    pub router_state_overlay: Option<Arc<RouterStateLoadOverlay>>,
     pub alias_fallback_breaker: Option<Arc<CircuitBreaker>>,
     ready: AtomicBool,
 }
@@ -71,6 +79,28 @@ impl AppContext {
         policies: Arc<PolicyRegistry>,
         active_load: Arc<ActiveLoadRegistry>,
     ) -> Self {
+        Self::with_active_load_and_router_state(
+            config,
+            tokenizers,
+            proxy,
+            registry,
+            policies,
+            active_load,
+            None,
+            None,
+        )
+    }
+
+    pub fn with_active_load_and_router_state(
+        config: Config,
+        tokenizers: Arc<TokenizerRegistry>,
+        proxy: Arc<Proxy>,
+        registry: Arc<WorkerRegistry>,
+        policies: Arc<PolicyRegistry>,
+        active_load: Arc<ActiveLoadRegistry>,
+        router_state_client: Option<Arc<dyn RouterStateClient>>,
+        router_state_overlay: Option<Arc<RouterStateLoadOverlay>>,
+    ) -> Self {
         let metrics = MetricsRegistry::new();
         // Wire the per-worker active-load gauge so `sgl_router_active_load`
         // mirrors the live counter on every register / drop / sweep.
@@ -95,6 +125,8 @@ impl AppContext {
             active_load,
             metrics,
             selection_lock: Mutex::new(()),
+            router_state_client,
+            router_state_overlay,
             alias_fallback_breaker,
             ready: AtomicBool::new(false),
         }
@@ -152,6 +184,8 @@ impl AppContext {
             active_load: ActiveLoadRegistry::with_defaults(),
             metrics: MetricsRegistry::new(),
             selection_lock: Mutex::new(()),
+            router_state_client: None,
+            router_state_overlay: None,
             alias_fallback_breaker: None,
             ready: AtomicBool::new(false),
         }

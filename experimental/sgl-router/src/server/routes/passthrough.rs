@@ -17,6 +17,7 @@ use crate::server::metrics::{PriorityFilterOutcome, RequestOutcome, WorkerModeLa
 use crate::server::routes::alias_fallback::{
     fallback_reason_for_error, fallback_reason_for_response, forward_to_fallback, rewrite_model,
 };
+use crate::server::routes::chat::reserve_pending_load;
 use crate::workers::LoadGuard;
 use axum::body::Body;
 use axum::extract::State;
@@ -224,7 +225,7 @@ async fn passthrough_primary(
             .as_ref()
             .map(|t| t.ids.len().max(1))
             .unwrap_or(1);
-        let pending_guard = worker.pending_guard_with_tokens(pending_tokens);
+        let pending_guard = reserve_pending_load(&ctx, &worker, pending_tokens);
         (worker, pending_guard)
     };
     let worker_headers = worker

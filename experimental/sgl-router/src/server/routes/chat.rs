@@ -4,6 +4,7 @@
 use crate::discovery::{ModelId, WorkerMode};
 use crate::policies::registry::{filter_eligible, PdPoolResolver, PdResolveError};
 use crate::policies::{request_tokens_for, RequestTokens, SelectionContext};
+use crate::router_state::RouterStateReservationGuard;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{
@@ -50,6 +51,32 @@ const CHARS_PER_TOKEN_ESTIMATE: usize = 4;
 /// layer; axum's `Bytes` extractor enforces it and returns 413
 /// PAYLOAD_TOO_LARGE before this handler runs.
 pub const MAX_CHAT_BODY_BYTES: usize = 5 << 20;
+
+pub(crate) fn reserve_pending_load(
+    ctx: &AppContext,
+    worker: &Worker,
+    pending_tokens: usize,
+) -> (
+    crate::workers::worker::PendingLoadGuard,
+    Option<RouterStateReservationGuard>,
+) {
+    let pending_tokens = pending_tokens.max(1);
+    let remote_guard = ctx.router_state_client.as_ref().and_then(|client| {
+        RouterStateReservationGuard::reserve(
+            Arc::clone(client),
+            worker.url.clone(),
+            pending_tokens,
+            ctx.config
+                .active_load
+                .stale_request_timeout_secs
+                .saturating_mul(1000),
+        )
+    });
+    (
+        worker.pending_guard_with_tokens(pending_tokens),
+        remote_guard,
+    )
+}
 
 /// Minimal probe over the request body — we only need the `stream` field
 /// and the `model` field to decide between buffered vs SSE forwarding and
@@ -313,7 +340,7 @@ async fn chat_completions_inner(
             .as_ref()
             .map(|t| t.ids.len().max(1))
             .unwrap_or(1);
-        let pending_guard = worker.pending_guard_with_tokens(pending_tokens);
+        let pending_guard = reserve_pending_load(&ctx, &worker, pending_tokens);
         (worker, pending_guard)
     };
 

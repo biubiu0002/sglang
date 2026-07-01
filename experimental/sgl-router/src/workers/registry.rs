@@ -3,6 +3,7 @@
 
 use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use crate::health::circuit_breaker::CircuitBreakerConfig;
+use crate::router_state::RouterStateLoadOverlay;
 use crate::workers::worker::Worker;
 use dashmap::DashMap;
 use std::collections::HashSet;
@@ -47,6 +48,7 @@ pub struct WorkerRegistry {
     /// `remove` take this lock so contention is bounded by registry
     /// mutation rate (worker-discovery events), not request rate.
     write: Mutex<()>,
+    router_state_overlay: Mutex<Option<Arc<RouterStateLoadOverlay>>>,
 }
 
 impl WorkerRegistry {
@@ -121,7 +123,11 @@ impl WorkerRegistry {
                 }
             }
         }
-        let w = Arc::new(Worker::with_cb_config(spec, cb));
+        let mut worker = Worker::with_cb_config(spec, cb);
+        if let Some(overlay) = self.router_state_overlay.lock().unwrap().clone() {
+            worker.attach_router_state_overlay(overlay);
+        }
+        let w = Arc::new(worker);
         let id = w.id.clone();
         self.remove_locked(&id);
         for m in &w.model_ids {
@@ -210,6 +216,10 @@ impl WorkerRegistry {
     /// immediately.
     pub fn all(&self) -> Vec<Arc<Worker>> {
         self.by_id.iter().map(|e| Arc::clone(e.value())).collect()
+    }
+
+    pub fn attach_router_state_overlay(&self, overlay: Arc<RouterStateLoadOverlay>) {
+        *self.router_state_overlay.lock().unwrap() = Some(overlay);
     }
 }
 

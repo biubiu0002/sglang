@@ -18,7 +18,10 @@ impl Config {
         match &self.discovery {
             DiscoveryBackend::StaticUrls(s) => {
                 if s.urls.is_empty() {
-                    if self.runtime_mode == RuntimeMode::CacheState {
+                    if matches!(
+                        self.runtime_mode,
+                        RuntimeMode::CacheState | RuntimeMode::RouterState
+                    ) {
                         return Ok(());
                     }
                     return Err(anyhow!(
@@ -176,6 +179,13 @@ mod tests {
     fn accepts_empty_static_urls_for_cache_state_mode() {
         let mut cfg = cfg("qwen3", &[]);
         cfg.runtime_mode = RuntimeMode::CacheState;
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn accepts_empty_static_urls_for_router_state_mode() {
+        let mut cfg = cfg("qwen3", &[]);
+        cfg.runtime_mode = RuntimeMode::RouterState;
         cfg.validate().unwrap();
     }
 

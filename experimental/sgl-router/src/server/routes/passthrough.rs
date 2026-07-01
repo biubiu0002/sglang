@@ -17,7 +17,7 @@ use crate::server::metrics::{PriorityFilterOutcome, RequestOutcome, WorkerModeLa
 use crate::server::routes::alias_fallback::{
     fallback_reason_for_error, fallback_reason_for_response, forward_to_fallback, rewrite_model,
 };
-use crate::server::routes::chat::reserve_pending_load;
+use crate::server::routes::chat::{make_client_disconnect_hook, reserve_pending_load};
 use crate::workers::LoadGuard;
 use axum::body::Body;
 use axum::extract::State;
@@ -259,6 +259,7 @@ async fn passthrough_primary(
             body,
             Some(stream_guards),
             None,
+            Some(make_client_disconnect_hook(Arc::clone(&ctx.metrics))),
         );
         tokio::select! {
             biased;

@@ -8,7 +8,8 @@ use crate::router_state::RouterStateReservationGuard;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{
-    MetricsRegistry, PriorityFilterOutcome, RequestOutcome, StaleRequestOutcome, WorkerModeLabel,
+    MetricsRegistry, PriorityFilterOutcome, RequestOutcome, SseClientDisconnectPhase,
+    StaleRequestOutcome, WorkerModeLabel,
 };
 use crate::server::routes::alias_fallback::{
     fallback_reason_for_error, fallback_reason_for_response, forward_to_fallback, rewrite_model,
@@ -76,6 +77,22 @@ pub(crate) fn reserve_pending_load(
         worker.pending_guard_with_tokens(pending_tokens),
         remote_guard,
     )
+}
+
+pub(crate) fn make_client_disconnect_hook(
+    metrics: Arc<MetricsRegistry>,
+) -> Box<dyn FnOnce(crate::proxy::sse::ClientDisconnectPhase) + Send + 'static> {
+    Box::new(move |phase| {
+        let phase = match phase {
+            crate::proxy::sse::ClientDisconnectPhase::BeforeFirstUpstreamByte => {
+                SseClientDisconnectPhase::BeforeFirstUpstreamByte
+            }
+            crate::proxy::sse::ClientDisconnectPhase::AfterFirstUpstreamByte => {
+                SseClientDisconnectPhase::AfterFirstUpstreamByte
+            }
+        };
+        metrics.record_sse_client_disconnect(phase);
+    })
 }
 
 /// Minimal probe over the request body — we only need the `stream` field
@@ -607,6 +624,7 @@ async fn chat_completions_inner(
                 outgoing_body,
                 Some(stream_guards),
                 Some(make_ttft_hook()),
+                Some(make_client_disconnect_hook(Arc::clone(&ctx.metrics))),
             );
             tokio::select! {
                 biased;
@@ -642,6 +660,7 @@ async fn chat_completions_inner(
             outgoing_body,
             Some(stream_guards),
             Some(make_ttft_hook()),
+            Some(make_client_disconnect_hook(Arc::clone(&ctx.metrics))),
         );
         // Bias `fetch` over the cancellation branch: a successful
         // response that completes in the same poll as the token firing

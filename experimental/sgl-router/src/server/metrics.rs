@@ -37,6 +37,7 @@
 //! | `sgl_router_alias_route_total` | Counter | `alias_model_id`, `route`, `reason` |
 //! | `sgl_router_remote_cache_state_query_total` | Counter | `outcome` |
 //! | `sgl_router_remote_cache_state_feed_total` | Counter | `outcome` |
+//! | `sgl_router_sse_client_disconnects_total` | Counter | `phase` |
 //!
 //! The four `sgl_router_worker*` gauges and `sgl_router_workers` are sampled
 //! at scrape time from the live [`crate::workers::WorkerRegistry`] (passed to
@@ -215,6 +216,22 @@ impl StaleRequestOutcome {
     }
 }
 
+/// Downstream SSE client-disconnect phase label.
+#[derive(Debug, Clone, Copy)]
+pub enum SseClientDisconnectPhase {
+    BeforeFirstUpstreamByte,
+    AfterFirstUpstreamByte,
+}
+
+impl SseClientDisconnectPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::BeforeFirstUpstreamByte => "before_first_upstream_byte",
+            Self::AfterFirstUpstreamByte => "after_first_upstream_byte",
+        }
+    }
+}
+
 /// Remote cache-state query outcome. Kept intentionally small so enabling the
 /// optional distributed service cannot introduce unbounded metric labels.
 #[derive(Debug, Clone, Copy)]
@@ -297,6 +314,7 @@ pub struct MetricsRegistry {
     alias_route_total: Mutex<HashMap<AliasRouteKey, Arc<AtomicU64>>>,
     remote_cache_state_query_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     remote_cache_state_feed_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
+    sse_client_disconnects_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
 }
 
 #[derive(Debug, Hash, Eq, PartialEq, Clone)]
@@ -644,6 +662,17 @@ impl MetricsRegistry {
         let mut guard = self.remote_cache_state_feed_total.lock();
         let counter = guard
             .entry(outcome.as_str())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump `sgl_router_sse_client_disconnects_total{phase}`.
+    pub fn record_sse_client_disconnect(&self, phase: SseClientDisconnectPhase) {
+        let mut guard = self.sse_client_disconnects_total.lock();
+        let counter = guard
+            .entry(phase.as_str())
             .or_insert_with(|| Arc::new(AtomicU64::new(0)))
             .clone();
         drop(guard);
@@ -1050,6 +1079,25 @@ impl MetricsRegistry {
         }
         drop(guard);
 
+        // sse_client_disconnects_total
+        out.push_str(
+            "# HELP sgl_router_sse_client_disconnects_total Downstream SSE client disconnects observed by the proxy pump, labelled by whether the upstream had produced a response chunk.\n",
+        );
+        out.push_str("# TYPE sgl_router_sse_client_disconnects_total counter\n");
+        let guard = self.sse_client_disconnects_total.lock();
+        let mut entries: Vec<(&&str, u64)> = guard
+            .iter()
+            .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by_key(|e| *e.0);
+        for (phase, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_sse_client_disconnects_total{{phase=\"{}\"}} {}\n",
+                phase, value,
+            ));
+        }
+        drop(guard);
+
         out
     }
 }
@@ -1119,6 +1167,7 @@ mod tests {
         assert!(out.contains("# TYPE sgl_router_priority_filtered_total counter"));
         assert!(out.contains("# TYPE sgl_router_remote_cache_state_query_total counter"));
         assert!(out.contains("# TYPE sgl_router_remote_cache_state_feed_total counter"));
+        assert!(out.contains("# TYPE sgl_router_sse_client_disconnects_total counter"));
         // Pool-size series exist (at 0) for all three modes even with no
         // workers, so dashboards have a stable series to graph.
         assert!(out.contains(r#"sgl_router_workers{mode="plain"} 0"#));
@@ -1408,6 +1457,21 @@ mod tests {
         reg.record_stale_request(StaleRequestOutcome::Expired);
         let out = reg.render();
         assert!(out.contains(r#"sgl_router_stale_requests_total{outcome="expired"} 3"#));
+    }
+
+    #[test]
+    fn sse_client_disconnect_counter_increments_by_phase() {
+        let reg = MetricsRegistry::new();
+        reg.record_sse_client_disconnect(SseClientDisconnectPhase::BeforeFirstUpstreamByte);
+        reg.record_sse_client_disconnect(SseClientDisconnectPhase::BeforeFirstUpstreamByte);
+        reg.record_sse_client_disconnect(SseClientDisconnectPhase::AfterFirstUpstreamByte);
+        let out = reg.render();
+        assert!(out.contains(
+            r#"sgl_router_sse_client_disconnects_total{phase="before_first_upstream_byte"} 2"#
+        ));
+        assert!(out.contains(
+            r#"sgl_router_sse_client_disconnects_total{phase="after_first_upstream_byte"} 1"#
+        ));
     }
 
     #[test]

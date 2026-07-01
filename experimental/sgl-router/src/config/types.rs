@@ -55,6 +55,8 @@ pub enum RuntimeMode {
     Gateway,
     #[value(name = "cache_state")]
     CacheState,
+    #[value(name = "router_state")]
+    RouterState,
 }
 
 #[derive(Debug, Clone)]

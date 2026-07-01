@@ -11,6 +11,7 @@
 use crate::config::AliasFallbackConfig;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
+use crate::server::routes::chat::make_client_disconnect_hook;
 use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderValue, Response, StatusCode};
 use bytes::Bytes;
@@ -193,6 +194,7 @@ pub async fn forward_to_fallback(
                 body,
                 None,
                 None,
+                Some(make_client_disconnect_hook(Arc::clone(&ctx.metrics))),
             )
             .await
     } else {

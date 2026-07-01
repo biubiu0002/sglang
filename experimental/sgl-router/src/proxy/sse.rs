@@ -11,6 +11,28 @@ use bytes::Bytes;
 use futures::{FutureExt, StreamExt};
 use tokio_stream::wrappers::ReceiverStream;
 
+/// Phase at which the downstream client disconnected from an SSE response.
+/// Kept low-cardinality so callers can expose it directly as a metric label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientDisconnectPhase {
+    /// The client disconnected before the upstream produced any successful
+    /// response chunk. This is the phase that used to retain stream guards
+    /// until stale-request cleanup when the upstream was in a long prefill.
+    BeforeFirstUpstreamByte,
+    /// The client disconnected after at least one upstream response chunk was
+    /// observed by the pump.
+    AfterFirstUpstreamByte,
+}
+
+impl ClientDisconnectPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BeforeFirstUpstreamByte => "before_first_upstream_byte",
+            Self::AfterFirstUpstreamByte => "after_first_upstream_byte",
+        }
+    }
+}
+
 /// Bridge a byte stream into an axum Body that streams chunks unchanged.
 ///
 /// Spawns one tokio task per stream so the handler can return immediately.
@@ -24,9 +46,11 @@ use tokio_stream::wrappers::ReceiverStream;
 /// worst-case outstanding bytes to 64 × chunk_size (typically a few MB).
 ///
 /// # Client disconnect
-/// When the axum Body is dropped the receiver is closed; `tx.send()` then
-/// returns `Err`, which breaks the loop — no upstream bytes are read after the
-/// client disconnects.
+/// When the axum Body is dropped the receiver is closed. The pump watches that
+/// close signal while it is waiting for upstream bytes, so client disconnects
+/// release stream guards even if the upstream is still in a long prefill and
+/// has not produced a chunk yet. A concurrent `tx.send()` error is kept as the
+/// second line of defense.
 ///
 /// # Panic safety
 /// The pump future is wrapped in `AssertUnwindSafe(..).catch_unwind()`. If the
@@ -62,11 +86,18 @@ use tokio_stream::wrappers::ReceiverStream;
 /// token. It does NOT fire if the stream ends or errors before any `Ok` chunk
 /// arrives. `forward_streaming_to` passes a closure that records
 /// `sgl_router_ttft_seconds` for successful streaming responses.
+///
+/// # Client-disconnect hook
+/// When `on_client_disconnect` is `Some`, the closure runs exactly once when
+/// the downstream body receiver is closed before the upstream stream finishes.
+/// The phase label distinguishes disconnects before and after the first
+/// upstream response chunk.
 pub fn bytes_stream_to_body<S, E>(
     stream: S,
     stream_guards: Option<Box<dyn Send + 'static>>,
     on_complete: Option<Box<dyn FnOnce(bool) + Send + 'static>>,
     on_first_byte: Option<Box<dyn FnOnce() + Send + 'static>>,
+    on_client_disconnect: Option<Box<dyn FnOnce(ClientDisconnectPhase) + Send + 'static>>,
 ) -> Body
 where
     S: futures::Stream<Item = Result<Bytes, E>> + Send + Unpin + 'static,
@@ -87,39 +118,71 @@ where
             // keeping intent explicit.
             let _hold = stream_guards;
             let mut on_first_byte = on_first_byte;
+            let mut on_client_disconnect = on_client_disconnect;
+            let mut saw_upstream_byte = false;
             let mut s = stream;
-            while let Some(chunk) = s.next().await {
-                let item: Result<Bytes, std::io::Error> = chunk.map_err(|e| {
-                    let msg = e.to_string();
-                    tracing::warn!(error = %msg, "upstream SSE stream errored mid-flight");
-                    std::io::Error::other(msg)
-                });
-                let is_err_chunk = item.is_err();
-                // Fire the time-to-first-token hook on the first successful
-                // chunk from upstream. `take()` makes it fire at most once;
-                // an error-first stream never produced a token, so it's left
-                // unfired (and dropped on task end).
-                if !is_err_chunk {
-                    if let Some(hook) = on_first_byte.take() {
-                        hook();
+            loop {
+                let tx_closed = tx.clone();
+                tokio::select! {
+                    biased;
+                    _ = tx_closed.closed() => {
+                        if let Some(hook) = on_client_disconnect.take() {
+                            let phase = if saw_upstream_byte {
+                                ClientDisconnectPhase::AfterFirstUpstreamByte
+                            } else {
+                                ClientDisconnectPhase::BeforeFirstUpstreamByte
+                            };
+                            hook(phase);
+                        }
+                        tracing::debug!("SSE client disconnected while waiting for upstream bytes");
+                        break;
                     }
-                }
-                if is_err_chunk {
-                    *outcome_setter.lock() = false;
-                }
-                if tx.send(item).await.is_err() {
-                    // Receiver dropped. If we were about to ship an upstream
-                    // error there's nothing left to report; otherwise this is
-                    // a clean client-side disconnect — log at debug since it's
-                    // not a router-side fault.
-                    if !is_err_chunk {
-                        tracing::debug!("SSE client disconnected mid-stream");
+                    maybe_chunk = s.next() => {
+                        let Some(chunk) = maybe_chunk else {
+                            break;
+                        };
+                        let item: Result<Bytes, std::io::Error> = chunk.map_err(|e| {
+                            let msg = e.to_string();
+                            tracing::warn!(error = %msg, "upstream SSE stream errored mid-flight");
+                            std::io::Error::other(msg)
+                        });
+                        let is_err_chunk = item.is_err();
+                        // Fire the time-to-first-token hook on the first successful
+                        // chunk from upstream. `take()` makes it fire at most once;
+                        // an error-first stream never produced a token, so it's left
+                        // unfired (and dropped on task end).
+                        if !is_err_chunk {
+                            saw_upstream_byte = true;
+                            if let Some(hook) = on_first_byte.take() {
+                                hook();
+                            }
+                        }
+                        if is_err_chunk {
+                            *outcome_setter.lock() = false;
+                        }
+                        if tx.send(item).await.is_err() {
+                            if let Some(hook) = on_client_disconnect.take() {
+                                let phase = if saw_upstream_byte {
+                                    ClientDisconnectPhase::AfterFirstUpstreamByte
+                                } else {
+                                    ClientDisconnectPhase::BeforeFirstUpstreamByte
+                                };
+                                hook(phase);
+                            }
+                            // Receiver dropped. If we were about to ship an upstream
+                            // error there's nothing left to report; otherwise this is
+                            // a clean client-side disconnect — log at debug since it's
+                            // not a router-side fault.
+                            if !is_err_chunk {
+                                tracing::debug!("SSE client disconnected mid-stream");
+                            }
+                            break;
+                        }
+                        if is_err_chunk {
+                            // Surfaced upstream error to client; stop reading.
+                            break;
+                        }
                     }
-                    break;
-                }
-                if is_err_chunk {
-                    // Surfaced upstream error to client; stop reading.
-                    break;
                 }
             }
         });
@@ -160,7 +223,7 @@ mod tests {
             Ok(Bytes::from_static(b"world")),
         ];
         let s = stream::iter(chunks);
-        let body = bytes_stream_to_body(s, None, None, None);
+        let body = bytes_stream_to_body(s, None, None, None, None);
         let bytes = body.collect().await.unwrap().to_bytes();
         assert_eq!(&bytes[..], b"hello world");
     }
@@ -184,6 +247,7 @@ mod tests {
             Some(Box::new(move || {
                 fired_c.fetch_add(1, Ordering::SeqCst);
             })),
+            None,
         );
         let _ = body.collect().await.unwrap();
         assert_eq!(
@@ -211,6 +275,7 @@ mod tests {
             Some(Box::new(move || {
                 fired_c.fetch_add(1, Ordering::SeqCst);
             })),
+            None,
         );
         let _ = body.collect().await;
         assert_eq!(
@@ -227,7 +292,7 @@ mod tests {
             Err(std::io::Error::other("upstream blew up mid-stream")),
         ];
         let s = stream::iter(chunks);
-        let body = bytes_stream_to_body(s, None, None, None);
+        let body = bytes_stream_to_body(s, None, None, None, None);
         // Collecting a body that terminates with an error must return Err.
         let result = body.collect().await;
         assert!(
@@ -289,7 +354,7 @@ mod tests {
         // that arm, the closure unwrap-or-elses would panic itself or
         // produce an empty message, which this test catches.
         let s = PanicAnyOnSecondPoll { polls: 0 };
-        let body = bytes_stream_to_body(s, None, None, None);
+        let body = bytes_stream_to_body(s, None, None, None, None);
         let result = body.collect().await;
         assert!(
             result.is_err(),
@@ -312,7 +377,7 @@ mod tests {
         // The pump task panics mid-stream. The client must see a loud Err,
         // NOT a silently-truncated success.
         let s = PanicOnSecondPoll { polls: 0 };
-        let body = bytes_stream_to_body(s, None, None, None);
+        let body = bytes_stream_to_body(s, None, None, None, None);
         let result = body.collect().await;
         assert!(
             result.is_err(),
@@ -371,7 +436,17 @@ mod tests {
             yielded: 0,
             max: 1000, // way more than we'll let it consume
         };
-        let body = bytes_stream_to_body(stream, None, None, None);
+        let phase = Arc::new(parking_lot::Mutex::new(None));
+        let phase_c = Arc::clone(&phase);
+        let body = bytes_stream_to_body(
+            stream,
+            None,
+            None,
+            None,
+            Some(Box::new(move |p| {
+                *phase_c.lock() = Some(p);
+            })),
+        );
 
         // Read exactly one frame, then drop the body to simulate client disconnect.
         let mut data_stream = body.into_data_stream();
@@ -392,6 +467,66 @@ mod tests {
         assert!(
             final_polls < 1000,
             "pump drained the entire upstream after client disconnect ({final_polls} polls); the break-on-tx.send-err path is dead"
+        );
+        assert_eq!(
+            *phase.lock(),
+            Some(ClientDisconnectPhase::AfterFirstUpstreamByte)
+        );
+    }
+
+    #[tokio::test]
+    async fn bytes_stream_to_body_drops_guards_when_client_disconnects_before_first_chunk() {
+        use std::pin::Pin;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::task::{Context, Poll};
+
+        struct PendingStream;
+
+        impl futures::Stream for PendingStream {
+            type Item = Result<Bytes, std::io::Error>;
+
+            fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+                Poll::Pending
+            }
+        }
+
+        struct DropFlag(Arc<AtomicBool>);
+
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let phase = Arc::new(parking_lot::Mutex::new(None));
+        let phase_c = Arc::clone(&phase);
+        let body = bytes_stream_to_body(
+            PendingStream,
+            Some(Box::new(DropFlag(Arc::clone(&dropped)))),
+            None,
+            None,
+            Some(Box::new(move |p| {
+                *phase_c.lock() = Some(p);
+            })),
+        );
+
+        drop(body);
+
+        for _ in 0..20 {
+            if dropped.load(Ordering::SeqCst) {
+                assert_eq!(
+                    *phase.lock(),
+                    Some(ClientDisconnectPhase::BeforeFirstUpstreamByte)
+                );
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        panic!(
+            "stream guard was not dropped after client disconnect while upstream stream was pending"
         );
     }
 }

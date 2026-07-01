@@ -31,7 +31,8 @@ use crate::config::{
 pub struct Cli {
     /// Runtime mode. `gateway` is the normal OpenAI-compatible router.
     /// `cache_state` runs only the distributed cache-state HTTP API for
-    /// internal gateway queries and does not require worker discovery.
+    /// internal gateway queries. `router_state` runs only the distributed
+    /// active-load API. Non-gateway modes do not require worker discovery.
     #[arg(long, value_enum, default_value = "gateway")]
     pub mode: RuntimeMode,
 
@@ -278,7 +279,10 @@ impl Cli {
     /// [`Config::validate`] for the remaining value-level invariants
     /// (model id, static worker URLs).
     pub fn into_config(self) -> Result<Config> {
-        let discovery = if self.mode == RuntimeMode::CacheState {
+        let discovery = if matches!(
+            self.mode,
+            RuntimeMode::CacheState | RuntimeMode::RouterState
+        ) {
             if !self.worker_urls.is_empty() || self.service_discovery {
                 self.build_discovery()?
             } else {

@@ -256,6 +256,7 @@ impl Proxy {
         body: Bytes,
         stream_guards: Option<Box<dyn Send + 'static>>,
         on_first_byte: Option<Box<dyn FnOnce() + Send + 'static>>,
+        on_client_disconnect: Option<Box<dyn FnOnce(sse::ClientDisconnectPhase) + Send + 'static>>,
     ) -> Result<Response<Body>, ApiError> {
         if !breaker.allow() {
             return Err(ApiError::BreakerOpen {
@@ -270,6 +271,7 @@ impl Proxy {
             body,
             stream_guards,
             on_first_byte,
+            on_client_disconnect,
         )
         .await
     }
@@ -284,6 +286,7 @@ impl Proxy {
         body: Bytes,
         stream_guards: Option<Box<dyn Send + 'static>>,
         on_first_byte: Option<Box<dyn FnOnce() + Send + 'static>>,
+        on_client_disconnect: Option<Box<dyn FnOnce(sse::ClientDisconnectPhase) + Send + 'static>>,
     ) -> Result<Response<Body>, ApiError> {
         let worker_url = parse_worker_url(worker_url, breaker)?;
         let url = worker_url.join(path).map_err(|e| {
@@ -346,6 +349,7 @@ impl Proxy {
             stream_guards,
             on_complete,
             first_byte_hook,
+            on_client_disconnect,
         );
         let mut out = Response::new(body);
         *out.status_mut() = status;

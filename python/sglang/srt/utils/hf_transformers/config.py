@@ -142,6 +142,18 @@ class HfModelConfigParser(ModelConfigParserBase):
             if config is None:
                 raise
 
+        raw_glm_moe_dsa_config = None
+        if (
+            config.architectures is not None
+            and config.architectures[0] == "GlmMoeDsaForCausalLM"
+        ):
+            from transformers import PretrainedConfig
+
+            raw_glm_moe_dsa_config, _ = PretrainedConfig.get_config_dict(
+                model, revision=revision, **kwargs
+            )
+            _restore_glm_moe_dsa_raw_config_fields(config, raw_glm_moe_dsa_config)
+
         if (
             config.architectures is not None
             and config.architectures[0] == "Phi4MMForCausalLM"
@@ -199,6 +211,9 @@ class HfModelConfigParser(ModelConfigParserBase):
                 _apply_deepseek_ocr_overrides(config, model)
             else:
                 config._name_or_path = model
+
+        if raw_glm_moe_dsa_config is not None:
+            _restore_glm_moe_dsa_raw_config_fields(config, raw_glm_moe_dsa_config)
 
         if isinstance(model, str) and config.model_type == "internvl_chat":
             for key, val in config.llm_config.__dict__.items():

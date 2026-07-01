@@ -85,8 +85,34 @@ def _load_glm_moe_dsa_config_without_legacy_layer_types(
     config = CONFIG_MAPPING[raw_config["model_type"]].from_dict(
         raw_config, **unused_kwargs
     )
+    _restore_glm_moe_dsa_raw_config_fields(config, raw_config)
     config._name_or_path = model
     return config
+
+
+def _restore_glm_moe_dsa_raw_config_fields(config, raw_config):
+    for key in (
+        "head_dim",
+        "index_head_dim",
+        "index_n_heads",
+        "index_share_for_mtp_iteration",
+        "index_skip_topk_offset",
+        "index_topk",
+        "index_topk_freq",
+        "index_topk_pattern",
+        "indexer_rope_interleave",
+        "indexer_types",
+        "kv_lora_rank",
+        "q_lora_rank",
+        "qk_head_dim",
+        "qk_nope_head_dim",
+        "qk_rope_head_dim",
+        "rope_interleave",
+        "rope_parameters",
+        "v_head_dim",
+    ):
+        if key in raw_config:
+            setattr(config, key, raw_config[key])
 
 
 @register_model_config_parser("hf")

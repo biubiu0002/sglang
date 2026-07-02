@@ -281,6 +281,52 @@ class TestChatCompletionRequest(unittest.TestCase):
         )
         self.assertFalse(request.chat_template_kwargs.get("enable_thinking"))
 
+    def test_chat_completion_accepts_responses_style_text_parts(self):
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Hello"}],
+                },
+                {
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Hi"}],
+                },
+            ],
+        )
+
+        user_part = request.messages[0].content[0]
+        assistant_part = request.messages[1].content[0]
+        self.assertEqual(user_part.type, "text")
+        self.assertEqual(user_part.text, "Hello")
+        self.assertEqual(assistant_part.type, "text")
+        self.assertEqual(assistant_part.text, "Hi")
+
+    def test_chat_completion_accepts_responses_style_image_parts(self):
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_image",
+                            "image_url": "data:image/png;base64,AAAA",
+                            "detail": "low",
+                            "max_dynamic_patch": 4,
+                        }
+                    ],
+                }
+            ],
+        )
+
+        image_part = request.messages[0].content[0]
+        self.assertEqual(image_part.type, "image_url")
+        self.assertEqual(image_part.image_url.url, "data:image/png;base64,AAAA")
+        self.assertEqual(image_part.image_url.detail, "low")
+        self.assertEqual(image_part.image_url.max_dynamic_patch, 4)
+
     def test_chat_completion_return_reasoning_false_does_not_disable_thinking(self):
         messages = [{"role": "user", "content": "Hello"}]
         request = ChatCompletionRequest(

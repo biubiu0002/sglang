@@ -542,6 +542,51 @@ ChatCompletionMessageContentPart = Union[
     ChatCompletionMessageContentToolReferenceBlock,
 ]
 
+
+def _normalize_chat_completion_content_part(part: Any) -> Any:
+    if hasattr(part, "model_dump"):
+        part = part.model_dump(exclude_none=True)
+    if not isinstance(part, dict):
+        return part
+
+    part_type = part.get("type")
+    if part_type in ("input_text", "output_text"):
+        normalized = part.copy()
+        normalized["type"] = "text"
+        return normalized
+
+    if part_type == "input_image":
+        image_url = part.get("image_url")
+        if isinstance(image_url, dict):
+            image_url_obj = image_url.copy()
+        else:
+            image_url_obj = {"url": image_url}
+        if not image_url_obj.get("detail"):
+            image_url_obj["detail"] = part.get("detail") or "auto"
+        for key in ("min_dynamic_patch", "max_dynamic_patch"):
+            if key in part and key not in image_url_obj:
+                image_url_obj[key] = part[key]
+        return {"type": "image_url", "image_url": image_url_obj}
+
+    return part
+
+
+def _normalize_chat_completion_message_content(message: Any) -> Any:
+    if hasattr(message, "model_dump"):
+        message = message.model_dump(exclude_none=True)
+    if not isinstance(message, dict):
+        return message
+
+    content = message.get("content")
+    if not isinstance(content, list):
+        return message
+
+    message = message.copy()
+    message["content"] = [
+        _normalize_chat_completion_content_part(part) for part in content
+    ]
+    return message
+
 # Rerank content types for multimodal reranking (e.g., Qwen3-VL-Reranker)
 # Can be a simple string (text-only) or a list of multimodal content parts
 RerankContentPart = Union[
@@ -786,6 +831,23 @@ class ChatCompletionRequest(BaseModel):
     @classmethod
     def _handle_deprecated_dp_rank(cls, values):
         return _migrate_deprecated_dp_rank(values)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_response_style_message_content(cls, values):
+        if not isinstance(values, dict):
+            return values
+
+        messages = values.get("messages")
+        if not isinstance(messages, list):
+            return values
+
+        values = values.copy()
+        values["messages"] = [
+            _normalize_chat_completion_message_content(message)
+            for message in messages
+        ]
+        return values
 
     @model_validator(mode="before")
     @classmethod

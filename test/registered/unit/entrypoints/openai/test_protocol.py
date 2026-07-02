@@ -235,9 +235,7 @@ class TestChatCompletionRequest(unittest.TestCase):
         self.assertFalse(request.chat_template_kwargs.get("enable_thinking"))
 
     def test_chat_completion_reasoning_effort_max(self):
-        """`max` is an sglang extension on chat completion's top-level
-        `reasoning_effort` only; the Responses-API-style nested
-        `reasoning.effort` path stays aligned with OpenAI's three levels."""
+        """`max` is an sglang extension accepted on both chat effort shapes."""
         from pydantic import ValidationError
 
         messages = [{"role": "user", "content": "Hello"}]
@@ -256,14 +254,41 @@ class TestChatCompletionRequest(unittest.TestCase):
                 reasoning_effort="ultra",
             )
 
-        # Nested reasoning.effort=max is NOT promoted by normalize_reasoning_inputs:
-        # the Responses API path keeps the OpenAI low/medium/high contract.
         request = ChatCompletionRequest(
             model="test-model",
             messages=messages,
             reasoning={"effort": "max"},
         )
-        self.assertNotEqual(request.reasoning_effort, "max")
+        self.assertEqual(request.reasoning_effort, "max")
+
+    def test_chat_completion_thinking_disabled_compat_fields(self):
+        messages = [{"role": "user", "content": "Hello"}]
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=messages,
+            thinking={"type": "disabled"},
+            return_reasoning=False,
+        )
+        self.assertFalse(request.chat_template_kwargs.get("thinking"))
+        self.assertFalse(request.chat_template_kwargs.get("enable_thinking"))
+
+    def test_chat_completion_enable_thinking_false_compat_field(self):
+        messages = [{"role": "user", "content": "Hello"}]
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=messages,
+            enable_thinking=False,
+        )
+        self.assertFalse(request.chat_template_kwargs.get("enable_thinking"))
+
+    def test_chat_completion_return_reasoning_false_does_not_disable_thinking(self):
+        messages = [{"role": "user", "content": "Hello"}]
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=messages,
+            return_reasoning=False,
+        )
+        self.assertIsNone(request.chat_template_kwargs)
 
     def test_chat_completion_json_format(self):
         """Test chat completion json format"""

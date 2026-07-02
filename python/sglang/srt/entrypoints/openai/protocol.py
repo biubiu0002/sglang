@@ -733,6 +733,7 @@ class ChatCompletionRequest(BaseModel):
     session_params: Optional[Dict] = None
     separate_reasoning: bool = True
     stream_reasoning: bool = True
+    return_reasoning: Optional[bool] = None
     chat_template_kwargs: Optional[Dict] = None
 
     # SGLang multimodal controls (extensions)
@@ -803,7 +804,7 @@ class ChatCompletionRequest(BaseModel):
 
         if r is not None and isinstance(r, dict):
             effort = r.get("effort") or r.get("reasoning_effort")
-            if effort in {"none", "low", "medium", "high"}:
+            if effort in {"none", "low", "medium", "high", "max"}:
                 values["reasoning_effort"] = effort
 
             enabled = (
@@ -811,6 +812,9 @@ class ChatCompletionRequest(BaseModel):
                 if r.get("enabled") is not None
                 else r.get("enable", False)
             )
+            thinking_type = r.get("type")
+            if thinking_type in {"enabled", "disabled"}:
+                enabled = thinking_type == "enabled"
             if isinstance(enabled, str):
                 enabled = enabled.strip().lower() in {"1", "true", "yes", "y", "on"}
             if enabled:
@@ -823,6 +827,34 @@ class ChatCompletionRequest(BaseModel):
                 ctk.setdefault("thinking", True)
                 ctk.setdefault("enable_thinking", True)
                 values["chat_template_kwargs"] = ctk
+
+        thinking = values.get("thinking")
+        if thinking is not None and isinstance(thinking, dict):
+            thinking_type = thinking.get("type")
+            if thinking_type in {"enabled", "disabled"}:
+                ctk = values.get("chat_template_kwargs")
+                if not isinstance(ctk, dict):
+                    ctk = {}
+                enabled = thinking_type == "enabled"
+                ctk.setdefault("thinking", enabled)
+                ctk.setdefault("enable_thinking", enabled)
+                values["chat_template_kwargs"] = ctk
+
+        enable_thinking = values.get("enable_thinking")
+        if isinstance(enable_thinking, str):
+            enable_thinking = enable_thinking.strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "y",
+                "on",
+            }
+        if isinstance(enable_thinking, bool):
+            ctk = values.get("chat_template_kwargs")
+            if not isinstance(ctk, dict):
+                ctk = {}
+            ctk.setdefault("enable_thinking", enable_thinking)
+            values["chat_template_kwargs"] = ctk
 
         if values.get("reasoning_effort") == "none":
             ctk = values.get("chat_template_kwargs")

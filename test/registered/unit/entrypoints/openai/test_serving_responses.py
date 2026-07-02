@@ -566,7 +566,7 @@ class OutputItemsTestCase(unittest.TestCase):
         self.assertEqual(len(output_items), 1)
         self.assertIsInstance(output_items[0], ResponseOutputMessage)
 
-    def test_reasoning_trace_is_not_exposed_as_response_output(self):
+    def test_reasoning_trace_is_returned_when_explicitly_requested(self):
         serving = make_serving()
         serving.reasoning_parser = "glm45"
 
@@ -588,6 +588,37 @@ class OutputItemsTestCase(unittest.TestCase):
                 tokenizer=Mock(),
             )
 
+        self.assertEqual(len(output_items), 2)
+        self.assertIsInstance(output_items[0], ResponseReasoningItem)
+        self.assertEqual(output_items[0].summary[0].text, "private thinking")
+        self.assertEqual(output_items[0].content[0].text, "private thinking")
+
+        message_items = [
+            item for item in output_items if isinstance(item, ResponseOutputMessage)
+        ]
+        self.assertEqual(len(message_items), 1)
+        self.assertEqual(message_items[0].content[0].text, "final answer")
+
+    def test_reasoning_trace_is_not_returned_by_default(self):
+        serving = make_serving()
+        serving.reasoning_parser = "glm45"
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_responses.ReasoningParser"
+        ) as parser_cls:
+            parser_cls.return_value.parse_non_stream.return_value = (
+                "private thinking",
+                "final answer",
+            )
+            output_items = serving._make_response_output_items(
+                ResponsesRequest(model="x", input="hi", store=False),
+                "<think>private thinking</think>final answer",
+                tokenizer=Mock(),
+            )
+
+        self.assertFalse(
+            any(isinstance(item, ResponseReasoningItem) for item in output_items)
+        )
         self.assertEqual(len(output_items), 1)
         self.assertIsInstance(output_items[0], ResponseOutputMessage)
         self.assertEqual(output_items[0].content[0].text, "final answer")

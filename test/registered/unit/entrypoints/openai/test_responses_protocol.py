@@ -97,6 +97,39 @@ class ResponsesRequestTestCase(unittest.TestCase):
             )
             self.assertEqual(request.reasoning.effort, effort)
 
+    def test_reasoning_effort_none_disables_chat_template_thinking(self):
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            reasoning={"effort": "none"},
+            store=False,
+        )
+        self.assertEqual(
+            request.chat_template_kwargs,
+            {"thinking": False, "enable_thinking": False},
+        )
+
+    def test_thinking_disabled_compat_field_disables_chat_template_thinking(self):
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            thinking={"type": "disabled"},
+            store=False,
+        )
+        self.assertEqual(
+            request.chat_template_kwargs,
+            {"thinking": False, "enable_thinking": False},
+        )
+
+    def test_enable_thinking_compat_field_flows_to_chat_template_kwargs(self):
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            enable_thinking=False,
+            store=False,
+        )
+        self.assertEqual(request.chat_template_kwargs, {"enable_thinking": False})
+
 
 class ResponsesSamplingParamsTestCase(unittest.TestCase):
     def test_processed_stop_and_tool_constraint_propagate(self):

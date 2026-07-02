@@ -25,6 +25,7 @@ from openai.types.responses import (
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
 from openai.types.responses.response_reasoning_item import (
     Content as ResponseReasoningTextContent,
+    Summary as ResponseReasoningSummaryText,
 )
 from openai_harmony import Message as OpenAIMessage
 
@@ -503,6 +504,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             reasoning_effort=self._chat_reasoning_effort_from_response_reasoning(
                 request
             ),
+            chat_template_kwargs=request.chat_template_kwargs,
             parallel_tool_calls=(
                 request.parallel_tool_calls
                 if request.parallel_tool_calls is not None
@@ -662,6 +664,10 @@ class OpenAIServingResponses(OpenAIServingChat):
         return request.reasoning is not None and request.reasoning.summary is not None
 
     @staticmethod
+    def _wants_reasoning_output(request: ResponsesRequest) -> bool:
+        return request.reasoning is not None and request.reasoning.effort != "none"
+
+    @staticmethod
     def _chat_reasoning_effort_from_response_reasoning(
         request: ResponsesRequest,
     ) -> Optional[str]:
@@ -737,6 +743,26 @@ class OpenAIServingResponses(OpenAIServingChat):
         )
         tool_call_items: list[ResponseFunctionToolCall] = []
         parsed_via_native = False
+        if reasoning_content and self._wants_reasoning_output(request):
+            output_items.append(
+                ResponseReasoningItem(
+                    id=f"rs_{random_uuid()}",
+                    type="reasoning",
+                    summary=[
+                        ResponseReasoningSummaryText(
+                            text=reasoning_content,
+                            type="summary_text",
+                        )
+                    ],
+                    content=[
+                        ResponseReasoningTextContent(
+                            text=reasoning_content,
+                            type="reasoning_text",
+                        )
+                    ],
+                    status="completed",
+                )
+            )
         if (
             content
             and chat_tools

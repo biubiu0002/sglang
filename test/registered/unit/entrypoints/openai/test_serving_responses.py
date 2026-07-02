@@ -254,6 +254,30 @@ class InputItemNormalizationTestCase(unittest.TestCase):
             {"role": "tool", "tool_call_id": "call_abc", "content": "42"},
         )
 
+    def test_reasoning_input_uses_summary_not_raw_content(self):
+        normalized = OpenAIServingResponses._normalize_response_message_for_chat(
+            {
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "public summary"}],
+                "content": [{"type": "reasoning_text", "text": "raw private trace"}],
+            }
+        )
+        self.assertEqual(
+            normalized,
+            {"role": "assistant", "reasoning_content": "public summary"},
+        )
+
+        self.assertIsNone(
+            OpenAIServingResponses._normalize_response_message_for_chat(
+                {
+                    "type": "reasoning",
+                    "content": [
+                        {"type": "reasoning_text", "text": "raw private trace"}
+                    ],
+                }
+            )
+        )
+
     def test_unknown_input_item_type_raises(self):
         with self.assertRaises(ValueError):
             OpenAIServingResponses._normalize_response_message_for_chat(
@@ -370,6 +394,44 @@ class MultimodalRequestTestCase(unittest.TestCase):
             captured["adapted_request"].image_data, ["http://example.com/cat.png"]
         )
         self.assertEqual(captured["adapted_request"].modalities, ["image"])
+
+    def test_make_request_maps_responses_reasoning_effort_for_chat_request(self):
+        serving = make_serving()
+        captured = {}
+
+        def fake_process_messages(chat_request, is_multimodal):
+            captured["reasoning_effort"] = chat_request.reasoning_effort
+            return MessageProcessingResult(
+                prompt="ignored",
+                prompt_ids=[1, 2, 3],
+                image_data=None,
+                audio_data=None,
+                video_data=None,
+                modalities=[],
+                stop=[],
+            )
+
+        serving._process_messages = fake_process_messages
+        serving._get_request_payload = Mock(return_value={})
+
+        for responses_effort, chat_effort in (
+            ("minimal", "low"),
+            ("xhigh", "max"),
+            ("none", "none"),
+            ("high", "high"),
+        ):
+            request = ResponsesRequest(
+                model="x",
+                input="hi",
+                reasoning={"effort": responses_effort},
+                store=False,
+            )
+            asyncio.run(
+                serving._make_request(
+                    request, None, serving.tokenizer_manager.tokenizer
+                )
+            )
+            self.assertEqual(captured["reasoning_effort"], chat_effort)
 
 
 class OutputItemsTestCase(unittest.TestCase):
@@ -503,6 +565,32 @@ class OutputItemsTestCase(unittest.TestCase):
 
         self.assertEqual(len(output_items), 1)
         self.assertIsInstance(output_items[0], ResponseOutputMessage)
+
+    def test_reasoning_trace_is_not_exposed_as_response_output(self):
+        serving = make_serving()
+        serving.reasoning_parser = "glm45"
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_responses.ReasoningParser"
+        ) as parser_cls:
+            parser_cls.return_value.parse_non_stream.return_value = (
+                "private thinking",
+                "final answer",
+            )
+            output_items = serving._make_response_output_items(
+                ResponsesRequest(
+                    model="x",
+                    input="hi",
+                    reasoning={"summary": "auto"},
+                    store=False,
+                ),
+                "<think>private thinking</think>final answer",
+                tokenizer=Mock(),
+            )
+
+        self.assertEqual(len(output_items), 1)
+        self.assertIsInstance(output_items[0], ResponseOutputMessage)
+        self.assertEqual(output_items[0].content[0].text, "final answer")
 
 
 class HarmonyResponsesTestCase(unittest.TestCase):

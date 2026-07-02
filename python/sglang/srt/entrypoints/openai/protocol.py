@@ -1300,7 +1300,7 @@ OpenAIServingRequest = Union[
 class ResponseReasoningParam(BaseModel):
     """Reasoning parameters for responses."""
 
-    effort: Optional[Literal["low", "medium", "high"]] = Field(
+    effort: Optional[Literal["none", "minimal", "low", "medium", "high", "xhigh"]] = Field(
         default="medium",
         description="Constrains effort on reasoning for reasoning models.",
     )

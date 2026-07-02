@@ -87,6 +87,16 @@ class ResponsesRequestTestCase(unittest.TestCase):
         self.assertEqual(len(request.tools[0].tools), 2)
         self.assertEqual(request.tools[0].tools[0]["name"], "apply_patch")
 
+    def test_reasoning_effort_accepts_openai_values(self):
+        for effort in ("none", "minimal", "low", "medium", "high", "xhigh"):
+            request = ResponsesRequest(
+                model="x",
+                input="hi",
+                reasoning={"effort": effort},
+                store=False,
+            )
+            self.assertEqual(request.reasoning.effort, effort)
+
 
 class ResponsesSamplingParamsTestCase(unittest.TestCase):
     def test_processed_stop_and_tool_constraint_propagate(self):

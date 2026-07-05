@@ -27,6 +27,12 @@ from openai.types.responses.response_reasoning_item import (
     Content as ResponseReasoningTextContent,
     Summary as ResponseReasoningSummaryText,
 )
+from openai.types.responses.response_reasoning_summary_part_added_event import (
+    Part as ResponseReasoningSummaryAddedPart,
+)
+from openai.types.responses.response_reasoning_summary_part_done_event import (
+    Part as ResponseReasoningSummaryDonePart,
+)
 from openai_harmony import Message as OpenAIMessage
 
 from sglang.srt.entrypoints.context import (
@@ -1924,20 +1930,81 @@ class OpenAIServingResponses(OpenAIServingChat):
         finish_reason: Optional[dict[str, Any]] = None
         stream_offset = 0
         incremental = self.tokenizer_manager.server_args.incremental_streaming_output
+        wants_summary = self._wants_reasoning_summary(request)
 
         def _open_reasoning_item() -> str:
+            nonlocal current_output_index
+            current_output_index += 1
             item_id = f"rs_{random_uuid()}"
             reasoning_state.update(
-                open=True, item_id=item_id, output_index=-1, text=""
+                open=True, item_id=item_id, output_index=current_output_index, text=""
             )
             return item_id
 
         def _close_reasoning_item():
             if not reasoning_state["open"]:
                 return []
+            text = reasoning_state["text"]
+            events = []
+            if wants_summary:
+                events.append(
+                    _send_event(
+                        openai_responses_types.ResponseReasoningSummaryTextDoneEvent(
+                            type="response.reasoning_summary_text.done",
+                            item_id=reasoning_state["item_id"],
+                            sequence_number=-1,
+                            output_index=reasoning_state["output_index"],
+                            summary_index=0,
+                            text=text,
+                        )
+                    )
+                )
+                events.append(
+                    _send_event(
+                        openai_responses_types.ResponseReasoningSummaryPartDoneEvent(
+                            type="response.reasoning_summary_part.done",
+                            item_id=reasoning_state["item_id"],
+                            sequence_number=-1,
+                            output_index=reasoning_state["output_index"],
+                            summary_index=0,
+                            part=ResponseReasoningSummaryDonePart(
+                                type="summary_text", text=text
+                            ),
+                        )
+                    )
+                )
+            else:
+                events.append(
+                    _send_event(
+                        openai_responses_types.ResponseReasoningTextDoneEvent(
+                            type="response.reasoning_text.done",
+                            item_id=reasoning_state["item_id"],
+                            sequence_number=-1,
+                            output_index=reasoning_state["output_index"],
+                            content_index=0,
+                            text=text,
+                        )
+                    )
+                )
+            events.append(
+                _send_event(
+                    openai_responses_types.ResponseOutputItemDoneEvent(
+                        type="response.output_item.done",
+                        sequence_number=-1,
+                        output_index=reasoning_state["output_index"],
+                        item=ResponseReasoningItem(
+                            id=reasoning_state["item_id"],
+                            type="reasoning",
+                            summary=[],
+                            content=None,
+                            status="completed",
+                        ),
+                    )
+                )
+            )
             reasoning_state["open"] = False
             reasoning_state["text"] = ""
-            return []
+            return events
 
         def _open_message_item() -> str:
             nonlocal current_output_index
@@ -2076,8 +2143,57 @@ class OpenAIServingResponses(OpenAIServingChat):
                         for ev in _close_message_item():
                             yield ev
                     if not reasoning_state["open"]:
-                        _open_reasoning_item()
+                        item_id = _open_reasoning_item()
+                        yield _send_event(
+                            openai_responses_types.ResponseOutputItemAddedEvent(
+                                type="response.output_item.added",
+                                sequence_number=-1,
+                                output_index=reasoning_state["output_index"],
+                                item=ResponseReasoningItem(
+                                    id=item_id,
+                                    type="reasoning",
+                                    summary=[],
+                                    content=None,
+                                    status="in_progress",
+                                ),
+                            )
+                        )
+                        if wants_summary:
+                            yield _send_event(
+                                openai_responses_types.ResponseReasoningSummaryPartAddedEvent(
+                                    type="response.reasoning_summary_part.added",
+                                    item_id=item_id,
+                                    output_index=reasoning_state["output_index"],
+                                    summary_index=0,
+                                    part=ResponseReasoningSummaryAddedPart(
+                                        type="summary_text", text=""
+                                    ),
+                                    sequence_number=-1,
+                                )
+                            )
                     reasoning_state["text"] += reasoning_chunk
+                    if wants_summary:
+                        yield _send_event(
+                            openai_responses_types.ResponseReasoningSummaryTextDeltaEvent(
+                                type="response.reasoning_summary_text.delta",
+                                item_id=reasoning_state["item_id"],
+                                output_index=reasoning_state["output_index"],
+                                summary_index=0,
+                                delta=reasoning_chunk,
+                                sequence_number=-1,
+                            )
+                        )
+                    else:
+                        yield _send_event(
+                            openai_responses_types.ResponseReasoningTextDeltaEvent(
+                                type="response.reasoning_text.delta",
+                                item_id=reasoning_state["item_id"],
+                                output_index=reasoning_state["output_index"],
+                                content_index=0,
+                                delta=reasoning_chunk,
+                                sequence_number=-1,
+                            )
+                        )
 
                 if not delta:
                     continue

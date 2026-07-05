@@ -206,7 +206,7 @@ class NonHarmonyStreamTestCase(unittest.TestCase):
         self.assertEqual(output[1]["name"], "get_weather")
         self.assertEqual(output[2]["content"][0]["text"], "It's sunny.")
 
-    def test_reasoning_deltas_are_not_exposed_as_response_events(self):
+    def test_reasoning_deltas_emit_typed_events_without_completed_raw_trace(self):
         serving = make_serving()
         serving.reasoning_parser = "glm45"
         serving.tool_call_parser = None
@@ -244,13 +244,28 @@ class NonHarmonyStreamTestCase(unittest.TestCase):
             )
 
         types = event_types(events)
-        self.assertFalse(any(t.startswith("response.reasoning_") for t in types))
+        for ev in (
+            "response.reasoning_summary_part.added",
+            "response.reasoning_summary_text.delta",
+            "response.reasoning_summary_text.done",
+            "response.reasoning_summary_part.done",
+        ):
+            self.assertIn(ev, types)
         added = [
             payload
             for payload in event_payloads(events)
             if payload.get("type") == "response.output_item.added"
         ]
-        self.assertEqual([payload["output_index"] for payload in added], [0])
+        self.assertEqual(
+            [payload["item"]["type"] for payload in added], ["reasoning", "message"]
+        )
+        self.assertEqual([payload["output_index"] for payload in added], [0, 1])
+        reasoning_deltas = [
+            payload["delta"]
+            for payload in event_payloads(events)
+            if payload.get("type") == "response.reasoning_summary_text.delta"
+        ]
+        self.assertEqual(reasoning_deltas, ["private thinking"])
         completed = find_completed_event(events)
         output = completed["response"]["output"]
         self.assertEqual([item["type"] for item in output], ["message"])

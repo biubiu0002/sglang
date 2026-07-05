@@ -24,7 +24,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.lora.backend.base_backend import BaseLoRABackend
+from sglang.srt.lora.backend.base_backend import (
+    BaseLoRABackend,
+    _compute_moe_lora_info,
+)
 from sglang.srt.lora.utils import LoRABatchInfo, get_lm_head_lora_b_shard_size
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
@@ -40,6 +43,8 @@ class BaseLayerWithLoRA(nn.Module):
         self.base_layer: nn.Module = base_layer
         self.set_lora: bool = False
         self.lora_backend: BaseLoRABackend = lora_backend
+        self.lora_ranks: Optional[torch.Tensor] = None
+        self.lora_ranks_cpu: Optional[torch.Tensor] = None
         if hasattr(self.base_layer, "weight"):
             self.weight = self.base_layer.weight
         if hasattr(self.base_layer, "bias") and self.base_layer.bias is not None:
@@ -50,6 +55,17 @@ class BaseLayerWithLoRA(nn.Module):
 
     def set_lora_info(self, *args):
         pass
+
+    def set_lora_ranks(
+        self,
+        lora_ranks: Optional[torch.Tensor],
+        lora_ranks_cpu: Optional[torch.Tensor] = None,
+    ):
+        self.lora_ranks = lora_ranks
+        self.lora_ranks_cpu = lora_ranks_cpu
+
+    def use_module_lora_ranks(self):
+        return self.lora_backend.use_lora_ranks(self.lora_ranks, self.lora_ranks_cpu)
 
     def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
         pass
@@ -126,17 +142,18 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         Formula: output = base_output + lora_B @ lora_A_embedding(input_)
         """
 
-        # Efficient embedding lookup for LoRA A (already support extra token embedding process)
-        lora_a_output = self.run_lora_a_embedding(input_, batch_info)
+        with self.use_module_lora_ranks():
+            # Efficient embedding lookup for LoRA A (already support extra token embedding process)
+            lora_a_output = self.run_lora_a_embedding(input_, batch_info)
 
-        # Apply LoRA B weights using backend
-        lora_output = self.lora_backend.run_lora_b_sgemm(
-            x=lora_a_output,
-            weights=self.embedding_B_buffer,
-            output_offset=self.output_offset,
-            output_offset_cpu=self.output_offset_cpu,
-            base_output=base_output,
-        )
+            # Apply LoRA B weights using backend
+            lora_output = self.lora_backend.run_lora_b_sgemm(
+                x=lora_a_output,
+                weights=self.embedding_B_buffer,
+                output_offset=self.output_offset,
+                output_offset_cpu=self.output_offset_cpu,
+                base_output=base_output,
+            )
         return lora_output
 
     def run_lora_a_embedding(
@@ -350,6 +367,16 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
                            = base_output + (hidden @ A^T) @ B^T
         """
         lm_head_batch_info = self._get_lm_head_batch_info(hidden_states.shape[0])
+        if lm_head_batch_info is not None and self.lora_ranks is not None:
+            import dataclasses
+
+            updates = {"lora_ranks": self.lora_ranks}
+            if (
+                self.lora_ranks_cpu is not None
+                and hasattr(lm_head_batch_info, "lora_ranks_cpu")
+            ):
+                updates["lora_ranks_cpu"] = self.lora_ranks_cpu
+            lm_head_batch_info = dataclasses.replace(lm_head_batch_info, **updates)
 
         # Apply lora_A^T: hidden_states @ A^T
         lora_a_output = self.lora_backend.run_lora_a_sgemm(
@@ -449,14 +476,15 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
         self.B_buffer = B_buffer
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        lora_a_output = self.lora_backend.run_lora_a_sgemm(x, self.A_buffer)
-        lora_output = self.lora_backend.run_lora_b_sgemm(
-            x=lora_a_output,
-            weights=self.B_buffer,
-            output_offset=self.output_offset,
-            output_offset_cpu=self.output_offset_cpu,
-            base_output=base_output,
-        )
+        with self.use_module_lora_ranks():
+            lora_a_output = self.lora_backend.run_lora_a_sgemm(x, self.A_buffer)
+            lora_output = self.lora_backend.run_lora_b_sgemm(
+                x=lora_a_output,
+                weights=self.B_buffer,
+                output_offset=self.output_offset,
+                output_offset_cpu=self.output_offset_cpu,
+                base_output=base_output,
+            )
         return lora_output
 
     def forward(self, input_: torch.Tensor):
@@ -549,27 +577,28 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         return self.A_buffer.shape[-2] // lora_rank
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        lora_n_slices = self._get_lora_n_slices()
-        if lora_n_slices == 2 and self.use_gate_up_lora:
-            lora_output = self.lora_backend.run_gate_up_lora(
-                x=x,
-                gate_up_lora_a=self.A_buffer,
-                gate_up_lora_b=self.B_buffer,
-                output_offset=self.output_offset,
-                output_offset_cpu=self.output_offset_cpu,
-                base_output=base_output,
-            )
-        else:
-            lora_output = self.lora_backend.run_qkv_lora(
-                x=x,
-                qkv_lora_a=self.A_buffer,
-                qkv_lora_b=self.B_buffer,
-                output_offset=self.output_offset,
-                output_offset_cpu=self.output_offset_cpu,
-                max_qkv_out_dim=self.max_out_dim,
-                base_output=base_output,
-                n_slices=lora_n_slices,
-            )
+        with self.use_module_lora_ranks():
+            lora_n_slices = self._get_lora_n_slices()
+            if lora_n_slices == 2 and self.use_gate_up_lora:
+                lora_output = self.lora_backend.run_gate_up_lora(
+                    x=x,
+                    gate_up_lora_a=self.A_buffer,
+                    gate_up_lora_b=self.B_buffer,
+                    output_offset=self.output_offset,
+                    output_offset_cpu=self.output_offset_cpu,
+                    base_output=base_output,
+                )
+            else:
+                lora_output = self.lora_backend.run_qkv_lora(
+                    x=x,
+                    qkv_lora_a=self.A_buffer,
+                    qkv_lora_b=self.B_buffer,
+                    output_offset=self.output_offset,
+                    output_offset_cpu=self.output_offset_cpu,
+                    max_qkv_out_dim=self.max_out_dim,
+                    base_output=base_output,
+                    n_slices=lora_n_slices,
+                )
         return lora_output
 
     def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
@@ -628,15 +657,16 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         self.B_buffer_qkv = B_buffer_qkv
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        lora_output = self.lora_backend.run_qkv_lora(
-            x=x,
-            qkv_lora_a=self.A_buffer_qkv,
-            qkv_lora_b=self.B_buffer_qkv,
-            base_output=base_output,
-            output_offset=self.output_offset,
-            output_offset_cpu=self.output_offset_cpu,
-            max_qkv_out_dim=self.max_qkv_out_dim,
-        )
+        with self.use_module_lora_ranks():
+            lora_output = self.lora_backend.run_qkv_lora(
+                x=x,
+                qkv_lora_a=self.A_buffer_qkv,
+                qkv_lora_b=self.B_buffer_qkv,
+                base_output=base_output,
+                output_offset=self.output_offset,
+                output_offset_cpu=self.output_offset_cpu,
+                max_qkv_out_dim=self.max_qkv_out_dim,
+            )
 
         return lora_output
 
@@ -699,14 +729,15 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
         )
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        lora_a_output = self.lora_backend.run_lora_a_sgemm(x, self.A_buffer)
-        lora_output = self.lora_backend.run_lora_b_sgemm(
-            x=lora_a_output,
-            weights=self.B_buffer,
-            output_offset=self.output_offset,
-            output_offset_cpu=self.output_offset_cpu,
-            base_output=base_output,
-        )
+        with self.use_module_lora_ranks():
+            lora_a_output = self.lora_backend.run_lora_a_sgemm(x, self.A_buffer)
+            lora_output = self.lora_backend.run_lora_b_sgemm(
+                x=lora_a_output,
+                weights=self.B_buffer,
+                output_offset=self.output_offset,
+                output_offset_cpu=self.output_offset_cpu,
+                base_output=base_output,
+            )
         return lora_output
 
     def forward(self, input_: torch.Tensor, skip_all_reduce=False, forward_batch=None):
@@ -735,18 +766,19 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
         )
 
         if self.set_lora and should_reduce:
-            lora_a_output = self.lora_backend.run_lora_a_sgemm(
-                input_parallel, self.A_buffer
-            )
-            output_ = tensor_model_parallel_all_reduce(output_parallel)
-            lora_a_output = tensor_model_parallel_all_reduce(lora_a_output)
-            output_ = self.lora_backend.run_lora_b_sgemm(
-                x=lora_a_output,
-                weights=self.B_buffer,
-                output_offset=self.output_offset,
-                output_offset_cpu=self.output_offset_cpu,
-                base_output=output_,
-            )
+            with self.use_module_lora_ranks():
+                lora_a_output = self.lora_backend.run_lora_a_sgemm(
+                    input_parallel, self.A_buffer
+                )
+                output_ = tensor_model_parallel_all_reduce(output_parallel)
+                lora_a_output = tensor_model_parallel_all_reduce(lora_a_output)
+                output_ = self.lora_backend.run_lora_b_sgemm(
+                    x=lora_a_output,
+                    weights=self.B_buffer,
+                    output_offset=self.output_offset,
+                    output_offset_cpu=self.output_offset_cpu,
+                    base_output=output_,
+                )
         else:
             if self.set_lora:
                 output_parallel = self.apply_lora(output_parallel, input_parallel)
@@ -820,28 +852,30 @@ class ReplicatedLinearWithLoRA(BaseLayerWithLoRA):
 
         if first_dim == 0:
             # Simple single-projection (e.g. fc1_latent_proj, fc2_latent_proj)
-            lora_a_output = self.lora_backend.run_lora_a_sgemm(x, self.A_buffer)
-            lora_output = self.lora_backend.run_lora_b_sgemm(
-                x=lora_a_output,
-                weights=self.B_buffer,
-                output_offset=self._output_offset,
-                base_output=base_output,
-            )
+            with self.use_module_lora_ranks():
+                lora_a_output = self.lora_backend.run_lora_a_sgemm(x, self.A_buffer)
+                lora_output = self.lora_backend.run_lora_b_sgemm(
+                    x=lora_a_output,
+                    weights=self.B_buffer,
+                    output_offset=self._output_offset,
+                    base_output=base_output,
+                )
             return lora_output
 
         # Use the fused N-component kernel with n_slices=2 to handle the
         # split inside the triton kernel, avoiding Python-level splitting
         # which breaks when adapter rank < max_lora_rank.
-        lora_output = self.lora_backend.run_qkv_lora(
-            x=x,
-            qkv_lora_a=self.A_buffer,
-            qkv_lora_b=self.B_buffer,
-            output_offset=self._output_offset,
-            output_offset_cpu=self._output_offset_cpu,
-            max_qkv_out_dim=self._max_out_dim,
-            base_output=base_output,
-            n_slices=2,
-        )
+        with self.use_module_lora_ranks():
+            lora_output = self.lora_backend.run_qkv_lora(
+                x=x,
+                qkv_lora_a=self.A_buffer,
+                qkv_lora_b=self.B_buffer,
+                output_offset=self._output_offset,
+                output_offset_cpu=self._output_offset_cpu,
+                max_qkv_out_dim=self._max_out_dim,
+                base_output=base_output,
+                n_slices=2,
+            )
         return lora_output
 
     def forward(self, x: torch.Tensor):
@@ -899,6 +933,8 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self._uses_interleaved_gate_up = (
             getattr(base_layer.moe_runner_config, "gemm1_alpha", None) is not None
         )
+        self.gate_up_lora_ranks: Optional[torch.Tensor] = None
+        self.down_lora_ranks: Optional[torch.Tensor] = None
 
         # Initialize triton_lora moe runner for batches with lora enabled
         from sglang.srt.layers.moe import MoeRunnerBackend
@@ -968,6 +1004,21 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self.down_lora_a_weights = down_lora_a_weights
         self.down_lora_b_weights = down_lora_b_weights
 
+    def set_moe_lora_ranks(
+        self,
+        gate_up_lora_ranks: Optional[torch.Tensor],
+        down_lora_ranks: Optional[torch.Tensor],
+    ):
+        self.gate_up_lora_ranks = gate_up_lora_ranks
+        self.down_lora_ranks = down_lora_ranks
+
+    def _get_moe_lora_ranks(self) -> Optional[torch.Tensor]:
+        if self.gate_up_lora_ranks is None:
+            return self.down_lora_ranks
+        if self.down_lora_ranks is None:
+            return self.gate_up_lora_ranks
+        return torch.maximum(self.gate_up_lora_ranks, self.down_lora_ranks)
+
     def _get_lora_info(self):
         """Build LoRAInfo for the current batch."""
         from sglang.srt.lora.lora_moe_runners import LoRAInfo
@@ -983,6 +1034,26 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         # Single source of truth: lora_manager precomputes this per-batch from
         # the Python weight_indices list, no GPU sync needed.
         has_active_lora = bool(getattr(batch_info, "has_active_lora", False))
+        module_lora_ranks = self._get_moe_lora_ranks()
+        if module_lora_ranks is not None:
+            lora_ranks = module_lora_ranks
+            num_tokens = moe_lora_info.token_lora_mapping.shape[0]
+            adapter_enabled, token_lora_mapping = _compute_moe_lora_info(
+                num_tokens,
+                moe_lora_info.seg_indptr,
+                lora_ranks,
+                moe_lora_info.req_to_lora,
+                moe_lora_info.adapter_enabled,
+                moe_lora_info.token_lora_mapping,
+                max_len=moe_lora_info.max_len,
+            )
+            moe_lora_info = type(moe_lora_info)(
+                seg_indptr=moe_lora_info.seg_indptr,
+                req_to_lora=moe_lora_info.req_to_lora,
+                adapter_enabled=adapter_enabled,
+                token_lora_mapping=token_lora_mapping,
+                max_len=moe_lora_info.max_len,
+            )
 
         if self._lora_runner_backend.is_experimental_sgl_trtllm():
             # Per-rank (local) expert count the LoRA buffers are indexed by, so

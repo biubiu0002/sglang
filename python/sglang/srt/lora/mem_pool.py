@@ -204,6 +204,10 @@ class LoRAMemoryPool:
         self.lm_head_A_buffer: Dict[str, torch.Tensor] = {}
         self.lm_head_B_buffer: Dict[str, torch.Tensor] = {}
         self.new_embeddings_buffer: Dict[str, torch.Tensor] = {}
+        self.module_lora_ranks: Dict[str, List[torch.Tensor]] = {}
+        self.module_lora_ranks_cpu: Dict[str, List[torch.Tensor]] = {}
+        self.embedding_lora_ranks: Dict[str, torch.Tensor] = {}
+        self.embedding_lora_ranks_cpu: Dict[str, torch.Tensor] = {}
 
         self.embedding_dim: int = self.base_hf_config.hidden_size
 
@@ -641,6 +645,100 @@ class LoRAMemoryPool:
             self.target_modules,
             self.get_lora_B_shape,
         )
+        self.init_lora_rank_buffers(device)
+
+    def _make_cpu_lora_rank_tensor(self) -> torch.Tensor:
+        tensor = torch.zeros(self.max_loras_per_batch, dtype=torch.int32, device="cpu")
+        if self.pin_memory_available:
+            tensor = tensor.pin_memory()
+        return tensor
+
+    def init_lora_rank_buffers(self, device: torch.device):
+        self.module_lora_ranks = {
+            module_name: [
+                torch.zeros(self.max_loras_per_batch, dtype=torch.int32, device=device)
+                for _ in range(self.num_layer)
+            ]
+            for module_name in self.A_buffer
+        }
+        self.module_lora_ranks_cpu = {
+            module_name: [
+                self._make_cpu_lora_rank_tensor() for _ in range(self.num_layer)
+            ]
+            for module_name in self.A_buffer
+        }
+        self.embedding_lora_ranks = {
+            module_name: torch.zeros(
+                self.max_loras_per_batch, dtype=torch.int32, device=device
+            )
+            for module_name in set(self.embedding_A_buffer) | set(self.lm_head_A_buffer)
+        }
+        self.embedding_lora_ranks_cpu = {
+            module_name: self._make_cpu_lora_rank_tensor()
+            for module_name in set(self.embedding_A_buffer) | set(self.lm_head_A_buffer)
+        }
+
+    def get_lora_ranks(self, target_module: str, layer_id: int) -> torch.Tensor:
+        return self.module_lora_ranks[target_module][layer_id]
+
+    def get_lora_ranks_cpu(self, target_module: str, layer_id: int) -> torch.Tensor:
+        return self.module_lora_ranks_cpu[target_module][layer_id]
+
+    def get_embedding_lora_ranks(self, target_module: str) -> torch.Tensor:
+        return self.embedding_lora_ranks[target_module]
+
+    def get_embedding_lora_ranks_cpu(self, target_module: str) -> torch.Tensor:
+        return self.embedding_lora_ranks_cpu[target_module]
+
+    def _set_lora_rank(
+        self, target_module: str, layer_id: int, buffer_id: int, rank: int
+    ):
+        if target_module not in self.module_lora_ranks:
+            return
+        self.module_lora_ranks[target_module][layer_id][buffer_id] = rank
+        self.module_lora_ranks_cpu[target_module][layer_id][buffer_id] = rank
+
+    def _set_embedding_lora_rank(
+        self, target_module: str, buffer_id: int, rank: int
+    ):
+        if target_module not in self.embedding_lora_ranks:
+            return
+        self.embedding_lora_ranks[target_module][buffer_id] = rank
+        self.embedding_lora_ranks_cpu[target_module][buffer_id] = rank
+
+    def _clear_lora_ranks_for_slot(self, buffer_id: int):
+        for ranks in self.module_lora_ranks.values():
+            for layer_ranks in ranks:
+                layer_ranks[buffer_id] = 0
+        for ranks in self.module_lora_ranks_cpu.values():
+            for layer_ranks in ranks:
+                layer_ranks[buffer_id] = 0
+        for ranks in self.embedding_lora_ranks.values():
+            ranks[buffer_id] = 0
+        for ranks in self.embedding_lora_ranks_cpu.values():
+            ranks[buffer_id] = 0
+
+    @staticmethod
+    def _has_nonzero_weight(
+        weights: Optional[Union[torch.Tensor, Dict[int, torch.Tensor]]],
+    ) -> bool:
+        if weights is None:
+            return False
+        if isinstance(weights, dict):
+            return any(LoRAMemoryPool._has_nonzero_weight(w) for w in weights.values())
+        return bool(torch.count_nonzero(weights).item())
+
+    @staticmethod
+    def _has_active_weight_pair(
+        lora_adapter: LoRAAdapter,
+        a_weights: Optional[Union[torch.Tensor, Dict[int, torch.Tensor]]],
+        b_weights: Optional[Union[torch.Tensor, Dict[int, torch.Tensor]]],
+    ) -> bool:
+        return (
+            lora_adapter.scaling != 0
+            and LoRAMemoryPool._has_nonzero_weight(a_weights)
+            and LoRAMemoryPool._has_nonzero_weight(b_weights)
+        )
 
     def _get_maybe_cached_weight_for_transfer(
         self,
@@ -761,6 +859,8 @@ class LoRAMemoryPool:
         lora_embed_tokens_module: Optional[BaseLayerWithLoRA],
         lora_lm_head_module: Optional[BaseLayerWithLoRA],
     ):
+        self._clear_lora_ranks_for_slot(buffer_id)
+
         def load_lora_weight_tensor(
             buffer_view: torch.Tensor, weight: Optional[torch.Tensor]
         ):
@@ -975,6 +1075,18 @@ class LoRAMemoryPool:
             for name, weights in temp_A_buffer.items():
                 if name not in active_target_modules:
                     continue
+                self._set_lora_rank(
+                    name,
+                    layer_id,
+                    buffer_id,
+                    (
+                        lora_rank
+                        if self._has_active_weight_pair(
+                            lora_adapter, temp_A_buffer[name], temp_B_buffer[name]
+                        )
+                        else 0
+                    ),
+                )
                 c = get_stacked_multiply(name, self.base_model)
                 max_r = self.max_lora_rank
                 target_buffer = self.A_buffer[name][layer_id]
@@ -1193,6 +1305,8 @@ class LoRAMemoryPool:
             lora_added_tokens_size = lora_adapter.config.lora_added_tokens_size
             pinned_embedding_layers = lora_adapter.pinned_embedding_layers
             pinned_added_tokens_embeddings = lora_adapter.pinned_added_tokens_embeddings
+            embedding_has_nonzero_a: Dict[str, bool] = {}
+            embedding_has_nonzero_b: Dict[str, bool] = {}
             # Only when LoRA is applied to the embedding layer will it have the extra-token issue that needs to be resolved.
             # Load embeddings weights for extra tokens to buffer
             if lora_adapter.added_tokens_embeddings:
@@ -1227,6 +1341,9 @@ class LoRAMemoryPool:
                         weights,
                     )
                     load_lora_weight_tensor(buffer_view, weights)
+                    embedding_has_nonzero_a[target_module] = self._has_nonzero_weight(
+                        weights
+                    )
                 elif (
                     target_module == "embed_tokens"
                     and "embed_tokens" in name
@@ -1245,6 +1362,9 @@ class LoRAMemoryPool:
                         lora_b_weights,
                     )
                     load_lora_weight_tensor(buffer_view, lora_b_weights)
+                    embedding_has_nonzero_b[target_module] = self._has_nonzero_weight(
+                        lora_b_weights
+                    )
 
                 elif (
                     target_module == "lm_head"
@@ -1264,6 +1384,9 @@ class LoRAMemoryPool:
                         weights,
                     )
                     load_lora_weight_tensor(buffer_view, weights)
+                    embedding_has_nonzero_a[target_module] = self._has_nonzero_weight(
+                        weights
+                    )
                 elif (
                     target_module == "lm_head"
                     and lora_lm_head_module is not None
@@ -1292,6 +1415,9 @@ class LoRAMemoryPool:
                         lora_b_weights,
                     )
                     load_lora_weight_tensor(buffer_view, lora_b_weights)
+                    embedding_has_nonzero_b[target_module] = self._has_nonzero_weight(
+                        lora_b_weights
+                    )
                 elif (
                     target_module == "lm_head"
                     and "lm_head" in name
@@ -1313,6 +1439,18 @@ class LoRAMemoryPool:
                         not get_pp_group().is_last_rank
                     ), f"Failed to load lm_head LoRA weight: {name}, this is only expected to happen on non-last PP stages."
                     continue
+
+            for target_module in set(embedding_has_nonzero_a) | set(
+                embedding_has_nonzero_b
+            ):
+                rank = (
+                    lora_rank
+                    if lora_adapter.scaling != 0
+                    and embedding_has_nonzero_a.get(target_module, False)
+                    and embedding_has_nonzero_b.get(target_module, False)
+                    else 0
+                )
+                self._set_embedding_lora_rank(target_module, buffer_id, rank)
         else:
             # Zero out embedding/lm_head buffers for adapters without embedding LoRA
             # to avoid using garbage values from uninitialized memory

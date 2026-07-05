@@ -27,6 +27,7 @@ def sgemm_lora_a_embedding_fwd(
             weights,
             batch_info.weight_indices,
             batch_info.seg_lens,
+            batch_info.lora_ranks,
             batch_info.scalings,
             vocab_size,
         )
@@ -56,6 +57,7 @@ def sgemm_lora_a_fwd(
             weights,
             batch_info.weight_indices,
             batch_info.seg_lens,
+            batch_info.lora_ranks,
             batch_info.scalings,
             num_slices,
         )
@@ -86,6 +88,7 @@ def sgemm_lora_b_fwd(
             weights,
             batch_info.weight_indices,
             batch_info.seg_lens,
+            batch_info.lora_ranks,
             slice_offsets,
             base_output,
         )

@@ -336,8 +336,9 @@ class LoRAManager:
             weight_indices[i] = self.memory_pool.get_buffer_id(uid)
             if uid is not None:
                 lora = self.loras[uid]
-                lora_ranks[weight_indices[i]] = lora.config.r
                 scalings[weight_indices[i]] = lora.scaling
+                if lora.scaling != 0:
+                    lora_ranks[weight_indices[i]] = lora.config.r
         # Do in-place updates when CUDA graph is enabled and the batch forward mode
         # could use CUDA graph.
         self.lora_backend.prepare_lora_batch(
@@ -398,6 +399,10 @@ class LoRAManager:
                         down_lora_a_weights=down_a,
                         down_lora_b_weights=down_b,
                     )
+                    module.set_moe_lora_ranks(
+                        self.memory_pool.get_lora_ranks(gate_up_key, layer_id),
+                        self.memory_pool.get_lora_ranks(down_key, layer_id),
+                    )
                     continue
 
                 target_module = get_target_module_name(
@@ -416,6 +421,10 @@ class LoRAManager:
                         lora_type=LoRAType.LORA_B,
                     ),
                 )
+                module.set_lora_ranks(
+                    self.memory_pool.get_lora_ranks(target_module, layer_id),
+                    self.memory_pool.get_lora_ranks_cpu(target_module, layer_id),
+                )
 
         # Update embedding layer if present - gotta merge (refer to PR codebase)
         if self.embed_tokens_module is not None:
@@ -424,12 +433,20 @@ class LoRAManager:
                 self.memory_pool.get_embedding_tensor("embed_tokens", LoRAType.LORA_A),
                 self.memory_pool.get_embedding_tensor("embed_tokens", LoRAType.LORA_B),
             )
+            self.embed_tokens_module.set_lora_ranks(
+                self.memory_pool.get_embedding_lora_ranks("embed_tokens"),
+                self.memory_pool.get_embedding_lora_ranks_cpu("embed_tokens"),
+            )
 
         # Update lm_head layer if present
         if self.lm_head_module is not None:
             self.lm_head_module.set_lora_info(
                 self.memory_pool.get_embedding_tensor("lm_head", LoRAType.LORA_A),
                 self.memory_pool.get_embedding_tensor("lm_head", LoRAType.LORA_B),
+            )
+            self.lm_head_module.set_lora_ranks(
+                self.memory_pool.get_embedding_lora_ranks("lm_head"),
+                self.memory_pool.get_embedding_lora_ranks_cpu("lm_head"),
             )
 
     def init_state(

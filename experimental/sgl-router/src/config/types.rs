@@ -143,6 +143,8 @@ impl Default for ActiveLoadConfig {
 ///
 /// Accepted on the CLI (`--policy`) as `round_robin` / `random` /
 /// `power_of_two` / `load_based` / `cache_aware_zmq` / `sticky`.
+/// `cache_aware_spillover` is kept as a CLI compatibility alias for
+/// deployed environments that predate the `cache_aware_zmq` name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum PolicyKind {
     #[default]
@@ -158,7 +160,7 @@ pub enum PolicyKind {
     /// Cache-aware routing fed by SGLang's ZMQ KV-cache event publisher.
     /// Requires the model to have a tokenizer loaded; cache_aware tuning
     /// lives on `ModelConfig::cache_aware`.
-    #[value(name = "cache_aware_zmq")]
+    #[value(name = "cache_aware_zmq", alias = "cache_aware_spillover")]
     CacheAwareZmq,
     /// Sticky-session routing: pins a routing key (read from a
     /// configurable request header) to a worker via an in-memory map, so

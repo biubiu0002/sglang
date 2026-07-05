@@ -1001,6 +1001,18 @@ mod tests {
         assert_eq!(c.model.policy, PolicyKind::LoadBased);
     }
 
+    #[test]
+    fn parses_cache_aware_spillover_policy_alias() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://10.0.0.1:30000",
+            "--policy",
+            "cache_aware_spillover",
+        ]))
+        .unwrap();
+        assert_eq!(c.model.policy, PolicyKind::CacheAwareZmq);
+    }
+
     /// clap rejects `--cb-threshold 0` because the field is `NonZeroU32`.
     #[test]
     fn rejects_zero_cb_threshold() {

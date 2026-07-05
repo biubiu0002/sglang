@@ -21,7 +21,9 @@ limitations under the License.
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
+#ifndef USE_ROCM
 #include <cuda_runtime.h>
+#endif
 #else
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>

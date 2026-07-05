@@ -3,7 +3,9 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda.h>
 #include <cudaTypedefs.h>
+#ifndef USE_ROCM
 #include <cuda_runtime.h>
+#endif
 #include <torch/all.h>
 
 #include <iostream>

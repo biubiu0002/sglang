@@ -21,7 +21,9 @@
 // clang-format off
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#ifndef USE_ROCM
 #include <cuda_runtime.h>
+#endif
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
 

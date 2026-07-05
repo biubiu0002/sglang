@@ -14,7 +14,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#ifndef USE_ROCM
 #include <cuda_runtime.h>
+#endif
 #include <type_traits>
 
 namespace sglang_timestep_embedding {

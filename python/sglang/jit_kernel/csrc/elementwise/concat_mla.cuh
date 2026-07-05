@@ -6,7 +6,9 @@
 #include <tvm/ffi/container/tensor.h>
 
 #include <cuda_bf16.h>
+#ifndef USE_ROCM
 #include <cuda_runtime.h>
+#endif
 
 namespace {
 

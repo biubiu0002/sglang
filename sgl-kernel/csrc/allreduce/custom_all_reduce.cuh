@@ -4,7 +4,9 @@
 #include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#ifndef USE_ROCM
 #include <cuda_runtime.h>
+#endif
 
 #include <array>
 #include <iostream>

@@ -52,7 +52,9 @@
 #include <cutlass/numeric_types.h>
 
 #include "tvm_ffi_utils.h"
+#ifndef USE_ROCM
 #include <cuda_runtime.h>
+#endif
 
 namespace sglang {
 

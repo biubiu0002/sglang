@@ -24,7 +24,9 @@ limitations under the License.
 
 #include <cstddef>
 #include <cstdint>
+#ifndef USE_ROCM
 #include <cuda_runtime.h>
+#endif
 
 using namespace host;
 

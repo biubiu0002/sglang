@@ -28,7 +28,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <cuda_bf16.h>
+#ifndef USE_ROCM
 #include <cuda_runtime.h>
+#endif
 #include <iomanip>
 #include <iostream>
 #include <nvrtc.h>

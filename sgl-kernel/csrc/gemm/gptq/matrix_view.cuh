@@ -7,7 +7,9 @@ https://github.com/turboderp/exllama
 #define _matrix_view_cuh
 
 #include <cuda_fp16.h>
+#ifndef USE_ROCM
 #include <cuda_runtime.h>
+#endif
 
 #include "qdq_util.cuh"
 

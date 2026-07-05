@@ -1,5 +1,7 @@
 #include <cuda.h>
+#ifndef USE_ROCM
 #include <cuda_runtime.h>
+#endif
 
 #include <iostream>
 

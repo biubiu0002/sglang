@@ -20,7 +20,9 @@ limitations under the License.
 #include <sgl_kernel/utils.cuh>
 
 #include "nvfp4_quant.cuh"
+#ifndef USE_ROCM
 #include <cuda_runtime.h>
+#endif
 #include <cuda_runtime_api.h>
 
 using namespace host;

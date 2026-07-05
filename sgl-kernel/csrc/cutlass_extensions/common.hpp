@@ -1,6 +1,8 @@
 #pragma once
 
+#ifndef USE_ROCM
 #include "cuda_runtime.h"
+#endif
 #include "cutlass/cutlass.h"
 
 /**

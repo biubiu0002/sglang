@@ -16,7 +16,9 @@ limitations under the License.
 #pragma once
 
 #include <ATen/Tensor.h>
+#ifndef USE_ROCM
 #include <cuda_runtime.h>
+#endif
 #include <torch/all.h>
 
 #ifdef USE_ROCM

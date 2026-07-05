@@ -22,7 +22,9 @@
 #include <ATen/cuda/CUDAContext.h>
 
 #include "cuda_bf16.h"
+#ifndef USE_ROCM
 #include "cuda_runtime.h"
+#endif
 #include "utils.h"
 
 // Custom FMA implementation using PTX assembly instructions

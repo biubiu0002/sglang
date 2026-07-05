@@ -3,7 +3,9 @@
 #pragma once
 
 #include <cuda_bf16.h>
+#ifndef USE_ROCM
 #include <cuda_runtime.h>
+#endif
 
 #include <cstdint>
 

@@ -15,6 +15,7 @@ forwards take a single ``getattr`` and skip the helper entirely.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
@@ -68,6 +69,13 @@ def _get_state(
     sgemm_info = getattr(lora_backend, "_sgemm_info", None)
     if callable(sgemm_info):
         batch_info = sgemm_info()
+    lora_ranks = getattr(attn_module.kv_b_proj, "lora_ranks", None)
+    if lora_ranks is not None:
+        updates = {"lora_ranks": lora_ranks}
+        lora_ranks_cpu = getattr(attn_module.kv_b_proj, "lora_ranks_cpu", None)
+        if lora_ranks_cpu is not None and hasattr(batch_info, "lora_ranks_cpu"):
+            updates["lora_ranks_cpu"] = lora_ranks_cpu
+        batch_info = replace(batch_info, **updates)
     # Non-None state ⇒ a kv_b adapter is active here; load the step kernels now
     # (cached after the first active forward). No-LoRA forwards return above and
     # never import triton_ops.

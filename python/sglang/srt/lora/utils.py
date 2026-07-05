@@ -23,6 +23,9 @@ class MoELoRABatchInfo:
     # If a token has no lora adapter, the value is -1.
     token_lora_mapping: torch.Tensor
 
+    # Maximum request segment length used when computing token_lora_mapping.
+    max_len: int = 1
+
 
 @dataclass
 class LoRABatchInfo:

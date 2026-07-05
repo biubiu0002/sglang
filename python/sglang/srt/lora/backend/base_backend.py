@@ -1,4 +1,6 @@
-from typing import Tuple, Union
+import dataclasses
+from contextlib import contextmanager
+from typing import Iterator, Optional, Tuple, Union
 
 import torch
 import triton
@@ -47,6 +49,46 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
             result with shape (s, rank)
         """
         pass
+
+    @contextmanager
+    def use_lora_ranks(
+        self,
+        lora_ranks: Optional[torch.Tensor],
+        lora_ranks_cpu: Optional[torch.Tensor] = None,
+    ) -> Iterator[None]:
+        """Temporarily use module-local active LoRA ranks.
+
+        Batch routing is adapter-slot based, but whether a slot has usable
+        weights is module-local: one adapter may target attention only while
+        another targets MLP only. Kernels already skip rank-0 slots, so expose
+        the module-local ranks by replacing only the rank tensors while keeping
+        the rest of the prepared batch metadata unchanged.
+        """
+        if lora_ranks is None:
+            yield
+            return
+
+        old_batch_info = getattr(self, "batch_info", None)
+        old_sgemm_batch_info = getattr(self, "sgemm_batch_info", None)
+
+        def replace_ranks(batch_info):
+            if batch_info is None:
+                return None
+            updates = {"lora_ranks": lora_ranks}
+            if hasattr(batch_info, "lora_ranks_cpu") and lora_ranks_cpu is not None:
+                updates["lora_ranks_cpu"] = lora_ranks_cpu
+            return dataclasses.replace(batch_info, **updates)
+
+        self.batch_info = replace_ranks(old_batch_info)
+        if old_sgemm_batch_info is not None:
+            self.sgemm_batch_info = replace_ranks(old_sgemm_batch_info)
+        try:
+            yield
+        finally:
+            if old_batch_info is not None:
+                self.batch_info = old_batch_info
+            if old_sgemm_batch_info is not None:
+                self.sgemm_batch_info = old_sgemm_batch_info
 
     def run_extra_token_embedding(
         self,
@@ -306,6 +348,7 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
             req_to_lora=req_to_lora,
             adapter_enabled=adapter_enabled,
             token_lora_mapping=token_lora_mapping,
+            max_len=max_len,
         )
 
         return batch_info

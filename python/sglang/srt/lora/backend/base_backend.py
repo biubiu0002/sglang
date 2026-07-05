@@ -359,6 +359,7 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         weight_indices: list[int],
         lora_ranks: list[int],
         scalings: list[float],
+        active_weight_indices: tuple[int, ...],
         use_cuda_graph: bool,
     ):
         """Prepare the lora weights and batch info for current forward batch.
@@ -371,6 +372,7 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
             weight_indices: list of indices of lora weights to be applied for current batch
             lora_ranks: list of lora ranks corresponding to weight_indices
             scalings: list of scaling factors corresponding to weight_indices
+            active_weight_indices: adapter slots for non-base requests in this batch
             use_cuda_graph: whether to use CUDA Graph for this batch
         """
         pass

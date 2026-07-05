@@ -80,6 +80,10 @@ class LoRABatchInfo:
     # MoE LoRA batch info
     moe_lora_info: Optional[MoELoRABatchInfo] = None
 
+    # CPU-side adapter slots present in this batch. This lets LoRA layers skip
+    # module-local rank-0 work without reading GPU tensors back to the host.
+    active_weight_indices: Optional[Tuple[int, ...]] = None
+
 
 class LoRAType(Enum):
     LORA_A = 0

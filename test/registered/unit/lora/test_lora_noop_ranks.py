@@ -97,6 +97,42 @@ class TestLoRANoopRanks(unittest.TestCase):
         self.assertIs(backend.batch_info.lora_ranks, original_ranks)
         self.assertIs(backend.batch_info.lora_ranks_cpu, original_ranks_cpu)
 
+    def test_module_active_check_uses_only_real_lora_slots(self):
+        class FakeLayer:
+            def has_active_lora_for_current_batch(self, batch_info=None):
+                if getattr(batch_info, "use_cuda_graph", False):
+                    return True
+                active_weight_indices = getattr(batch_info, "active_weight_indices", None)
+                if active_weight_indices is None:
+                    return True
+                return any(
+                    self.lora_ranks_cpu[idx].item() > 0
+                    for idx in active_weight_indices
+                )
+
+        @dataclass
+        class FakeBatchInfo:
+            active_weight_indices: tuple[int, ...]
+            use_cuda_graph: bool = False
+
+        layer = FakeLayer()
+        layer.lora_ranks_cpu = torch.tensor([0, 4], dtype=torch.int32)
+
+        self.assertFalse(
+            layer.has_active_lora_for_current_batch(FakeBatchInfo(tuple()))
+        )
+        self.assertFalse(
+            layer.has_active_lora_for_current_batch(FakeBatchInfo((0,)))
+        )
+        self.assertTrue(
+            layer.has_active_lora_for_current_batch(FakeBatchInfo((1,)))
+        )
+        self.assertTrue(
+            layer.has_active_lora_for_current_batch(
+                FakeBatchInfo(tuple(), use_cuda_graph=True)
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -246,6 +246,7 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         weight_indices: list[int],
         lora_ranks: list[int],
         scalings: list[float],
+        active_weight_indices: tuple[int, ...],
         use_cuda_graph: bool,
     ):
         chunk_size = self._determine_chunk_size(forward_batch)
@@ -333,6 +334,7 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         batch_info.permutation[: len(permutation)].copy_(permutation, non_blocking=True)
         batch_info.req_seg_indptr[: bs + 1].copy_(req_seg_indptr_cpu, non_blocking=True)
         batch_info.req_weight_indices[:bs].copy_(req_wi_tensor, non_blocking=True)
+        batch_info.active_weight_indices = active_weight_indices
 
         batch_info = self._add_moe_lora_info(forward_batch, batch_info)
 

@@ -67,6 +67,24 @@ class BaseLayerWithLoRA(nn.Module):
     def use_module_lora_ranks(self):
         return self.lora_backend.use_lora_ranks(self.lora_ranks, self.lora_ranks_cpu)
 
+    def has_active_lora_for_current_batch(self, batch_info=None) -> bool:
+        """Return False when this module is definitely no-op for this batch."""
+        if self.lora_ranks_cpu is None:
+            return True
+
+        if batch_info is None:
+            batch_info = getattr(self.lora_backend, "batch_info", None)
+
+        # CUDA graph capture uses empty LoRA ids but must still capture LoRA ops.
+        if getattr(batch_info, "use_cuda_graph", False):
+            return True
+
+        active_weight_indices = getattr(batch_info, "active_weight_indices", None)
+        if active_weight_indices is None:
+            return True
+
+        return any(self.lora_ranks_cpu[idx].item() > 0 for idx in active_weight_indices)
+
     def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
         pass
 
@@ -141,6 +159,8 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         Apply LoRA to base embedding output.
         Formula: output = base_output + lora_B @ lora_A_embedding(input_)
         """
+        if not self.has_active_lora_for_current_batch(batch_info):
+            return base_output
 
         with self.use_module_lora_ranks():
             # Efficient embedding lookup for LoRA A (already support extra token embedding process)
@@ -367,6 +387,9 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
                            = base_output + (hidden @ A^T) @ B^T
         """
         lm_head_batch_info = self._get_lm_head_batch_info(hidden_states.shape[0])
+        if not self.has_active_lora_for_current_batch(lm_head_batch_info):
+            return base_output
+
         if lm_head_batch_info is not None and self.lora_ranks is not None:
             import dataclasses
 
@@ -476,6 +499,9 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
         self.B_buffer = B_buffer
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        if not self.has_active_lora_for_current_batch():
+            return base_output
+
         with self.use_module_lora_ranks():
             lora_a_output = self.lora_backend.run_lora_a_sgemm(x, self.A_buffer)
             lora_output = self.lora_backend.run_lora_b_sgemm(
@@ -577,6 +603,9 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         return self.A_buffer.shape[-2] // lora_rank
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        if not self.has_active_lora_for_current_batch():
+            return base_output
+
         with self.use_module_lora_ranks():
             lora_n_slices = self._get_lora_n_slices()
             if lora_n_slices == 2 and self.use_gate_up_lora:
@@ -657,6 +686,9 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         self.B_buffer_qkv = B_buffer_qkv
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        if not self.has_active_lora_for_current_batch():
+            return base_output
+
         with self.use_module_lora_ranks():
             lora_output = self.lora_backend.run_qkv_lora(
                 x=x,
@@ -729,6 +761,9 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
         )
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        if not self.has_active_lora_for_current_batch():
+            return base_output
+
         with self.use_module_lora_ranks():
             lora_a_output = self.lora_backend.run_lora_a_sgemm(x, self.A_buffer)
             lora_output = self.lora_backend.run_lora_b_sgemm(
@@ -766,19 +801,22 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
         )
 
         if self.set_lora and should_reduce:
-            with self.use_module_lora_ranks():
-                lora_a_output = self.lora_backend.run_lora_a_sgemm(
-                    input_parallel, self.A_buffer
-                )
+            if not self.has_active_lora_for_current_batch():
                 output_ = tensor_model_parallel_all_reduce(output_parallel)
-                lora_a_output = tensor_model_parallel_all_reduce(lora_a_output)
-                output_ = self.lora_backend.run_lora_b_sgemm(
-                    x=lora_a_output,
-                    weights=self.B_buffer,
-                    output_offset=self.output_offset,
-                    output_offset_cpu=self.output_offset_cpu,
-                    base_output=output_,
-                )
+            else:
+                with self.use_module_lora_ranks():
+                    lora_a_output = self.lora_backend.run_lora_a_sgemm(
+                        input_parallel, self.A_buffer
+                    )
+                    output_ = tensor_model_parallel_all_reduce(output_parallel)
+                    lora_a_output = tensor_model_parallel_all_reduce(lora_a_output)
+                    output_ = self.lora_backend.run_lora_b_sgemm(
+                        x=lora_a_output,
+                        weights=self.B_buffer,
+                        output_offset=self.output_offset,
+                        output_offset_cpu=self.output_offset_cpu,
+                        base_output=output_,
+                    )
         else:
             if self.set_lora:
                 output_parallel = self.apply_lora(output_parallel, input_parallel)
@@ -848,6 +886,9 @@ class ReplicatedLinearWithLoRA(BaseLayerWithLoRA):
             )
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        if not self.has_active_lora_for_current_batch():
+            return base_output
+
         first_dim = self.first_output_dim
 
         if first_dim == 0:

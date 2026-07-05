@@ -232,6 +232,7 @@ class TritonLoRABackend(BaseLoRABackend):
         weight_indices: list[int],
         lora_ranks: list[int],
         scalings: list[float],
+        active_weight_indices: tuple[int, ...],
         use_cuda_graph: bool,
     ):
         # Use pinned memory to avoid synchronizations during host-to-device transfer
@@ -296,6 +297,7 @@ class TritonLoRABackend(BaseLoRABackend):
             scalings_tensor, non_blocking=True
         )
         batch_info.weight_indices[:bs].copy_(weight_indices_tensor, non_blocking=True)
+        batch_info.active_weight_indices = active_weight_indices
 
         batch_info = self._add_moe_lora_info(forward_batch, batch_info)
         self.batch_info = batch_info

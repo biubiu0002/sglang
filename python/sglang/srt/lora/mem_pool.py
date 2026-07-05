@@ -161,6 +161,7 @@ class LoRAMemoryPool:
         self.strict_loading: bool = strict_loading
         self.enable_lora_overlap_loading: bool = enable_lora_overlap_loading
         self.pin_memory_available: bool = is_pin_memory_available()
+        self._warned_partial_moe_lora_keys: Set[Tuple[str, str]] = set()
 
         # Under EP with a Triton/DeepGEMM runner, `StandardDispatcher` remaps
         # global `topk_ids` -> local expert IDs before the MoE kernel, so
@@ -206,6 +207,7 @@ class LoRAMemoryPool:
         self.new_embeddings_buffer: Dict[str, torch.Tensor] = {}
         self.module_lora_ranks: Dict[str, List[torch.Tensor]] = {}
         self.module_lora_ranks_cpu: Dict[str, List[torch.Tensor]] = {}
+        self.moe_lora_expert_maps: Dict[str, List[torch.Tensor]] = {}
         self.embedding_lora_ranks: Dict[str, torch.Tensor] = {}
         self.embedding_lora_ranks_cpu: Dict[str, torch.Tensor] = {}
 
@@ -667,6 +669,19 @@ class LoRAMemoryPool:
             ]
             for module_name in self.A_buffer
         }
+        self.moe_lora_expert_maps = {
+            module_name: [
+                torch.full(
+                    (self.max_loras_per_batch, self._num_experts_local),
+                    -1,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                for _ in range(self.num_layer)
+            ]
+            for module_name in self.A_buffer
+            if self.is_moe_module(module_name)
+        }
         self.embedding_lora_ranks = {
             module_name: torch.zeros(
                 self.max_loras_per_batch, dtype=torch.int32, device=device
@@ -684,6 +699,14 @@ class LoRAMemoryPool:
     def get_lora_ranks_cpu(self, target_module: str, layer_id: int) -> torch.Tensor:
         return self.module_lora_ranks_cpu[target_module][layer_id]
 
+    def get_moe_lora_expert_map(
+        self, target_module: str, layer_id: int
+    ) -> Optional[torch.Tensor]:
+        maps = self.moe_lora_expert_maps.get(target_module)
+        if maps is None:
+            return None
+        return maps[layer_id]
+
     def get_embedding_lora_ranks(self, target_module: str) -> torch.Tensor:
         return self.embedding_lora_ranks[target_module]
 
@@ -697,6 +720,27 @@ class LoRAMemoryPool:
             return
         self.module_lora_ranks[target_module][layer_id][buffer_id] = rank
         self.module_lora_ranks_cpu[target_module][layer_id][buffer_id] = rank
+
+    def _reset_moe_lora_expert_map(
+        self, target_module: str, layer_id: int, buffer_id: int
+    ):
+        maps = self.moe_lora_expert_maps.get(target_module)
+        if maps is not None:
+            maps[layer_id][buffer_id].fill_(-1)
+
+    def _set_moe_lora_expert_map(
+        self, target_module: str, layer_id: int, buffer_id: int, local_eids: Set[int]
+    ):
+        maps = self.moe_lora_expert_maps.get(target_module)
+        if maps is None:
+            return
+        maps[layer_id][buffer_id].fill_(-1)
+        if not local_eids:
+            return
+        expert_ids = torch.tensor(
+            sorted(local_eids), dtype=torch.long, device=maps[layer_id].device
+        )
+        maps[layer_id][buffer_id, expert_ids] = expert_ids.to(torch.int32)
 
     def _set_embedding_lora_rank(
         self, target_module: str, buffer_id: int, rank: int
@@ -717,6 +761,84 @@ class LoRAMemoryPool:
             ranks[buffer_id] = 0
         for ranks in self.embedding_lora_ranks_cpu.values():
             ranks[buffer_id] = 0
+        for maps in getattr(self, "moe_lora_expert_maps", {}).values():
+            for layer_maps in maps:
+                layer_maps[buffer_id].fill_(-1)
+
+    def _active_moe_expert_ids(
+        self,
+        a_weights: Optional[Union[torch.Tensor, Dict[int, torch.Tensor]]],
+        b_weights: Optional[Union[torch.Tensor, Dict[int, torch.Tensor]]],
+    ) -> Set[int]:
+        if a_weights is None or b_weights is None:
+            return set()
+        if isinstance(a_weights, dict) and isinstance(b_weights, dict):
+            gids = sorted(set(a_weights).intersection(b_weights))
+            return {
+                lid
+                for gid in gids
+                for lid in [self._global_to_local_expert_id(gid)]
+                if lid is not None
+            }
+        if isinstance(a_weights, torch.Tensor) and isinstance(b_weights, torch.Tensor):
+            if a_weights.dim() == 3 and b_weights.dim() == 3:
+                count = min(a_weights.shape[0], b_weights.shape[0], self._num_experts_local)
+                return set(range(count))
+        return set()
+
+    def _looks_like_exported_expert_parallel_shard(
+        self, local_eids: Set[int]
+    ) -> bool:
+        if not local_eids or len(local_eids) >= self._num_experts_local:
+            return False
+
+        tp_size = max(getattr(self, "tp_size", 1), 1)
+        if tp_size <= 1:
+            return False
+        if self._num_experts_local % tp_size != 0:
+            return False
+        if len(local_eids) != self._num_experts_local // tp_size:
+            return False
+
+        ids = sorted(local_eids)
+        residue = ids[0] % tp_size
+        return ids == list(range(residue, self._num_experts_local, tp_size))
+
+    def _should_disable_partial_moe_lora(
+        self,
+        uid: str,
+        target_module: str,
+        layer_id: int,
+        local_eids: Set[int],
+    ) -> bool:
+        if not self._looks_like_exported_expert_parallel_shard(local_eids):
+            return False
+
+        msg = (
+            f"LoRA adapter '{uid}' has only {len(local_eids)}/"
+            f"{self._num_experts_local} TP-strided routed MoE experts for "
+            f"module '{target_module}' at layer {layer_id}. This looks like "
+            f"one expert-parallel training shard was loaded as a complete "
+            f"PEFT adapter."
+        )
+        if self.strict_loading:
+            raise ValueError(
+                f"{msg} Re-convert all mp_rank_* adapter shards into one "
+                f"complete PEFT adapter, or disable strict loading."
+            )
+
+        warned = getattr(self, "_warned_partial_moe_lora_keys", set())
+        key = (uid, target_module)
+        if key not in warned:
+            logger.warning(
+                "%s Disabling this routed-MoE LoRA branch to avoid applying "
+                "partial expert deltas in the MoE kernel. Re-convert all "
+                "mp_rank_* adapter shards for full LoRA quality.",
+                msg,
+            )
+            warned.add(key)
+            self._warned_partial_moe_lora_keys = warned
+        return True
 
     @staticmethod
     def _has_nonzero_weight(
@@ -1075,13 +1197,32 @@ class LoRAMemoryPool:
             for name, weights in temp_A_buffer.items():
                 if name not in active_target_modules:
                     continue
+                disable_partial_moe_lora = False
+                if name in ["gate_up_proj_moe", "down_proj_moe"]:
+                    active_experts = self._active_moe_expert_ids(
+                        temp_A_buffer[name], temp_B_buffer[name]
+                    )
+                    disable_partial_moe_lora = self._should_disable_partial_moe_lora(
+                        uid, name, layer_id, active_experts
+                    )
+                    if disable_partial_moe_lora:
+                        active_experts = set()
+                    self._set_moe_lora_expert_map(
+                        name, layer_id, buffer_id, active_experts
+                    )
+                else:
+                    self._reset_moe_lora_expert_map(name, layer_id, buffer_id)
                 self._set_lora_rank(
                     name,
                     layer_id,
                     buffer_id,
                     (
                         lora_rank
-                        if self._has_active_weight_pair(
+                        if not (
+                            name in ["gate_up_proj_moe", "down_proj_moe"]
+                            and disable_partial_moe_lora
+                        )
+                        and self._has_active_weight_pair(
                             lora_adapter, temp_A_buffer[name], temp_B_buffer[name]
                         )
                         else 0

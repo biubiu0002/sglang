@@ -976,6 +976,8 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         )
         self.gate_up_lora_ranks: Optional[torch.Tensor] = None
         self.down_lora_ranks: Optional[torch.Tensor] = None
+        self.gate_up_expert_map: Optional[torch.Tensor] = None
+        self.down_expert_map: Optional[torch.Tensor] = None
 
         # Initialize triton_lora moe runner for batches with lora enabled
         from sglang.srt.layers.moe import MoeRunnerBackend
@@ -1053,6 +1055,14 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self.gate_up_lora_ranks = gate_up_lora_ranks
         self.down_lora_ranks = down_lora_ranks
 
+    def set_moe_lora_expert_maps(
+        self,
+        gate_up_expert_map: Optional[torch.Tensor],
+        down_expert_map: Optional[torch.Tensor],
+    ):
+        self.gate_up_expert_map = gate_up_expert_map
+        self.down_expert_map = down_expert_map
+
     def _get_moe_lora_ranks(self) -> Optional[torch.Tensor]:
         if self.gate_up_lora_ranks is None:
             return self.down_lora_ranks
@@ -1096,16 +1106,14 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                 max_len=moe_lora_info.max_len,
             )
 
-        if self._lora_runner_backend.is_experimental_sgl_trtllm():
-            # Per-rank (local) expert count the LoRA buffers are indexed by, so
-            # virtual-experts indexing matches the buffers under EP.
-            num_experts = (
-                self.down_lora_a_weights.shape[1]
-                if self.down_lora_a_weights is not None
-                else self.base_layer.num_local_experts
-            )
-        else:
-            num_experts = self.base_layer.num_experts
+        # LoRA alignment indexes LoRA weight buffers, not the base fused MoE
+        # layer. Some models expose an extra shared-expert id in topk_ids while
+        # routed LoRA buffers only contain the real routed expert slots.
+        num_experts = (
+            self.down_lora_a_weights.shape[1]
+            if self.down_lora_a_weights is not None
+            else self.base_layer.num_local_experts
+        )
 
         return LoRAInfo(
             gate_up_lora_a_weights=self.gate_up_lora_a_weights,
@@ -1119,6 +1127,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             token_lora_mapping=moe_lora_info.token_lora_mapping,
             max_lora_rank=max_lora_rank,
             num_experts=num_experts,
+            max_len=moe_lora_info.max_len,
             has_active_lora=has_active_lora,
             experts_shared_outer_loras=self.experts_shared_outer_loras,
             cg_buffers=cg_buffers,
@@ -1126,6 +1135,10 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             tp_rank=self.tp_rank,
             hidden_size=getattr(self.base_layer, "hidden_size", 0),
             lora_use_virtual_experts=self.lora_use_virtual_experts,
+            gate_up_lora_ranks=self.gate_up_lora_ranks,
+            down_lora_ranks=self.down_lora_ranks,
+            gate_up_expert_map=self.gate_up_expert_map,
+            down_expert_map=self.down_expert_map,
         )
 
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput, **kwargs):

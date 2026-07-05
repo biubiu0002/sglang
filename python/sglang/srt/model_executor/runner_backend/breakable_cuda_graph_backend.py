@@ -18,6 +18,7 @@ No torch.compile.
 
 from __future__ import annotations
 
+import dataclasses
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
@@ -26,6 +27,7 @@ import torch
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
@@ -143,6 +145,13 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
     def _slice_output(self, output: Any, num_tokens: int) -> Any:
         if output is None:
             return None
+        if isinstance(output, LogitsProcessorOutput):
+            updates = {}
+            for field in dataclasses.fields(output):
+                value = getattr(output, field.name, None)
+                if torch.is_tensor(value):
+                    updates[field.name] = value[:num_tokens]
+            return dataclasses.replace(output, **updates)
         if torch.is_tensor(output):
             return output[:num_tokens]
         if isinstance(output, PPProxyTensors):
@@ -165,6 +174,15 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             )
         if torch.is_tensor(output) and torch.is_tensor(output_buffer):
             output_buffer[:num_tokens].copy_(output[:num_tokens])
+            return
+        if isinstance(output, LogitsProcessorOutput) and isinstance(
+            output_buffer, LogitsProcessorOutput
+        ):
+            for field in dataclasses.fields(output):
+                src = getattr(output, field.name, None)
+                dst = getattr(output_buffer, field.name, None)
+                if torch.is_tensor(src) and torch.is_tensor(dst):
+                    dst[:num_tokens].copy_(src[:num_tokens])
             return
         if isinstance(output, PPProxyTensors) and isinstance(
             output_buffer, PPProxyTensors

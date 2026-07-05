@@ -16,11 +16,13 @@ from sglang.jit_kernel.moe_align import moe_align_block_size as jit_moe_align_bl
 def _fused_virtual_topk_ids_kernel(
     topk_ids_ptr,
     token_lora_mapping_ptr,
+    expert_map_ptr,
     virtual_topk_ids_ptr,
     token_lora_mask_ptr,
     num_experts_for_weight: tl.constexpr,
     M,
     top_k: tl.constexpr,
+    has_expert_map: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     """
@@ -48,12 +50,21 @@ def _fused_virtual_topk_ids_kernel(
     safe_lora = tl.maximum(lora_id, 0)
 
     base = tl.load(topk_ids_ptr + offs, mask=valid, other=0)
+    mapped = base
+    if has_expert_map:
+        map_offset = safe_lora * num_experts_for_weight + base
+        mapped = tl.load(
+            expert_map_ptr + map_offset,
+            mask=valid & (base >= 0) & (base < num_experts_for_weight),
+            other=-1,
+        )
+
     # Preserve negative sentinel topk_ids (e.g. -1 for non-local experts after
     # EP dispatch). Without this, `-1 + safe_lora * num_experts` would land on
     # a real virtual-expert slot belonging to another adapter and trigger OOB
     # loads in downstream LoRA kernels.
-    shifted = base + safe_lora * num_experts_for_weight
-    result = tl.where(base < 0, base, shifted)
+    shifted = mapped + safe_lora * num_experts_for_weight
+    result = tl.where((base < 0) | (mapped < 0), -1, shifted)
     tl.store(virtual_topk_ids_ptr + offs, result, mask=valid)
 
     # Write mask once per row (at first k position)
@@ -68,6 +79,7 @@ def _fused_virtual_topk_ids(
     num_experts: int,
     shared_outer: bool,
     max_loras: int,
+    expert_map: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
     """
     Returns virtual topk_ids, token_lora_mask, and virtual_num_experts.
@@ -80,6 +92,7 @@ def _fused_virtual_topk_ids(
         # For shared_outer, we need topk_ids to be zeros
         zero_topk = torch.zeros_like(topk_ids)
         input_topk = zero_topk
+        expert_map = None
     else:
         num_experts_for_weight = num_experts
         input_topk = topk_ids
@@ -90,14 +103,18 @@ def _fused_virtual_topk_ids(
     BLOCK_SIZE = 1024
     grid = ((M * top_k + BLOCK_SIZE - 1) // BLOCK_SIZE,)
 
+    expert_map_arg = expert_map if expert_map is not None else token_lora_mapping
+
     _fused_virtual_topk_ids_kernel[grid](
         input_topk,
         token_lora_mapping,
+        expert_map_arg,
         virtual_topk_ids,
         token_lora_mask,
         num_experts_for_weight,
         M,
         top_k,
+        expert_map is not None,
         BLOCK_SIZE,
     )
 
@@ -507,6 +524,8 @@ def _merged_experts_fused_moe_lora_add_fake(
     mul_routed_weight: bool,
     experts_shared_outer_loras_a: bool,
     experts_shared_outer_loras_b: bool,
+    expert_map_a: torch.Tensor | None = None,
+    expert_map_b: torch.Tensor | None = None,
 ) -> None:
     return
 
@@ -523,6 +542,8 @@ def _merged_experts_fused_moe_lora_add_impl(
     experts_shared_outer_loras_a: bool,
     experts_shared_outer_loras_b: bool,
     routing_cache: dict | None = None,
+    expert_map_a: torch.Tensor | None = None,
+    expert_map_b: torch.Tensor | None = None,
 ) -> None:
     """
     1. Prepare virtual expert routing metadata from topk_ids + token_lora_mapping * num_experts.
@@ -596,9 +617,15 @@ def _merged_experts_fused_moe_lora_add_impl(
         num_experts: int,
         shared_outer: bool,
         block_size: int,
+        expert_map: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # Check routing_cache for cross-call reuse (gate_up and down share routing)
-        cache_key = (num_experts, shared_outer, block_size)
+        cache_key = (
+            num_experts,
+            shared_outer,
+            block_size,
+            expert_map.data_ptr() if expert_map is not None else 0,
+        )
         if routing_cache is not None:
             cached = routing_cache.get(cache_key)
             if cached is not None:
@@ -606,7 +633,12 @@ def _merged_experts_fused_moe_lora_add_impl(
 
         virtual_topk_ids, token_lora_mask, virtual_num_experts = (
             _fused_virtual_topk_ids(
-                topk_ids, token_lora_mapping, num_experts, shared_outer, max_loras
+                topk_ids,
+                token_lora_mapping,
+                num_experts,
+                shared_outer,
+                max_loras,
+                expert_map,
             )
         )
         sorted_token_ids, expert_ids, num_tokens_post_padded = _align_block_size(
@@ -664,6 +696,7 @@ def _merged_experts_fused_moe_lora_add_impl(
         num_experts_a,
         experts_shared_outer_loras_a,
         a_stage_config["BLOCK_SIZE_M"],
+        expert_map_a,
     )
 
     _invoke_moe_lora_shrink_splitk(
@@ -690,6 +723,7 @@ def _merged_experts_fused_moe_lora_add_impl(
         num_experts_b,
         experts_shared_outer_loras_b,
         b_stage_config["BLOCK_SIZE_M"],
+        expert_map_b,
     )
 
     invoke_fused_moe_kernel(
@@ -732,6 +766,8 @@ def _merged_experts_fused_moe_lora_add_op(
     mul_routed_weight: bool,
     experts_shared_outer_loras_a: bool,
     experts_shared_outer_loras_b: bool,
+    expert_map_a: torch.Tensor | None = None,
+    expert_map_b: torch.Tensor | None = None,
 ) -> None:
     _merged_experts_fused_moe_lora_add_impl(
         output,
@@ -744,6 +780,8 @@ def _merged_experts_fused_moe_lora_add_op(
         mul_routed_weight,
         experts_shared_outer_loras_a,
         experts_shared_outer_loras_b,
+        expert_map_a=expert_map_a,
+        expert_map_b=expert_map_b,
     )
 
 
@@ -769,6 +807,8 @@ def merged_experts_fused_moe_lora_add(
     experts_shared_outer_loras_a: bool,
     experts_shared_outer_loras_b: bool,
     routing_cache: dict | None = None,
+    expert_map_a: torch.Tensor | None = None,
+    expert_map_b: torch.Tensor | None = None,
 ) -> None:
     """Public API: wraps the registered op with routing_cache support."""
     _merged_experts_fused_moe_lora_add_impl(
@@ -783,4 +823,6 @@ def merged_experts_fused_moe_lora_add(
         experts_shared_outer_loras_a,
         experts_shared_outer_loras_b,
         routing_cache,
+        expert_map_a=expert_map_a,
+        expert_map_b=expert_map_b,
     )

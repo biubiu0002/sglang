@@ -861,16 +861,24 @@ class Indexer(MultiPlatformOp):
             return
         dst.copy_(src)
 
-    def _get_topk_paged(
+    def _get_topk_paged_impl(
         self,
         forward_batch: ForwardBatch,
         layer_id: int,
         q_fp8: torch.Tensor,
         weights: torch.Tensor,
-        metadata: BaseIndexerMetadata,
+        metadata: Optional[BaseIndexerMetadata],
     ) -> torch.Tensor:
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
+
+        if metadata is None:
+            metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
+            if metadata is None:
+                raise RuntimeError(
+                    "DSA paged top-k requires indexer metadata under CUDA graph "
+                    f"replay for layer {layer_id}."
+                )
 
         page_size = get_token_to_kv_pool().page_size
         # NOTE(dark): blocksize = 64 is hardcoded in deep_gemm
@@ -1021,6 +1029,8 @@ class Indexer(MultiPlatformOp):
             )
             topk_result = torch.cat([topk_result, padding], dim=0)
         return topk_result
+
+    _get_topk_paged = eager_on_graph(True)(_get_topk_paged_impl)
 
     def _get_mqa_logits_budget_bytes(self, device_index: int) -> int:
         free_mem_fraction = self._mqa_logits_free_mem_fraction()

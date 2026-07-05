@@ -1,8 +1,11 @@
 import unittest
 import importlib.util
+import sys
+import types
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 
@@ -25,6 +28,36 @@ _spec = importlib.util.spec_from_file_location("lora_ops_under_test", _LORA_OPS_
 _lora_ops = importlib.util.module_from_spec(_spec)
 assert _spec.loader is not None
 _spec.loader.exec_module(_lora_ops)
+
+_LORA_MOE_RUNNERS_PATH = (
+    Path(__file__).parents[4]
+    / "python"
+    / "sglang"
+    / "srt"
+    / "lora"
+    / "lora_moe_runners.py"
+)
+_moe_spec = importlib.util.spec_from_file_location(
+    "lora_moe_runners_under_test", _LORA_MOE_RUNNERS_PATH
+)
+_lora_moe_runners = importlib.util.module_from_spec(_moe_spec)
+assert _moe_spec.loader is not None
+sys.modules[_moe_spec.name] = _lora_moe_runners
+_runner_stub = types.ModuleType("sglang.srt.model_executor.runner")
+_runner_stub.get_is_capture_mode = lambda: False
+_utils_stub = types.ModuleType("sglang.srt.utils")
+_utils_stub.is_cuda = lambda: False
+_utils_stub.is_hip = lambda: False
+_utils_stub.is_xpu = lambda: False
+_utils_stub.next_power_of_2 = lambda x: 1 << (x - 1).bit_length()
+with patch.dict(
+    sys.modules,
+    {
+        "sglang.srt.model_executor.runner": _runner_stub,
+        "sglang.srt.utils": _utils_stub,
+    },
+):
+    _moe_spec.loader.exec_module(_lora_moe_runners)
 
 
 class TestLoRANoopRanks(unittest.TestCase):
@@ -132,6 +165,48 @@ class TestLoRANoopRanks(unittest.TestCase):
                 FakeBatchInfo(tuple(), use_cuda_graph=True)
             )
         )
+
+    def test_moe_lora_naive_alignment_filters_invalid_expert_ids(self):
+        sorted_token_ids, expert_ids, num_tokens_post_padded = (
+            _lora_moe_runners._naive_moe_lora_align_block_size(
+                topk_ids=torch.tensor([[0, 1, 2, 3, -1]], dtype=torch.int32),
+                seg_indptr=torch.tensor([0, 1], dtype=torch.int32),
+                req_to_lora=torch.tensor([0], dtype=torch.int32),
+                num_experts=2,
+                block_size_m=2,
+                max_loras=1,
+                max_num_tokens_padded=8,
+                max_num_m_blocks=4,
+                adapter_enabled=torch.tensor([1], dtype=torch.int32),
+                expert_map=None,
+                device=torch.device("cpu"),
+            )
+        )
+
+        self.assertEqual(num_tokens_post_padded.tolist(), [4])
+        self.assertEqual(sorted_token_ids[:4].tolist(), [0, 5, 1, 5])
+        self.assertEqual(expert_ids.tolist(), [0, 1, -1, -1])
+
+    def test_moe_lora_naive_alignment_filters_missing_adapter_experts(self):
+        sorted_token_ids, expert_ids, num_tokens_post_padded = (
+            _lora_moe_runners._naive_moe_lora_align_block_size(
+                topk_ids=torch.tensor([[0, 1, 2, 3]], dtype=torch.int32),
+                seg_indptr=torch.tensor([0, 1], dtype=torch.int32),
+                req_to_lora=torch.tensor([0], dtype=torch.int32),
+                num_experts=4,
+                block_size_m=2,
+                max_loras=1,
+                max_num_tokens_padded=8,
+                max_num_m_blocks=4,
+                adapter_enabled=torch.tensor([1], dtype=torch.int32),
+                expert_map=torch.tensor([[-1, 1, -1, 3]], dtype=torch.int32),
+                device=torch.device("cpu"),
+            )
+        )
+
+        self.assertEqual(num_tokens_post_padded.tolist(), [4])
+        self.assertEqual(sorted_token_ids[:4].tolist(), [1, 4, 3, 4])
+        self.assertEqual(expert_ids.tolist(), [1, 3, -1, -1])
 
 
 if __name__ == "__main__":

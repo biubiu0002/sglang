@@ -54,6 +54,10 @@ def _make_pool(
     # defaults so accidental reads don't AttributeError.
     pool.moe_tp_size = 1
     pool.moe_tp_rank = 0
+    pool.tp_size = 1
+    pool.tp_rank = 0
+    pool.strict_loading = False
+    pool._warned_partial_moe_lora_keys = set()
     if moe_use_local_expert_ids and num_experts_global % moe_ep_size == 0:
         pool._num_experts_local = num_experts_global // moe_ep_size
     else:
@@ -204,6 +208,137 @@ class TestIterLocalExpertWeightsDict(unittest.TestCase):
         self.assertEqual(
             got, {0: [0.0, 0.0], 1: [1.0, 1.0], 2: [2.0, 2.0], 3: [3.0, 3.0]}
         )
+
+    def test_tp_strided_sparse_export_remains_sparse(self):
+        pool = _make_pool(
+            num_experts_global=8,
+            moe_ep_size=1,
+            moe_ep_rank=0,
+            moe_use_local_expert_ids=False,
+        )
+        pool.moe_tp_size = 2
+        weights = {gid: torch.full((2,), float(gid)) for gid in (0, 2, 4, 6)}
+        cache_keys = {gid: f"expert.{gid}" for gid in weights}
+
+        got = [
+            (lid, w.tolist(), cache_key)
+            for lid, w, cache_key in pool._iter_local_expert_weights(
+                weights, cache_keys
+            )
+        ]
+
+        self.assertEqual([lid for lid, _, _ in got], [0, 2, 4, 6])
+        self.assertEqual(
+            [w for _, w, _ in got],
+            [
+                [0.0, 0.0],
+                [2.0, 2.0],
+                [4.0, 4.0],
+                [6.0, 6.0],
+            ],
+        )
+        self.assertEqual(
+            [cache_key for _, _, cache_key in got],
+            [
+                "expert.0",
+                "expert.2",
+                "expert.4",
+                "expert.6",
+            ],
+        )
+
+    def test_active_moe_expert_ids_uses_a_b_intersection(self):
+        pool = _make_pool(
+            num_experts_global=8,
+            moe_ep_size=1,
+            moe_ep_rank=0,
+            moe_use_local_expert_ids=False,
+        )
+        a_weights = {0: torch.ones(2), 2: torch.ones(2), 6: torch.ones(2)}
+        b_weights = {2: torch.ones(2), 4: torch.ones(2), 6: torch.ones(2)}
+
+        self.assertEqual(pool._active_moe_expert_ids(a_weights, b_weights), {2, 6})
+
+    def test_tp_strided_partial_experts_are_detected_as_export_shard(self):
+        pool = _make_pool(
+            num_experts_global=8,
+            moe_ep_size=1,
+            moe_ep_rank=0,
+            moe_use_local_expert_ids=False,
+        )
+        pool.tp_size = 2
+
+        self.assertTrue(pool._looks_like_exported_expert_parallel_shard({0, 2, 4, 6}))
+        self.assertTrue(pool._looks_like_exported_expert_parallel_shard({1, 3, 5, 7}))
+        self.assertFalse(pool._looks_like_exported_expert_parallel_shard({0, 4}))
+        self.assertFalse(pool._looks_like_exported_expert_parallel_shard({0, 1, 2, 3}))
+        self.assertFalse(pool._looks_like_exported_expert_parallel_shard(set(range(8))))
+
+    def test_partial_export_shard_disables_moe_lora_without_strict_loading(self):
+        pool = _make_pool(
+            num_experts_global=8,
+            moe_ep_size=1,
+            moe_ep_rank=0,
+            moe_use_local_expert_ids=False,
+        )
+        pool.tp_size = 2
+
+        self.assertTrue(
+            pool._should_disable_partial_moe_lora(
+                "adapter", "gate_up_proj_moe", 0, {0, 2, 4, 6}
+            )
+        )
+
+    def test_partial_export_shard_raises_with_strict_loading(self):
+        pool = _make_pool(
+            num_experts_global=8,
+            moe_ep_size=1,
+            moe_ep_rank=0,
+            moe_use_local_expert_ids=False,
+        )
+        pool.tp_size = 2
+        pool.strict_loading = True
+
+        with self.assertRaisesRegex(ValueError, "one expert-parallel training shard"):
+            pool._should_disable_partial_moe_lora(
+                "adapter", "down_proj_moe", 0, {0, 2, 4, 6}
+            )
+
+    def test_sparse_dict_without_full_tp_stride_remains_sparse(self):
+        pool = _make_pool(
+            num_experts_global=8,
+            moe_ep_size=1,
+            moe_ep_rank=0,
+            moe_use_local_expert_ids=False,
+        )
+        pool.moe_tp_size = 2
+        weights = {0: torch.full((2,), 0.0), 4: torch.full((2,), 4.0)}
+        cache_keys = {gid: f"expert.{gid}" for gid in weights}
+
+        got = {
+            lid: w.tolist()
+            for lid, w, _ in pool._iter_local_expert_weights(weights, cache_keys)
+        }
+
+        self.assertEqual(got, {0: [0.0, 0.0], 4: [4.0, 4.0]})
+
+    def test_ep_local_id_mapping_does_not_expand_tp_strided_exports(self):
+        pool = _make_pool(
+            num_experts_global=8,
+            moe_ep_size=2,
+            moe_ep_rank=0,
+            moe_use_local_expert_ids=True,
+        )
+        pool.moe_tp_size = 2
+        weights = {gid: torch.full((2,), float(gid)) for gid in (0, 2, 4, 6)}
+        cache_keys = {gid: f"expert.{gid}" for gid in weights}
+
+        got = {
+            lid: w.tolist()
+            for lid, w, _ in pool._iter_local_expert_weights(weights, cache_keys)
+        }
+
+        self.assertEqual(got, {0: [0.0, 0.0], 2: [2.0, 2.0]})
 
     def test_rank0_of_ep4_filters_and_remaps(self):
         pool = _make_pool(
@@ -703,6 +838,10 @@ class TestLoadBufferPassesMoeTpRankToSlice(unittest.TestCase):
         pool.lm_head_A_buffer = {}
         pool.lm_head_B_buffer = {}
         pool.new_embeddings_buffer = {}
+        pool.module_lora_ranks = {}
+        pool.module_lora_ranks_cpu = {}
+        pool.embedding_lora_ranks = {}
+        pool.embedding_lora_ranks_cpu = {}
 
         captured_ranks = []
 

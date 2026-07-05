@@ -24,7 +24,7 @@ without needing a per-backend LoRA runner subclass.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable
 
 import torch
@@ -73,6 +73,7 @@ def _naive_moe_lora_align_block_size(
     max_num_tokens_padded: int,
     max_num_m_blocks: int,
     adapter_enabled: torch.Tensor,
+    expert_map: torch.Tensor | None,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Construct LoRA token-expert alignment on CPU for small batches.
@@ -97,6 +98,7 @@ def _naive_moe_lora_align_block_size(
     req_to_lora_list = req_to_lora.cpu().tolist()
     topk_ids_list = topk_ids.cpu().tolist()
     adapter_enabled_list = adapter_enabled.cpu().tolist()
+    expert_map_list = expert_map.cpu().tolist() if expert_map is not None else None
 
     for lora_id in range(max_loras):
         if not adapter_enabled_list[lora_id]:
@@ -110,7 +112,14 @@ def _naive_moe_lora_align_block_size(
             end = seg_indptr_list[seg_idx + 1]
             for m in range(start, end):
                 for k in range(top_k):
-                    pairs.append((topk_ids_list[m][k], m * top_k + k))
+                    expert_id = topk_ids_list[m][k]
+                    if expert_id < 0 or expert_id >= num_experts:
+                        continue
+                    if expert_map_list is not None:
+                        expert_id = expert_map_list[lora_id][expert_id]
+                        if expert_id < 0 or expert_id >= num_experts:
+                            continue
+                    pairs.append((expert_id, m * top_k + k))
 
         if not pairs:
             continue
@@ -180,6 +189,7 @@ class LoRAInfo:
     max_lora_rank: int  # Maximum LoRA rank across all adapters
 
     num_experts: int
+    max_len: int = 1
     has_active_lora: bool = True
     experts_shared_outer_loras: bool = False
     cg_buffers: dict | None = None
@@ -189,6 +199,15 @@ class LoRAInfo:
     tp_rank: int = 0
     hidden_size: int = 0
     lora_use_virtual_experts: bool = False
+    expert_map: torch.Tensor | None = None
+
+    # Module-local MoE LoRA metadata. A single FusedMoE layer can have gate/up
+    # weights for a different expert subset than down weights, so each hook
+    # computes routing with its own rank vector and expert map.
+    gate_up_lora_ranks: torch.Tensor | None = None
+    down_lora_ranks: torch.Tensor | None = None
+    gate_up_expert_map: torch.Tensor | None = None
+    down_expert_map: torch.Tensor | None = None
 
 
 @dataclass
@@ -245,6 +264,7 @@ def _compute_lora_alignment(
                 int(max_num_tokens_padded),
                 int(max_num_m_blocks),
                 lora_info.adapter_enabled,
+                lora_info.expert_map,
                 device,
             )
         )
@@ -290,6 +310,7 @@ def _compute_lora_alignment(
             num_tokens_post_padded_lora,
             lora_info.adapter_enabled,
             lora_ids,
+            lora_info.expert_map,
             cumsum_buffer=cg.get("cumsum_buffer") if cg is not None else None,
             token_mask=cg.get("token_mask") if cg is not None else None,
         )
@@ -361,6 +382,8 @@ def _add_lora_gate_up_delta(
             experts_shared_outer_loras_a=lora_info.experts_shared_outer_loras,
             experts_shared_outer_loras_b=False,
             routing_cache=routing_cache,
+            expert_map_a=lora_info.gate_up_expert_map,
+            expert_map_b=lora_info.gate_up_expert_map,
         )
     else:
         blk = _get_moe_lora_block_config(r)
@@ -443,6 +466,8 @@ def _add_lora_down_delta(
             experts_shared_outer_loras_a=False,
             experts_shared_outer_loras_b=lora_info.experts_shared_outer_loras,
             routing_cache=routing_cache,
+            expert_map_a=lora_info.down_expert_map,
+            expert_map_b=lora_info.down_expert_map,
         )
     else:
         blk = _get_moe_lora_block_config(lora_info.max_lora_rank)
@@ -497,25 +522,50 @@ def build_lora_hooks(
     if not get_is_capture_mode() and not lora_info.has_active_lora:
         return LoRAHooks()
 
-    # Compute alignment / mapping (once, shared by both hooks)
-    token_lora_mapping: torch.Tensor | None = None
-    sorted_token_ids_reshaped: torch.Tensor | None = None
-    expert_ids_reshaped: torch.Tensor | None = None
-    num_tokens_post_padded_lora: torch.Tensor | None = None
-    lora_ids: torch.Tensor | None = None
-
-    if lora_info.lora_use_virtual_experts:
-        token_lora_mapping = lora_info.token_lora_mapping
-    else:
-        (
-            sorted_token_ids_reshaped,
-            expert_ids_reshaped,
-            num_tokens_post_padded_lora,
-            lora_ids,
-        ) = _compute_lora_alignment(topk_ids, lora_info)
-
     # Shared routing cache: gate_up and down reuse routing for same (num_experts, shared_outer, block_size)
     routing_cache: dict = {}
+
+    def module_lora_info(
+        ranks: torch.Tensor | None, expert_map: torch.Tensor | None
+    ) -> LoRAInfo:
+        if ranks is None:
+            ranks = lora_info.lora_ranks
+
+        cg = lora_info.cg_buffers if get_is_capture_mode() else None
+        adapter_enabled = (
+            cg["adapter_enabled"]
+            if cg is not None and "adapter_enabled" in cg
+            else torch.empty_like(lora_info.adapter_enabled)
+        )
+        token_lora_mapping = (
+            cg["token_lora_mapping"]
+            if cg is not None and "token_lora_mapping" in cg
+            else torch.empty_like(lora_info.token_lora_mapping)
+        )
+
+        from sglang.srt.lora.backend.base_backend import _compute_moe_lora_info
+
+        adapter_enabled, token_lora_mapping = _compute_moe_lora_info(
+            lora_info.token_lora_mapping.shape[0],
+            lora_info.seg_indptr,
+            ranks,
+            lora_info.req_to_lora,
+            adapter_enabled,
+            token_lora_mapping,
+            max_len=lora_info.max_len,
+        )
+        return replace(
+            lora_info,
+            lora_ranks=ranks,
+            adapter_enabled=adapter_enabled,
+            token_lora_mapping=token_lora_mapping,
+            expert_map=expert_map,
+        )
+
+    def compute_non_virtual_routing(
+        info: LoRAInfo,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return _compute_lora_alignment(topk_ids, info)
 
     def after_gate_up(
         hidden_states: torch.Tensor,
@@ -523,12 +573,29 @@ def build_lora_hooks(
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> None:
+        info = module_lora_info(
+            lora_info.gate_up_lora_ranks, lora_info.gate_up_expert_map
+        )
+        token_lora_mapping: torch.Tensor | None = None
+        sorted_token_ids_reshaped: torch.Tensor | None = None
+        expert_ids_reshaped: torch.Tensor | None = None
+        num_tokens_post_padded_lora: torch.Tensor | None = None
+        lora_ids: torch.Tensor | None = None
+        if info.lora_use_virtual_experts:
+            token_lora_mapping = info.token_lora_mapping
+        else:
+            (
+                sorted_token_ids_reshaped,
+                expert_ids_reshaped,
+                num_tokens_post_padded_lora,
+                lora_ids,
+            ) = compute_non_virtual_routing(info)
         _add_lora_gate_up_delta(
             hidden_states,
             intermediate_cache1,
             topk_weights,
             topk_ids,
-            lora_info,
+            info,
             token_lora_mapping,
             sorted_token_ids_reshaped,
             expert_ids_reshaped,
@@ -543,12 +610,27 @@ def build_lora_hooks(
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> None:
+        info = module_lora_info(lora_info.down_lora_ranks, lora_info.down_expert_map)
+        token_lora_mapping: torch.Tensor | None = None
+        sorted_token_ids_reshaped: torch.Tensor | None = None
+        expert_ids_reshaped: torch.Tensor | None = None
+        num_tokens_post_padded_lora: torch.Tensor | None = None
+        lora_ids: torch.Tensor | None = None
+        if info.lora_use_virtual_experts:
+            token_lora_mapping = info.token_lora_mapping
+        else:
+            (
+                sorted_token_ids_reshaped,
+                expert_ids_reshaped,
+                num_tokens_post_padded_lora,
+                lora_ids,
+            ) = compute_non_virtual_routing(info)
         _add_lora_down_delta(
             intermediate_input,
             intermediate_cache3,
             topk_weights,
             topk_ids,
-            lora_info,
+            info,
             token_lora_mapping,
             sorted_token_ids_reshaped,
             expert_ids_reshaped,

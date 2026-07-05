@@ -127,7 +127,7 @@ def _fused_moe_lora_kernel(
     # get the expert_id to process curr shard
     ind = lora_id * stride_el + pid_m
     expert_id = tl.load(expert_ids_ptr + ind, ind < max_loras * stride_el, -1)
-    if expert_id == -1:
+    if expert_id < 0 or expert_id >= num_experts:
         return
 
     # get a_ptr,b_ptr,c_ptr

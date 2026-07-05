@@ -46,6 +46,7 @@ SGL_DEVICE void _moe_align_block_size(
   int sorted_token_ids_offset = max_num_tokens_padded * model_offset;
   int expert_ids_offset = max_num_m_blocks * model_offset;
   int cumsum_offset = (num_experts + 1) * model_offset;
+  int expert_map_offset = num_experts * model_offset;
 
   // Use separate threadblocks to fill sorted_token_ids.
   // This is safe since the current kernel does not use sorted_token_ids.
@@ -77,7 +78,7 @@ SGL_DEVICE void _moe_align_block_size(
       continue;
     }
     if (has_expert_map) {
-      expert_id = expert_map[expert_id];
+      expert_id = expert_map[expert_map_offset + expert_id];
       if (expert_id < 0 || expert_id >= num_experts) continue;
     }
     int warp_idx = expert_id / experts_per_warp;
@@ -147,6 +148,7 @@ SGL_DEVICE void _moe_align_block_size_small_batch_expert(
   // using Multi LoRA.
   int sorted_token_ids_offset = max_num_tokens_padded * model_offset;
   int expert_ids_offset = max_num_m_blocks * model_offset;
+  int expert_map_offset = num_experts * model_offset;
 
   // Use an additional group of threads to fill sorted_token_ids.
   // Since the current kernel will use sorted_token_ids afterward,
@@ -179,7 +181,7 @@ SGL_DEVICE void _moe_align_block_size_small_batch_expert(
     int32_t expert_id = topk_ids[i];
     if (expert_id < 0 || expert_id >= num_experts) continue;
     if (has_expert_map) {
-      expert_id = expert_map[expert_id];
+      expert_id = expert_map[expert_map_offset + expert_id];
       if (expert_id < 0 || expert_id >= num_experts) continue;
     }
     int mask = token_mask == nullptr ? 1 : token_mask[i / topk_num];
@@ -223,7 +225,7 @@ SGL_DEVICE void _moe_align_block_size_small_batch_expert(
     int32_t expert_id = topk_ids[i];
     if (expert_id < 0 || expert_id >= num_experts) continue;
     if (has_expert_map) {
-      expert_id = expert_map[expert_id];
+      expert_id = expert_map[expert_map_offset + expert_id];
       if (expert_id < 0 || expert_id >= num_experts) continue;
     }
     int32_t rank_post_pad = tokens_cnts[tid * num_experts + expert_id] + cumsum[expert_id];
@@ -248,6 +250,7 @@ SGL_DEVICE void _count_and_sort_expert_tokens(
     int32_t model_offset,
     int32_t topk_num,
     bool has_expert_map) {
+  int expert_map_offset = num_experts * model_offset;
   const size_t tid = blockIdx.y * blockDim.x + threadIdx.x;
   const size_t stride = blockDim.x * gridDim.y;
 
@@ -260,7 +263,7 @@ SGL_DEVICE void _count_and_sort_expert_tokens(
     }
 
     if (has_expert_map) {
-      expert_id = expert_map[expert_id];
+      expert_id = expert_map[expert_map_offset + expert_id];
       // filter invalid experts
       if (expert_id == -1) continue;
     }

@@ -406,6 +406,12 @@ class LoRAManager:
                         self.memory_pool.get_lora_ranks(gate_up_key, layer_id),
                         self.memory_pool.get_lora_ranks(down_key, layer_id),
                     )
+                    module.set_moe_lora_expert_maps(
+                        self.memory_pool.get_moe_lora_expert_map(
+                            gate_up_key, layer_id
+                        ),
+                        self.memory_pool.get_moe_lora_expert_map(down_key, layer_id),
+                    )
                     continue
 
                 target_module = get_target_module_name(

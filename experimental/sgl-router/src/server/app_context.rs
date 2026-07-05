@@ -9,6 +9,7 @@ use crate::policies::PolicyRegistry;
 use crate::proxy::Proxy;
 use crate::router_state::{RouterStateClient, RouterStateLoadOverlay};
 use crate::server::metrics::MetricsRegistry;
+use crate::server::trace::TraceSink;
 use crate::tokenizer::TokenizerRegistry;
 use crate::workers::WorkerRegistry;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -46,6 +47,7 @@ pub struct AppContext {
     /// so TTFT-first scoring sees pending work from sibling gateway replicas.
     pub router_state_overlay: Option<Arc<RouterStateLoadOverlay>>,
     pub alias_fallback_breaker: Option<Arc<CircuitBreaker>>,
+    pub trace_sink: Option<Arc<TraceSink>>,
     ready: AtomicBool,
 }
 
@@ -116,6 +118,7 @@ impl AppContext {
             .alias_fallback
             .as_ref()
             .map(|_| Arc::new(CircuitBreaker::new()));
+        let trace_sink = TraceSink::from_config(&config.trace);
         Self {
             config,
             tokenizers,
@@ -128,6 +131,7 @@ impl AppContext {
             router_state_client,
             router_state_overlay,
             alias_fallback_breaker,
+            trace_sink,
             ready: AtomicBool::new(false),
         }
     }
@@ -168,6 +172,7 @@ impl AppContext {
                 ),
                 proxy: crate::config::ProxyConfig::default(),
                 active_load: crate::config::ActiveLoadConfig::default(),
+                trace: crate::config::TraceConfig::default(),
                 worker_introspect_key: None,
                 load_poll_interval_secs: None,
                 cache_tree_page_size: None,
@@ -187,6 +192,7 @@ impl AppContext {
             router_state_client: None,
             router_state_overlay: None,
             alias_fallback_breaker: None,
+            trace_sink: None,
             ready: AtomicBool::new(false),
         }
     }

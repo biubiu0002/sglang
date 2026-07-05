@@ -14,6 +14,7 @@ use crate::server::metrics::{
 use crate::server::routes::alias_fallback::{
     fallback_reason_for_error, fallback_reason_for_response, forward_to_fallback, rewrite_model,
 };
+use crate::server::trace::TraceContext;
 use crate::workers::{LoadGuard, Worker};
 use axum::body::Body;
 use axum::extract::State;
@@ -223,7 +224,7 @@ pub async fn chat_completions(
 
 async fn chat_completions_inner(
     State(ctx): State<Arc<AppContext>>,
-    headers: HeaderMap,
+    mut headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
     let start = std::time::Instant::now();
@@ -232,6 +233,14 @@ async fn chat_completions_inner(
     let model_str = probe
         .model
         .ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?;
+    let trace_ctx = TraceContext::new(
+        &mut headers,
+        "POST",
+        "/v1/chat/completions",
+        Some(model_str.clone()),
+        streaming,
+        body.clone(),
+    );
     let model_id = ModelId(model_str.clone());
 
     // PD pool isolation: for PD-mode deployments, prefill traffic
@@ -616,7 +625,7 @@ async fn chat_completions_inner(
         if streaming {
             let stream_guards: Box<dyn Send + 'static> =
                 Box::new((decode_guard, make_duration_guard()));
-            let fetch = ctx.proxy.forward_streaming_to(
+            let fetch = ctx.proxy.forward_streaming_to_traced(
                 &decode_worker.url,
                 &decode_worker.breaker,
                 "/v1/chat/completions",
@@ -625,6 +634,8 @@ async fn chat_completions_inner(
                 Some(stream_guards),
                 Some(make_ttft_hook()),
                 Some(make_client_disconnect_hook(Arc::clone(&ctx.metrics))),
+                ctx.trace_sink.clone(),
+                trace_ctx.clone(),
             );
             tokio::select! {
                 biased;
@@ -633,12 +644,14 @@ async fn chat_completions_inner(
             }
         } else {
             let _decode_hold = decode_guard;
-            let fetch = ctx.proxy.forward_json_to(
+            let fetch = ctx.proxy.forward_json_to_traced(
                 &decode_worker.url,
                 &decode_worker.breaker,
                 "/v1/chat/completions",
                 decode_headers.as_ref(),
                 outgoing_body,
+                ctx.trace_sink.clone(),
+                trace_ctx.clone(),
             );
             tokio::select! {
                 biased;
@@ -652,7 +665,7 @@ async fn chat_completions_inner(
         // non-streaming arm.
         let stream_guards: Box<dyn Send + 'static> =
             Box::new((guard, active_guard, pending_guard, make_duration_guard()));
-        let fetch = ctx.proxy.forward_streaming_to(
+        let fetch = ctx.proxy.forward_streaming_to_traced(
             &worker.url,
             &worker.breaker,
             "/v1/chat/completions",
@@ -661,6 +674,8 @@ async fn chat_completions_inner(
             Some(stream_guards),
             Some(make_ttft_hook()),
             Some(make_client_disconnect_hook(Arc::clone(&ctx.metrics))),
+            ctx.trace_sink.clone(),
+            trace_ctx.clone(),
         );
         // Bias `fetch` over the cancellation branch: a successful
         // response that completes in the same poll as the token firing
@@ -681,12 +696,14 @@ async fn chat_completions_inner(
         // future does not need them (it does not return until the
         // body is buffered).
         let _holds: (LoadGuard, _, _) = (guard, active_guard, pending_guard);
-        let fetch = ctx.proxy.forward_json_to(
+        let fetch = ctx.proxy.forward_json_to_traced(
             &worker.url,
             &worker.breaker,
             "/v1/chat/completions",
             worker_headers.as_ref(),
             outgoing_body,
+            ctx.trace_sink.clone(),
+            trace_ctx.clone(),
         );
         // Same `biased` order as the streaming arm.
         tokio::select! {

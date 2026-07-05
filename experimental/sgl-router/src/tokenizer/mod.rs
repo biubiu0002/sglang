@@ -265,6 +265,7 @@ mod tests {
             ),
             proxy: crate::config::ProxyConfig::default(),
             active_load: crate::config::ActiveLoadConfig::default(),
+            trace: crate::config::TraceConfig::default(),
             worker_introspect_key: None,
             load_poll_interval_secs: None,
             cache_tree_page_size: None,

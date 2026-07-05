@@ -59,6 +59,7 @@ fn base_config() -> Config {
         }),
         proxy: ProxyConfig::default(),
         active_load: ActiveLoadConfig::default(),
+        trace: sgl_router::config::TraceConfig::default(),
         worker_introspect_key: None,
         load_poll_interval_secs: None,
         cache_tree_page_size: None,
@@ -90,6 +91,7 @@ async fn forwards_whitelisted_headers_strips_others() {
         .header("content-type", "application/json")
         .header("authorization", "Bearer test")
         .header("x-request-id", "abc-123")
+        .header("x-trace-id", "trace-abc")
         .header("x-sgl-route-key", "k1")
         .header("cookie", "should-not-forward=true")
         .header("host", "example.com")
@@ -97,7 +99,14 @@ async fn forwards_whitelisted_headers_strips_others() {
         .header("transfer-encoding", "chunked")
         .body(Body::from(body))
         .unwrap();
-    app.oneshot(req).await.unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        res.headers()
+            .get("x-trace-id")
+            .and_then(|v| v.to_str().ok()),
+        Some("trace-abc"),
+        "router must echo the request trace id on the response",
+    );
 
     let seen = worker.captured.lock().unwrap();
     // Whitelisted headers are forwarded with their inbound VALUES intact —
@@ -112,6 +121,11 @@ async fn forwards_whitelisted_headers_strips_others() {
         seen.headers.get("x-request-id").map(String::as_str),
         Some("abc-123"),
         "x-request-id must be forwarded with its inbound value verbatim",
+    );
+    assert_eq!(
+        seen.headers.get("x-trace-id").map(String::as_str),
+        Some("trace-abc"),
+        "x-trace-id must be forwarded with its inbound value verbatim",
     );
     assert_eq!(
         seen.headers.get("x-sgl-route-key").map(String::as_str),

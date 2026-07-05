@@ -26,7 +26,7 @@ async fn failover_when_one_worker_dies() {
     let w3 = crate::common::mock_worker::MockWorker::start(vec![]).await;
 
     let cfg = Config {
-        runtime_mode: sgl_router::config::RuntimeMode::Gateway,
+        runtime_mode: RuntimeMode::Gateway,
         server: ServerConfig {
             host: "0".into(),
             port: 0,
@@ -49,6 +49,7 @@ async fn failover_when_one_worker_dies() {
         }),
         proxy: ProxyConfig::default(),
         active_load: ActiveLoadConfig::default(),
+        trace: TraceConfig::default(),
         worker_introspect_key: None,
         load_poll_interval_secs: None,
         cache_tree_page_size: None,

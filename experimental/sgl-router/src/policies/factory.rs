@@ -163,7 +163,7 @@ mod tests {
     use super::*;
     use crate::config::{
         ActiveLoadConfig, Config, DiscoveryBackend, ModelConfig, ProxyConfig, ServerConfig,
-        StaticUrlsDiscoveryConfig,
+        StaticUrlsDiscoveryConfig, TraceConfig,
     };
 
     use crate::config::PolicyKind;
@@ -190,6 +190,7 @@ mod tests {
             }),
             proxy: ProxyConfig::default(),
             active_load: ActiveLoadConfig::default(),
+            trace: TraceConfig::default(),
             worker_introspect_key: None,
             load_poll_interval_secs: None,
             cache_tree_page_size: None,

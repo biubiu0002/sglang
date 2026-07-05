@@ -58,6 +58,7 @@ fn build_sticky_ctx(header_name: &str, worker_urls: &[String]) -> Arc<AppContext
         }),
         proxy: ProxyConfig::default(),
         active_load: ActiveLoadConfig::default(),
+        trace: sgl_router::config::TraceConfig::default(),
         worker_introspect_key: None,
         load_poll_interval_secs: None,
         cache_tree_page_size: None,

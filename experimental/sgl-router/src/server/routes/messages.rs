@@ -24,6 +24,7 @@ use crate::server::routes::alias_fallback::{
     fallback_reason_for_error, fallback_reason_for_response, forward_to_fallback, rewrite_model,
 };
 use crate::server::routes::chat::{make_client_disconnect_hook, reserve_pending_load};
+use crate::server::trace::TraceContext;
 use crate::workers::LoadGuard;
 use axum::body::Body;
 use axum::extract::State;
@@ -506,7 +507,7 @@ fn anthropic_error_response(e: ApiError) -> Response<Body> {
 
 async fn messages_inner(
     State(ctx): State<Arc<AppContext>>,
-    headers: HeaderMap,
+    mut headers: HeaderMap,
     body: Bytes,
     forward_path: &'static str,
 ) -> Result<Response<Body>, ApiError> {
@@ -516,6 +517,14 @@ async fn messages_inner(
     let model_str = probe
         .model
         .ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?;
+    let trace_ctx = TraceContext::new(
+        &mut headers,
+        "POST",
+        forward_path,
+        Some(model_str.clone()),
+        streaming,
+        body.clone(),
+    );
     let model_id = ModelId(model_str.clone());
 
     // Same candidate set as chat (prefill pool for PD; full set for plain).
@@ -665,7 +674,7 @@ async fn messages_inner(
         // v1 measures header-time only; end-to-end streaming latency is a
         // follow-up. Guards move into stream_guards so load stays accurate.
         let stream_guards: Box<dyn Send + 'static> = Box::new((guard, active_guard, pending_guard));
-        let fetch = ctx.proxy.forward_streaming_to(
+        let fetch = ctx.proxy.forward_streaming_to_traced(
             &worker.url,
             &worker.breaker,
             forward_path,
@@ -674,6 +683,8 @@ async fn messages_inner(
             Some(stream_guards),
             None,
             Some(make_client_disconnect_hook(Arc::clone(&ctx.metrics))),
+            ctx.trace_sink.clone(),
+            trace_ctx.clone(),
         );
         tokio::select! {
             biased;
@@ -682,12 +693,14 @@ async fn messages_inner(
         }
     } else {
         let _holds: (LoadGuard, _, _) = (guard, active_guard, pending_guard);
-        let fetch = ctx.proxy.forward_json_to(
+        let fetch = ctx.proxy.forward_json_to_traced(
             &worker.url,
             &worker.breaker,
             forward_path,
             worker_headers.as_ref(),
             body,
+            ctx.trace_sink.clone(),
+            trace_ctx.clone(),
         );
         tokio::select! {
             biased;
@@ -1032,6 +1045,7 @@ mod tests {
             }),
             proxy: ProxyConfig::default(),
             active_load: ActiveLoadConfig::default(),
+            trace: crate::config::TraceConfig::default(),
             worker_introspect_key: None,
             load_poll_interval_secs: None,
             cache_tree_page_size: None,

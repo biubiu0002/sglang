@@ -12,6 +12,7 @@ use crate::config::AliasFallbackConfig;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::routes::chat::make_client_disconnect_hook;
+use crate::server::trace::TraceContext;
 use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderValue, Response, StatusCode};
 use bytes::Bytes;
@@ -116,7 +117,15 @@ pub async fn forward_to_fallback(
     reason: AliasFallbackReason,
 ) -> Result<Response<Body>, ApiError> {
     let body = rewrite_model(original_body, &cfg.fallback_model_id)?;
-    let headers = fallback_headers(inbound_headers, cfg.fallback_bearer_token.as_deref())?;
+    let mut headers = fallback_headers(inbound_headers, cfg.fallback_bearer_token.as_deref())?;
+    let trace_ctx = TraceContext::new(
+        &mut headers,
+        "POST",
+        path,
+        Some(cfg.fallback_model_id.clone()),
+        streaming,
+        body.clone(),
+    );
     let breaker = ctx.alias_fallback_breaker.as_ref().ok_or_else(|| {
         ApiError::Internal(anyhow::anyhow!(
             "alias fallback configured without fallback circuit breaker"
@@ -186,7 +195,7 @@ pub async fn forward_to_fallback(
     }
     if streaming {
         ctx.proxy
-            .forward_streaming_to_without_admission(
+            .forward_streaming_to_without_admission_traced(
                 &cfg.fallback_base_url,
                 breaker,
                 path,
@@ -195,16 +204,20 @@ pub async fn forward_to_fallback(
                 None,
                 None,
                 Some(make_client_disconnect_hook(Arc::clone(&ctx.metrics))),
+                ctx.trace_sink.clone(),
+                trace_ctx,
             )
             .await
     } else {
         ctx.proxy
-            .forward_json_to_without_admission(
+            .forward_json_to_without_admission_traced(
                 &cfg.fallback_base_url,
                 breaker,
                 path,
                 &headers,
                 body,
+                ctx.trace_sink.clone(),
+                trace_ctx,
             )
             .await
     }

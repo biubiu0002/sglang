@@ -17,6 +17,7 @@ pub struct Config {
     pub discovery: DiscoveryBackend,
     pub proxy: ProxyConfig,
     pub active_load: ActiveLoadConfig,
+    pub trace: TraceConfig,
     /// Optional bearer token the router presents on its OWN requests to
     /// each worker's `/server_info` (introspection + cache_aware_zmq
     /// KV-event publisher discovery). `None` => unauthenticated
@@ -101,6 +102,27 @@ pub struct ActiveLoadConfig {
     /// janitor fires its `cancel_token` and the chat handler returns
     /// 504 `stale_request_expired`. Default 600 s.
     pub stale_request_timeout_secs: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct TraceConfig {
+    pub sink_url: Option<String>,
+    pub capture_bodies: bool,
+    pub body_max_bytes: usize,
+}
+
+pub fn default_trace_body_max_bytes() -> usize {
+    64 * 1024
+}
+
+impl Default for TraceConfig {
+    fn default() -> Self {
+        Self {
+            sink_url: None,
+            capture_bodies: false,
+            body_max_bytes: default_trace_body_max_bytes(),
+        }
+    }
 }
 
 pub fn default_stale_request_timeout_secs() -> u64 {

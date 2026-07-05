@@ -11,10 +11,11 @@ use std::num::NonZeroU32;
 
 use crate::config::{
     default_cb_cool_down, default_proxy_request_timeout_secs, default_stale_request_timeout_secs,
-    resolve_mode, ActiveLoadConfig, AliasFallbackConfig, CacheAwareConfig, CacheTreeSource,
-    CircuitBreakerConfig, Config, DiscoveryBackend, K8sDiscoveryConfig, LogFormat, ModelConfig,
-    ObservabilityConfig, PolicyKind, ProxyConfig, RuntimeMode, ServerConfig,
-    StaticUrlsDiscoveryConfig, StickyConfig, WorkerBearerKeyConfig,
+    default_trace_body_max_bytes, resolve_mode, ActiveLoadConfig, AliasFallbackConfig,
+    CacheAwareConfig, CacheTreeSource, CircuitBreakerConfig, Config, DiscoveryBackend,
+    K8sDiscoveryConfig, LogFormat, ModelConfig, ObservabilityConfig, PolicyKind, ProxyConfig,
+    RuntimeMode, ServerConfig, StaticUrlsDiscoveryConfig, StickyConfig, TraceConfig,
+    WorkerBearerKeyConfig,
 };
 
 /// `sgl-router` — slim KV-aware OpenAI-compatible router for SGLang workers.
@@ -230,6 +231,19 @@ pub struct Cli {
     /// reaps it (returns 504 `stale_request_expired`).
     #[arg(long, default_value_t = default_stale_request_timeout_secs())]
     pub stale_request_timeout_secs: u64,
+
+    // ---- request trace sink (optional) ----
+    /// Optional HTTP endpoint that receives best-effort JSON trace events.
+    /// When unset, router request tracing is disabled.
+    #[arg(long, env = "TRACE_SINK_URL")]
+    pub trace_sink_url: Option<String>,
+    /// Include bounded request/response body snippets in trace events.
+    /// Requires --trace-sink-url. Defaults to metadata-only tracing.
+    #[arg(long, env = "TRACE_CAPTURE_BODIES", default_value_t = false)]
+    pub trace_capture_bodies: bool,
+    /// Maximum body bytes captured per request/response trace field.
+    #[arg(long, env = "TRACE_BODY_MAX_BYTES", default_value_t = default_trace_body_max_bytes())]
+    pub trace_body_max_bytes: usize,
 
     // ---- real-load polling (cache_aware_zmq load source) ----
     /// Interval (seconds) at which a background task polls each worker's
@@ -453,6 +467,14 @@ impl Cli {
             }
         }
         let use_reported_load = self.load_poll_interval_secs.is_some();
+        if self.trace_capture_bodies && self.trace_sink_url.is_none() {
+            return Err(anyhow!(
+                "--trace-capture-bodies requires --trace-sink-url (otherwise captured bodies have nowhere to go)"
+            ));
+        }
+        if self.trace_body_max_bytes == 0 {
+            return Err(anyhow!("--trace-body-max-bytes must be greater than 0"));
+        }
 
         // Build a CacheAwareConfig when the operator tuned a knob OR enabled
         // the load poller (which flips use_reported_load on); otherwise leave
@@ -545,6 +567,11 @@ impl Cli {
             },
             active_load: ActiveLoadConfig {
                 stale_request_timeout_secs: self.stale_request_timeout_secs,
+            },
+            trace: TraceConfig {
+                sink_url: self.trace_sink_url,
+                capture_bodies: self.trace_capture_bodies,
+                body_max_bytes: self.trace_body_max_bytes,
             },
             worker_introspect_key: self.worker_introspect_key,
             load_poll_interval_secs: self.load_poll_interval_secs,

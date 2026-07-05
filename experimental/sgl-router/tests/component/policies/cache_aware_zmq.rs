@@ -84,6 +84,7 @@ async fn zmq_indexer_routes_to_publishing_worker_e2e() {
         ),
         proxy: ProxyConfig::default(),
         active_load: ActiveLoadConfig::default(),
+        trace: sgl_router::config::TraceConfig::default(),
         worker_introspect_key: None,
         load_poll_interval_secs: None,
         cache_tree_page_size: None,

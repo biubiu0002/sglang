@@ -32,10 +32,15 @@ use tokio::sync::mpsc;
 /// `http://host:port@min_priority=100`. A distinctive literal (not a bare
 /// `@`) so it cannot collide with URL userinfo (`user:pass@host`).
 const MIN_PRIORITY_TOKEN: &str = "@min_priority=";
+/// Optional pool metadata suffix used by deployment manifests, for example
+/// `http://host:port@tier=shared`. The router does not currently route on
+/// this label, so static discovery strips it before URL parsing and proxying.
+const TIER_TOKEN: &str = "@tier=";
 
 /// Split a `--worker-urls` entry into its base URL and optional
 /// `min_priority` capability. `http://h:p@min_priority=100` yields
 /// `("http://h:p", Some(100))`; a plain URL yields `(url, None)`.
+/// A deployment-only `@tier=...` suffix is stripped and ignored.
 ///
 /// A present-but-unparseable suffix (e.g. `@min_priority=abc`) is a config
 /// error the caller surfaces, rather than silently dropping the isolation
@@ -49,7 +54,16 @@ const MIN_PRIORITY_TOKEN: &str = "@min_priority=";
 /// misparse `host:port@min_priority=N` as userinfo, letting malformed base
 /// URLs and with/without-suffix duplicates slip past startup checks.
 pub(crate) fn parse_worker_entry(entry: &str) -> Result<(String, Option<i64>)> {
-    match entry.rsplit_once(MIN_PRIORITY_TOKEN) {
+    let (without_tier, _tier) = match entry.rsplit_once(TIER_TOKEN) {
+        Some((url, tier)) => {
+            if tier.trim().is_empty() {
+                return Err(anyhow!("empty tier in worker URL entry {entry:?}"));
+            }
+            (url, Some(tier))
+        }
+        None => (entry, None),
+    };
+    match without_tier.rsplit_once(MIN_PRIORITY_TOKEN) {
         Some((url, prio_str)) => {
             let prio = prio_str.trim().parse::<i64>().map_err(|_| {
                 anyhow::anyhow!(
@@ -59,7 +73,7 @@ pub(crate) fn parse_worker_entry(entry: &str) -> Result<(String, Option<i64>)> {
             })?;
             Ok((url.to_string(), Some(prio)))
         }
-        None => Ok((entry.to_string(), None)),
+        None => Ok((without_tier.to_string(), None)),
     }
 }
 
@@ -160,6 +174,29 @@ mod tests {
         let (url, prio) = parse_worker_entry("http://rtx-01:30000@min_priority=100").unwrap();
         assert_eq!(url, "http://rtx-01:30000");
         assert_eq!(prio, Some(100));
+    }
+
+    #[test]
+    fn parse_entry_strips_tier_suffix() {
+        let (url, prio) = parse_worker_entry("http://b200-01:10100@tier=shared").unwrap();
+        assert_eq!(url, "http://b200-01:10100");
+        assert_eq!(prio, None);
+    }
+
+    #[test]
+    fn parse_entry_strips_tier_after_min_priority() {
+        let (url, prio) =
+            parse_worker_entry("http://rtx-01:30000@min_priority=100@tier=borrowed").unwrap();
+        assert_eq!(url, "http://rtx-01:30000");
+        assert_eq!(prio, Some(100));
+    }
+
+    #[test]
+    fn parse_entry_rejects_empty_tier_suffix() {
+        let err = parse_worker_entry("http://w:30000@tier=")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("empty tier"), "got: {err}");
     }
 
     #[test]

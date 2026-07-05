@@ -330,6 +330,7 @@ class LoRAManager:
         weight_indices = [0] * len(forward_batch.lora_ids)
         lora_ranks = [0] * self.max_loras_per_batch
         scalings = [0] * self.max_loras_per_batch
+        active_weight_indices = []
         for i, uid in enumerate(forward_batch.lora_ids):
             if uid not in self.memory_pool.uid_to_buffer_id:
                 continue
@@ -338,6 +339,7 @@ class LoRAManager:
                 lora = self.loras[uid]
                 scalings[weight_indices[i]] = lora.scaling
                 if lora.scaling != 0:
+                    active_weight_indices.append(weight_indices[i])
                     lora_ranks[weight_indices[i]] = lora.config.r
         # Do in-place updates when CUDA graph is enabled and the batch forward mode
         # could use CUDA graph.
@@ -346,6 +348,7 @@ class LoRAManager:
             weight_indices=weight_indices,
             lora_ranks=lora_ranks,
             scalings=scalings,
+            active_weight_indices=tuple(dict.fromkeys(active_weight_indices)),
             use_cuda_graph=use_cuda_graph,
         )
         self.lora_backend.batch_info.has_active_lora = any(

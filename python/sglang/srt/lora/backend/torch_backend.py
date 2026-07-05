@@ -196,6 +196,7 @@ class TorchNativeLoRABackend(BaseLoRABackend):
         weight_indices: list[int],
         lora_ranks: list[int],
         scalings: list[float],
+        active_weight_indices: tuple[int, ...],
         use_cuda_graph: bool,
     ):
         # Do not use merge optimization for graph mode
@@ -297,6 +298,7 @@ class TorchNativeLoRABackend(BaseLoRABackend):
         batch_info.seg_lens_cpu = seg_lens_cpu
         batch_info.weight_indices_cpu = weight_indices_tensor
         batch_info.scalings_cpu = scalings_tensor
+        batch_info.active_weight_indices = active_weight_indices
 
         batch_info = self._add_moe_lora_info(forward_batch, batch_info)
         self.batch_info = batch_info

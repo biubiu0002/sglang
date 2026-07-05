@@ -2230,13 +2230,8 @@ class DeepseekSparseAttnBackend(
             f"cu_seqlens_k has {len(cu_seqlens_k)-1} requests"
         )
 
-        # Use TRTLLm ragged attention for SM100 (Blackwell/B200) when the
-        # FlashInfer kernel supports this model shape; otherwise fall back to
-        # the generic varlen path below.
-        trtllm_supported_shape = (layer.head_dim <= 128 and layer.v_head_dim <= 128) or (
-            layer.head_dim == 192 and layer.v_head_dim == 128
-        )
-        if self.device_sm_major >= 10 and trtllm_supported_shape:
+        # Use TRTLLm ragged attention for SM100 (Blackwell/B200) to avoid FA4 accuracy issues
+        if self.device_sm_major >= 10:
             import flashinfer
 
             seq_lens = metadata.cache_seqlens_int32

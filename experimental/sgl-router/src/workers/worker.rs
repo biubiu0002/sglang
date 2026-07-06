@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::discovery::{ModelId, WorkerId, WorkerMode};
+use crate::discovery::{ModelId, WorkerBackend, WorkerId, WorkerMode, WorkerTier};
 use crate::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use crate::router_state::RouterStateLoadOverlay;
 use axum::http::{header, HeaderMap, HeaderValue};
@@ -153,6 +153,12 @@ pub struct Worker {
     /// of the candidate set before policy selection. Carried from
     /// `WorkerSpec`; see [`crate::discovery::WorkerSpec::min_priority`].
     min_priority: Option<i64>,
+    /// Serving backend. Determines which worker-control endpoints the
+    /// router may call; e.g. vLLM workers do not expose SGLang `/get_load`
+    /// or KV event metadata.
+    backend: WorkerBackend,
+    /// Operator-defined routing tier used by tier-aware policies.
+    tier: WorkerTier,
     /// Worker-reported real load (from the background load poller hitting
     /// the worker's `/get_load`). Decoupled from `active_requests`
     /// (router-side in-flight count), which is a poor signal for a mixed
@@ -206,6 +212,8 @@ impl Worker {
             bootstrap_host,
             bootstrap_port: spec.bootstrap_port,
             min_priority: spec.min_priority,
+            backend: spec.backend,
+            tier: spec.tier,
             reported_load: Arc::new(AtomicI64::new(REPORTED_LOAD_UNSET)),
             global_pending: None,
             bearer_token: spec.bearer_token,
@@ -233,6 +241,14 @@ impl Worker {
     /// [`crate::policies::registry::filter_eligible`]).
     pub fn min_priority(&self) -> Option<i64> {
         self.min_priority
+    }
+
+    pub fn backend(&self) -> WorkerBackend {
+        self.backend
+    }
+
+    pub fn tier(&self) -> WorkerTier {
+        self.tier
     }
 
     /// Optional per-worker bearer token. Shared-key pools leave this unset
@@ -384,6 +400,8 @@ impl std::fmt::Debug for Worker {
         f.debug_struct("Worker")
             .field("id", &self.id)
             .field("url", &self.url)
+            .field("backend", &self.backend)
+            .field("tier", &self.tier)
             .field("mode", &self.mode())
             .field("active_load", &self.active_load())
             .field("pending_load", &self.pending_load())
@@ -415,6 +433,8 @@ mod tests {
             bootstrap_port: None,
             min_priority: None,
             bearer_token: None,
+            backend: Default::default(),
+            tier: Default::default(),
         });
         assert_eq!(w.active_load(), 0);
         let g = w.load_guard();
@@ -437,6 +457,8 @@ mod tests {
             bootstrap_port: None,
             min_priority: None,
             bearer_token: None,
+            backend: Default::default(),
+            tier: Default::default(),
         });
         // Seed router-side in-flight = 2.
         let _g1 = w.load_guard();
@@ -485,6 +507,8 @@ mod tests {
             bootstrap_port: None,
             min_priority: None,
             bearer_token: None,
+            backend: Default::default(),
+            tier: Default::default(),
         });
 
         w.set_reported_load(2);
@@ -517,6 +541,8 @@ mod tests {
             bootstrap_port: None,
             min_priority: None,
             bearer_token: None,
+            backend: Default::default(),
+            tier: Default::default(),
         });
         let overlay = RouterStateLoadOverlay::new();
         overlay.update(RouterStateSnapshotResponse {
@@ -550,6 +576,8 @@ mod tests {
                 bootstrap_port: None,
                 min_priority: None,
                 bearer_token: None,
+                backend: Default::default(),
+                tier: Default::default(),
             });
             assert_eq!(w.mode(), m);
         }
@@ -565,6 +593,8 @@ mod tests {
             bootstrap_port: None,
             min_priority: None,
             bearer_token: None,
+            backend: Default::default(),
+            tier: Default::default(),
         });
         assert_eq!(w.mode(), WorkerMode::Prefill);
         w.set_mode(WorkerMode::Decode);
@@ -583,6 +613,8 @@ mod tests {
             bootstrap_port: Some(8997),
             min_priority: None,
             bearer_token: None,
+            backend: Default::default(),
+            tier: Default::default(),
         });
         assert_eq!(w.bootstrap_port(), Some(8997));
     }
@@ -597,6 +629,8 @@ mod tests {
             bootstrap_port: None,
             min_priority: None,
             bearer_token: None,
+            backend: Default::default(),
+            tier: Default::default(),
         });
         assert_eq!(w.bootstrap_port(), None);
     }
@@ -611,6 +645,8 @@ mod tests {
             bootstrap_port: Some(8997),
             min_priority: None,
             bearer_token: None,
+            backend: Default::default(),
+            tier: Default::default(),
         });
         assert_eq!(w.bootstrap_host(), "10.0.0.1");
     }
@@ -625,6 +661,8 @@ mod tests {
             bootstrap_port: Some(8997),
             min_priority: None,
             bearer_token: None,
+            backend: Default::default(),
+            tier: Default::default(),
         });
         assert_eq!(w.bootstrap_host(), "prefill-0.svc.cluster.local");
     }
@@ -643,6 +681,8 @@ mod tests {
             bootstrap_port: Some(8997),
             min_priority: None,
             bearer_token: None,
+            backend: Default::default(),
+            tier: Default::default(),
         });
         assert_eq!(w.bootstrap_host(), "localhost");
     }

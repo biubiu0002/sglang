@@ -44,6 +44,8 @@ fn build_worker(url: &str, model: &str) -> Arc<Worker> {
         bootstrap_port: None,
         min_priority: None,
         bearer_token: None,
+        backend: Default::default(),
+        tier: Default::default(),
     }))
 }
 
@@ -74,6 +76,7 @@ async fn zmq_indexer_routes_to_publishing_worker_e2e() {
             policy: sgl_router::config::PolicyKind::CacheAwareZmq,
             circuit_breaker: None,
             cache_aware: None,
+            tiered_spillover: None,
             sticky: None,
         },
         discovery: sgl_router::config::DiscoveryBackend::StaticUrls(

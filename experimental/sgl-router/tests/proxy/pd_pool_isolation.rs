@@ -48,6 +48,7 @@ fn config() -> Config {
             policy: PolicyKind::RoundRobin,
             circuit_breaker: None,
             cache_aware: None,
+            tiered_spillover: None,
             sticky: None,
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
@@ -57,6 +58,7 @@ fn config() -> Config {
         proxy: ProxyConfig::default(),
         active_load: ActiveLoadConfig::default(),
         trace: sgl_router::config::TraceConfig::default(),
+        priority_override: sgl_router::config::PriorityOverrideConfig::default(),
         worker_introspect_key: None,
         load_poll_interval_secs: None,
         cache_tree_page_size: None,
@@ -109,6 +111,8 @@ async fn pd_mode_decode_only_returns_no_prefill_workers_available() {
         bootstrap_port: None,
         min_priority: None,
         bearer_token: None,
+        backend: Default::default(),
+        tier: Default::default(),
     }]);
     let app = build_router(ctx);
 
@@ -164,6 +168,8 @@ async fn pd_mode_chat_dispatch_fans_to_both_prefill_and_decode() {
             bootstrap_port: Some(8997),
             min_priority: None,
             bearer_token: None,
+            backend: Default::default(),
+            tier: Default::default(),
         },
         WorkerSpec {
             id: WorkerId("d1".into()),
@@ -173,6 +179,8 @@ async fn pd_mode_chat_dispatch_fans_to_both_prefill_and_decode() {
             bootstrap_port: None,
             min_priority: None,
             bearer_token: None,
+            backend: Default::default(),
+            tier: Default::default(),
         },
     ]);
     let app = build_router(ctx);
@@ -253,6 +261,8 @@ async fn pd_mode_chat_dispatch_sets_decode_affinity_header() {
             bootstrap_port: None,
             min_priority: None,
             bearer_token: None,
+            backend: Default::default(),
+            tier: Default::default(),
         },
         WorkerSpec {
             id: WorkerId("p2".into()),
@@ -262,6 +272,8 @@ async fn pd_mode_chat_dispatch_sets_decode_affinity_header() {
             bootstrap_port: None,
             min_priority: None,
             bearer_token: None,
+            backend: Default::default(),
+            tier: Default::default(),
         },
         WorkerSpec {
             id: WorkerId("d1".into()),
@@ -271,6 +283,8 @@ async fn pd_mode_chat_dispatch_sets_decode_affinity_header() {
             bootstrap_port: None,
             min_priority: None,
             bearer_token: None,
+            backend: Default::default(),
+            tier: Default::default(),
         },
         WorkerSpec {
             id: WorkerId("d2".into()),
@@ -280,6 +294,8 @@ async fn pd_mode_chat_dispatch_sets_decode_affinity_header() {
             bootstrap_port: None,
             min_priority: None,
             bearer_token: None,
+            backend: Default::default(),
+            tier: Default::default(),
         },
     ]);
     let app = build_router(ctx);
@@ -332,6 +348,8 @@ async fn plain_mode_chat_dispatch_omits_decode_affinity_header() {
         bootstrap_port: None,
         min_priority: None,
         bearer_token: None,
+        backend: Default::default(),
+        tier: Default::default(),
     }]);
     let app = build_router(ctx);
 
@@ -360,6 +378,8 @@ async fn pd_mode_prefill_only_returns_no_decode_workers_available() {
         bootstrap_port: None,
         min_priority: None,
         bearer_token: None,
+        backend: Default::default(),
+        tier: Default::default(),
     }]);
     let app = build_router(ctx);
 
@@ -390,6 +410,8 @@ async fn pd_mode_chat_response_carries_decode_affinity_header() {
             bootstrap_port: None,
             min_priority: None,
             bearer_token: None,
+            backend: Default::default(),
+            tier: Default::default(),
         },
         WorkerSpec {
             id: WorkerId("d1".into()),
@@ -399,6 +421,8 @@ async fn pd_mode_chat_response_carries_decode_affinity_header() {
             bootstrap_port: None,
             min_priority: None,
             bearer_token: None,
+            backend: Default::default(),
+            tier: Default::default(),
         },
         WorkerSpec {
             id: WorkerId("d2".into()),
@@ -408,6 +432,8 @@ async fn pd_mode_chat_response_carries_decode_affinity_header() {
             bootstrap_port: None,
             min_priority: None,
             bearer_token: None,
+            backend: Default::default(),
+            tier: Default::default(),
         },
     ]);
     let app = build_router(ctx);
@@ -448,6 +474,8 @@ async fn plain_mode_chat_response_omits_decode_affinity_header() {
         bootstrap_port: None,
         min_priority: None,
         bearer_token: None,
+        backend: Default::default(),
+        tier: Default::default(),
     }]);
     let app = build_router(ctx);
 

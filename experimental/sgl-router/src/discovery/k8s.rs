@@ -140,6 +140,8 @@ fn extract_workers(es: &EndpointSlice, mode: WorkerMode) -> Vec<WorkerSpec> {
                 bootstrap_port: None,
                 min_priority: None,
                 bearer_token: None,
+                backend: Default::default(),
+                tier: Default::default(),
             });
         }
     }

@@ -22,7 +22,9 @@
 //! the K8s backend (which can still classify via pod labels).
 
 use crate::config::StaticUrlsDiscoveryConfig;
-use crate::discovery::{DiscoveryEvent, WorkerId, WorkerMode, WorkerSpec};
+use crate::discovery::{
+    DiscoveryEvent, WorkerBackend, WorkerId, WorkerMode, WorkerSpec, WorkerTier,
+};
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use tokio::sync::mpsc;
@@ -32,10 +34,25 @@ use tokio::sync::mpsc;
 /// `http://host:port@min_priority=100`. A distinctive literal (not a bare
 /// `@`) so it cannot collide with URL userinfo (`user:pass@host`).
 const MIN_PRIORITY_TOKEN: &str = "@min_priority=";
-/// Optional pool metadata suffix used by deployment manifests, for example
-/// `http://host:port@tier=shared`. The router does not currently route on
-/// this label, so static discovery strips it before URL parsing and proxying.
+const BACKEND_TOKEN: &str = "@backend=";
 const TIER_TOKEN: &str = "@tier=";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WorkerCapabilities {
+    pub min_priority: Option<i64>,
+    pub backend: WorkerBackend,
+    pub tier: WorkerTier,
+}
+
+impl Default for WorkerCapabilities {
+    fn default() -> Self {
+        Self {
+            min_priority: None,
+            backend: WorkerBackend::Sglang,
+            tier: WorkerTier::Default,
+        }
+    }
+}
 
 /// Split a `--worker-urls` entry into its base URL and optional
 /// `min_priority` capability. `http://h:p@min_priority=100` yields
@@ -53,28 +70,53 @@ const TIER_TOKEN: &str = "@tier=";
 /// validation would run against the raw suffixed string and `url::Url` would
 /// misparse `host:port@min_priority=N` as userinfo, letting malformed base
 /// URLs and with/without-suffix duplicates slip past startup checks.
-pub(crate) fn parse_worker_entry(entry: &str) -> Result<(String, Option<i64>)> {
-    let (without_tier, _tier) = match entry.rsplit_once(TIER_TOKEN) {
-        Some((url, tier)) => {
-            if tier.trim().is_empty() {
-                return Err(anyhow!("empty tier in worker URL entry {entry:?}"));
-            }
-            (url, Some(tier))
-        }
-        None => (entry, None),
-    };
-    match without_tier.rsplit_once(MIN_PRIORITY_TOKEN) {
-        Some((url, prio_str)) => {
-            let prio = prio_str.trim().parse::<i64>().map_err(|_| {
+pub(crate) fn parse_worker_entry(entry: &str) -> Result<(String, WorkerCapabilities)> {
+    let mut base = entry;
+    let mut caps = WorkerCapabilities::default();
+    loop {
+        let Some((pos, token)) = [MIN_PRIORITY_TOKEN, BACKEND_TOKEN, TIER_TOKEN]
+            .into_iter()
+            .filter_map(|token| base.rfind(token).map(|pos| (pos, token)))
+            .max_by_key(|(pos, _)| *pos)
+        else {
+            break;
+        };
+        let value = &base[pos + token.len()..];
+        base = &base[..pos];
+        if token == MIN_PRIORITY_TOKEN {
+            let prio = value.trim().parse::<i64>().map_err(|_| {
                 anyhow::anyhow!(
                     "invalid min_priority in worker URL entry {entry:?}: \
-                     {prio_str:?} is not an integer"
+                     {value:?} is not an integer"
                 )
             })?;
-            Ok((url.to_string(), Some(prio)))
+            caps.min_priority = Some(prio);
+        } else if token == BACKEND_TOKEN {
+            caps.backend = match value.trim() {
+                "sglang" => WorkerBackend::Sglang,
+                "vllm" => WorkerBackend::Vllm,
+                other => {
+                    return Err(anyhow::anyhow!(
+                        "invalid backend in worker URL entry {entry:?}: \
+                         {other:?} is not one of: sglang, vllm"
+                    ));
+                }
+            };
+        } else {
+            caps.tier = match value.trim() {
+                "default" => WorkerTier::Default,
+                "bulk" => WorkerTier::Bulk,
+                "shared" => WorkerTier::Shared,
+                other => {
+                    return Err(anyhow::anyhow!(
+                        "invalid tier in worker URL entry {entry:?}: \
+                         {other:?} is not one of: default, bulk, shared"
+                    ));
+                }
+            };
         }
-        None => Ok((without_tier.to_string(), None)),
     }
+    Ok((base.to_string(), caps))
 }
 
 /// Normalize worker URLs for config-key matching. This mirrors
@@ -82,7 +124,7 @@ pub(crate) fn parse_worker_entry(entry: &str) -> Result<(String, Option<i64>)> {
 /// drop a trailing slash so `http://x:30000` and `http://x:30000/` match the
 /// same bearer-key entry.
 pub(crate) fn normalize_worker_url(entry: &str) -> Result<String> {
-    let (base, _min_priority) = parse_worker_entry(entry)?;
+    let (base, _caps) = parse_worker_entry(entry)?;
     let parsed = url::Url::parse(&base)
         .map_err(|e| anyhow!("worker URL entry {entry:?} is not a valid URL: {e}"))?;
     Ok(parsed.as_str().trim_end_matches('/').to_string())
@@ -99,7 +141,7 @@ pub async fn spawn(
 ) -> Result<tokio::task::JoinHandle<()>> {
     // Parse + validate every entry up front so a bad suffix fails startup
     // loudly instead of after the task is detached.
-    let parsed: Vec<(String, Option<i64>)> = cfg
+    let parsed: Vec<(String, WorkerCapabilities)> = cfg
         .urls
         .iter()
         .map(|e| parse_worker_entry(e))
@@ -115,7 +157,7 @@ pub async fn spawn(
         })
         .collect::<Result<_>>()?;
     let handle = tokio::spawn(async move {
-        for (url, min_priority) in parsed {
+        for (url, caps) in parsed {
             let bearer_token = normalize_worker_url(&url)
                 .ok()
                 .and_then(|normalized| bearer_keys.get(&normalized).cloned());
@@ -125,8 +167,10 @@ pub async fn spawn(
                 mode: WorkerMode::Plain,
                 model_ids: Vec::new(),
                 bootstrap_port: None,
-                min_priority,
+                min_priority: caps.min_priority,
                 bearer_token,
+                backend: caps.backend,
+                tier: caps.tier,
             };
             if tx.send(DiscoveryEvent::Added(spec)).await.is_err() {
                 tracing::info!(
@@ -164,31 +208,76 @@ mod tests {
 
     #[test]
     fn parse_entry_plain_url_has_no_min_priority() {
-        let (url, prio) = parse_worker_entry("http://w0:30000").unwrap();
+        let (url, caps) = parse_worker_entry("http://w0:30000").unwrap();
         assert_eq!(url, "http://w0:30000");
-        assert_eq!(prio, None);
+        assert_eq!(caps.min_priority, None);
+        assert_eq!(caps.backend, WorkerBackend::Sglang);
+        assert_eq!(caps.tier, WorkerTier::Default);
     }
 
     #[test]
     fn parse_entry_extracts_min_priority_suffix() {
-        let (url, prio) = parse_worker_entry("http://rtx-01:30000@min_priority=100").unwrap();
+        let (url, caps) = parse_worker_entry("http://rtx-01:30000@min_priority=100").unwrap();
         assert_eq!(url, "http://rtx-01:30000");
-        assert_eq!(prio, Some(100));
+        assert_eq!(caps.min_priority, Some(100));
+        assert_eq!(caps.backend, WorkerBackend::Sglang);
+        assert_eq!(caps.tier, WorkerTier::Default);
+    }
+
+    #[test]
+    fn parse_entry_extracts_vllm_backend_suffix() {
+        let (url, caps) = parse_worker_entry("http://h20-r0:8006@backend=vllm").unwrap();
+        assert_eq!(url, "http://h20-r0:8006");
+        assert_eq!(caps.backend, WorkerBackend::Vllm);
+        assert_eq!(caps.min_priority, None);
+        assert_eq!(caps.tier, WorkerTier::Default);
+    }
+
+    #[test]
+    fn parse_entry_extracts_tier_suffix() {
+        let (url, caps) = parse_worker_entry("http://h20-r0:8006@tier=bulk").unwrap();
+        assert_eq!(url, "http://h20-r0:8006");
+        assert_eq!(caps.tier, WorkerTier::Bulk);
+        assert_eq!(caps.backend, WorkerBackend::Sglang);
+        assert_eq!(caps.min_priority, None);
+    }
+
+    #[test]
+    fn parse_entry_extracts_combined_suffixes_in_either_order() {
+        let (url, caps) =
+            parse_worker_entry("http://h20-r0:8006@backend=vllm@tier=bulk@min_priority=100")
+                .unwrap();
+        assert_eq!(url, "http://h20-r0:8006");
+        assert_eq!(caps.backend, WorkerBackend::Vllm);
+        assert_eq!(caps.tier, WorkerTier::Bulk);
+        assert_eq!(caps.min_priority, Some(100));
+
+        let (url, caps) =
+            parse_worker_entry("http://h20-r0:8006@min_priority=100@tier=bulk@backend=vllm")
+                .unwrap();
+        assert_eq!(url, "http://h20-r0:8006");
+        assert_eq!(caps.backend, WorkerBackend::Vllm);
+        assert_eq!(caps.tier, WorkerTier::Bulk);
+        assert_eq!(caps.min_priority, Some(100));
     }
 
     #[test]
     fn parse_entry_strips_tier_suffix() {
-        let (url, prio) = parse_worker_entry("http://b200-01:10100@tier=shared").unwrap();
+        let (url, caps) = parse_worker_entry("http://b200-01:10100@tier=shared").unwrap();
         assert_eq!(url, "http://b200-01:10100");
-        assert_eq!(prio, None);
+        assert_eq!(caps.min_priority, None);
+        assert_eq!(caps.tier, WorkerTier::Shared);
+        assert_eq!(caps.backend, WorkerBackend::Sglang);
     }
 
     #[test]
     fn parse_entry_strips_tier_after_min_priority() {
-        let (url, prio) =
-            parse_worker_entry("http://rtx-01:30000@min_priority=100@tier=borrowed").unwrap();
+        let (url, caps) =
+            parse_worker_entry("http://rtx-01:30000@min_priority=100@tier=shared").unwrap();
         assert_eq!(url, "http://rtx-01:30000");
-        assert_eq!(prio, Some(100));
+        assert_eq!(caps.min_priority, Some(100));
+        assert_eq!(caps.tier, WorkerTier::Shared);
+        assert_eq!(caps.backend, WorkerBackend::Sglang);
     }
 
     #[test]
@@ -196,7 +285,7 @@ mod tests {
         let err = parse_worker_entry("http://w:30000@tier=")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("empty tier"), "got: {err}");
+        assert!(err.contains("tier"), "got: {err}");
     }
 
     #[test]
@@ -208,12 +297,29 @@ mod tests {
     }
 
     #[test]
+    fn parse_entry_rejects_unknown_tier() {
+        let err = parse_worker_entry("http://w:30000@tier=gold")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("tier"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_entry_rejects_unknown_backend() {
+        let err = parse_worker_entry("http://w:30000@backend=trtllm")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("backend"), "got: {err}");
+    }
+
+    #[test]
     fn parse_entry_userinfo_at_is_not_mistaken_for_token() {
         // A bare `@` (here in a hypothetical userinfo position) must not be
         // treated as the capability token — only `@min_priority=` splits.
-        let (url, prio) = parse_worker_entry("http://user@host:30000").unwrap();
+        let (url, caps) = parse_worker_entry("http://user@host:30000").unwrap();
         assert_eq!(url, "http://user@host:30000");
-        assert_eq!(prio, None);
+        assert_eq!(caps.min_priority, None);
+        assert_eq!(caps.backend, WorkerBackend::Sglang);
     }
 
     /// Task exits cleanly when the consumer drops the receiver mid-fanout.

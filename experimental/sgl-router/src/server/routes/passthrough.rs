@@ -68,6 +68,7 @@ async fn passthrough(
     path: &'static str,
     log_name: &'static str,
 ) -> Result<Response<Body>, ApiError> {
+    let body = apply_request_priority_override(&ctx.config.priority_override, &headers, body)?;
     let probe = parse_probe(&body)?;
     let streaming = probe.stream.unwrap_or(false);
     let model_str = probe
@@ -139,7 +140,6 @@ async fn passthrough_primary(
     log_name: &'static str,
 ) -> Result<Response<Body>, ApiError> {
     let start = std::time::Instant::now();
-    let body = apply_request_priority_override(&ctx.config.priority_override, &headers, body)?;
     let probe = parse_probe(&body)?;
     let streaming = probe.stream.unwrap_or(false);
     let model_str = probe

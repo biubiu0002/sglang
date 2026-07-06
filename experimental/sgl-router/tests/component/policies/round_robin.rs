@@ -16,6 +16,8 @@ fn worker(id: &str) -> Arc<Worker> {
         bootstrap_port: None,
         min_priority: None,
         bearer_token: None,
+        backend: Default::default(),
+        tier: Default::default(),
     }))
 }
 

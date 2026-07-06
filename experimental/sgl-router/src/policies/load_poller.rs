@@ -7,7 +7,7 @@
 //! "how busy is this worker" signal for a mixed short/long workload: one
 //! 200k-token request and one 2k request both count as load 1, yet load
 //! the engine completely differently. This poller periodically asks each
-//! worker for its REAL queue depth via the worker's `/get_load` endpoint
+//! worker for its REAL request pressure via the worker's `/get_load` endpoint
 //! and stores it on `Worker::reported_load`, which the `cache_aware_zmq`
 //! policy consumes (via `Worker::effective_load`) for its min-load /
 //! imbalance / hit-load-guard decisions.
@@ -28,15 +28,18 @@ use std::time::Duration;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
+use crate::discovery::WorkerBackend;
 use crate::policies::active_load::JanitorHandle;
-use crate::workers::worker::REPORTED_LOAD_FAILED;
+use crate::workers::worker::{REPORTED_LOAD_FAILED, REPORTED_LOAD_UNSET};
 use crate::workers::WorkerRegistry;
 
 /// Per-`dp_rank` entry from a worker's `/get_load` response, e.g.
 /// `[{"dp_rank":0,"num_reqs":0,"num_waiting_reqs":0,"num_tokens":0,...}, ...]`.
-/// Unknown fields are ignored; we only need the waiting-request count.
+/// Unknown fields are ignored; routing needs the request pressure.
 #[derive(Debug, Deserialize)]
 struct GetLoadEntry {
+    #[serde(default)]
+    num_reqs: i64,
     #[serde(default)]
     num_waiting_reqs: i64,
 }
@@ -47,16 +50,33 @@ struct GetLoadEntry {
 /// stall the whole poll round.
 const GET_LOAD_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Sum `num_waiting_reqs` across all dp ranks reported by one worker.
+/// Sum active plus waiting requests across all dp ranks reported by one worker.
+///
+/// Borrowing production B200 capacity must treat already-running production
+/// requests as busy, not only queued requests. Counting both fields keeps
+/// idle-borrow routing conservative.
 /// Returns `None` if the body does not parse as the expected array.
-fn parse_total_waiting(body: &str) -> Option<i64> {
+fn parse_total_request_pressure(body: &str) -> Option<i64> {
     let entries: Vec<GetLoadEntry> = serde_json::from_str(body).ok()?;
-    Some(entries.iter().map(|e| e.num_waiting_reqs.max(0)).sum())
+    Some(
+        entries
+            .iter()
+            .map(|e| e.num_reqs.max(0).saturating_add(e.num_waiting_reqs.max(0)))
+            .sum(),
+    )
 }
 
 /// Poll one worker's `/get_load` once and store the result (or the
 /// failure sentinel) on the worker. Never panics; never returns an error.
 async fn poll_one(client: &reqwest::Client, worker: &Arc<crate::workers::worker::Worker>) {
+    if worker.backend() == WorkerBackend::Vllm {
+        worker.set_reported_load(REPORTED_LOAD_UNSET);
+        tracing::debug!(
+            worker_url = %worker.url,
+            "load-poller: skipping vLLM worker without SGLang /get_load"
+        );
+        return;
+    }
     let url = format!("{}/get_load", worker.url.trim_end_matches('/'));
     let outcome = async {
         let mut req = client.get(&url).timeout(GET_LOAD_TIMEOUT);
@@ -71,7 +91,7 @@ async fn poll_one(client: &reqwest::Client, worker: &Arc<crate::workers::worker:
             return None;
         }
         let body = resp.text().await.ok()?;
-        parse_total_waiting(&body)
+        parse_total_request_pressure(&body)
     }
     .await;
     match outcome {
@@ -136,32 +156,88 @@ pub fn spawn_load_poller(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
+    use crate::workers::worker::REPORTED_LOAD_FAILED;
 
     #[test]
-    fn parse_sums_waiting_across_dp_ranks() {
+    fn parse_sums_active_and_waiting_across_dp_ranks() {
         let body = r#"[
             {"dp_rank":0,"num_reqs":3,"num_waiting_reqs":2,"num_tokens":100},
             {"dp_rank":1,"num_reqs":1,"num_waiting_reqs":5,"num_tokens":50}
         ]"#;
-        assert_eq!(parse_total_waiting(body), Some(7));
+        assert_eq!(parse_total_request_pressure(body), Some(11));
     }
 
     #[test]
     fn parse_single_rank() {
         let body = r#"[{"dp_rank":0,"num_reqs":0,"num_waiting_reqs":0,"num_tokens":0}]"#;
-        assert_eq!(parse_total_waiting(body), Some(0));
+        assert_eq!(parse_total_request_pressure(body), Some(0));
     }
 
     #[test]
     fn parse_negative_clamped_to_zero() {
         // Defensive: a bogus negative waiting count must not underflow the sum.
-        let body = r#"[{"num_waiting_reqs":-4},{"num_waiting_reqs":3}]"#;
-        assert_eq!(parse_total_waiting(body), Some(3));
+        let body = r#"[{"num_reqs":2,"num_waiting_reqs":-4},{"num_reqs":-5,"num_waiting_reqs":3}]"#;
+        assert_eq!(parse_total_request_pressure(body), Some(5));
     }
 
     #[test]
     fn parse_rejects_non_array() {
-        assert_eq!(parse_total_waiting("not json"), None);
-        assert_eq!(parse_total_waiting(r#"{"num_waiting_reqs":1}"#), None);
+        assert_eq!(parse_total_request_pressure("not json"), None);
+        assert_eq!(
+            parse_total_request_pressure(r#"{"num_waiting_reqs":1}"#),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_round_skips_vllm_worker_without_get_load() {
+        let registry = Arc::new(WorkerRegistry::default());
+        let id = WorkerId("vllm".into());
+        registry
+            .add(WorkerSpec {
+                id: id.clone(),
+                url: "http://127.0.0.1:9".into(),
+                mode: WorkerMode::Plain,
+                model_ids: vec![ModelId("m".into())],
+                bootstrap_port: None,
+                min_priority: None,
+                bearer_token: None,
+                backend: WorkerBackend::Vllm,
+                tier: Default::default(),
+            })
+            .unwrap();
+        let worker = registry.get(&id).unwrap();
+        worker.set_reported_load(REPORTED_LOAD_FAILED);
+        let client = reqwest::Client::new();
+
+        poll_round(&client, &registry).await;
+
+        assert_eq!(worker.reported_load(), REPORTED_LOAD_UNSET);
+    }
+
+    #[tokio::test]
+    async fn poll_round_marks_sglang_worker_failed_on_missing_get_load() {
+        let registry = Arc::new(WorkerRegistry::default());
+        let id = WorkerId("sglang".into());
+        registry
+            .add(WorkerSpec {
+                id: id.clone(),
+                url: "http://127.0.0.1:9".into(),
+                mode: WorkerMode::Plain,
+                model_ids: vec![ModelId("m".into())],
+                bootstrap_port: None,
+                min_priority: None,
+                bearer_token: None,
+                backend: WorkerBackend::Sglang,
+                tier: Default::default(),
+            })
+            .unwrap();
+        let worker = registry.get(&id).unwrap();
+        let client = reqwest::Client::new();
+
+        poll_round(&client, &registry).await;
+
+        assert_eq!(worker.reported_load(), REPORTED_LOAD_FAILED);
     }
 }

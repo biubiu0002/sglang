@@ -198,10 +198,10 @@ async fn main() -> Result<()> {
         };
 
     // Build the KV-event index up front so the cache-aware-zmq policy can
-    // share its `HashTree` handle + `BlockSizeOracle`. When no model uses
-    // `cache_aware_zmq`, the index is still constructed (cheap) but no
-    // subscribers are ever added.
+    // share its `HashTree` handle + `BlockSizeOracle`. Only ZMQ-backed
+    // cache-aware routing attaches subscribers to worker KV event ports.
     let block_size_oracle = sgl_router::policies::kv_events::BlockSizeOracle::new();
+    let cache_tree_source = cfg.model.cache_aware.as_ref().map(|c| c.tree_source);
 
     // Route-history tree mode: the router feeds the prefix tree from its own
     // routing decisions instead of subscribing to worker ZMQ KV-events. In
@@ -210,8 +210,12 @@ async fn main() -> Result<()> {
     // and we deliberately DON'T attach ZMQ subscribers (no worker ZMQ port
     // needed — works over NAT/Vast public mappings).
     let route_history = matches!(
-        cfg.model.cache_aware.as_ref().map(|c| c.tree_source),
+        cache_tree_source,
         Some(sgl_router::config::CacheTreeSource::RouteHistory)
+    );
+    let uses_zmq_cache_events = matches!(
+        cache_tree_source,
+        Some(sgl_router::config::CacheTreeSource::Zmq)
     );
     if route_history {
         if let Some(ps) = cfg.cache_tree_page_size {
@@ -305,11 +309,14 @@ async fn main() -> Result<()> {
     // poll each worker's /get_load for its real queue depth and feed it to
     // cache_aware_zmq (instead of the router-side in-flight count). Reuses the
     // worker introspect key for auth. None => not spawned (in-flight count).
-    let load_poller_handle = cfg.load_poll_interval_secs.map(|ms| {
-        tracing::info!(interval_ms = ms, "spawning worker load poller (/get_load)");
+    let load_poller_handle = cfg.load_poll_interval_secs.map(|secs| {
+        tracing::info!(
+            interval_secs = secs,
+            "spawning worker load poller (/get_load)"
+        );
         sgl_router::policies::load_poller::spawn_load_poller(
             Arc::clone(&registry),
-            std::time::Duration::from_millis(ms),
+            std::time::Duration::from_secs(secs),
             cfg.worker_introspect_key.clone(),
         )
     });
@@ -318,17 +325,16 @@ async fn main() -> Result<()> {
     let (event_rx, discovery_handle) = sgl_router::discovery::spawn_discovery(&cfg)
         .await
         .context("spawn discovery")?;
-    // In route-history mode, do NOT attach the KV-event index to the manager:
-    // that path introspects each worker's /server_info and spawns ZMQ
-    // subscribers, which is exactly what route-history avoids. The policy still
-    // shares the same tree handle (built above) — it's just fed by routing
-    // decisions instead of ZMQ events.
-    let kv_index_opt: Option<Arc<sgl_router::policies::kv_events::KvEventIndex>> = if route_history
-    {
-        None
-    } else {
-        Some(Arc::clone(&kv_index))
-    };
+    // Only ZMQ cache-aware mode attaches the KV-event index to the manager.
+    // Route-history feeds the tree from routing decisions, and non-cache
+    // policies such as tiered_spillover should not introspect /server_info or
+    // subscribe to worker KV event ports.
+    let kv_index_opt: Option<Arc<sgl_router::policies::kv_events::KvEventIndex>> =
+        if uses_zmq_cache_events {
+            Some(Arc::clone(&kv_index))
+        } else {
+            None
+        };
     let manager_handle = tokio::spawn(sgl_router::workers::manager::run_with_config(
         event_rx,
         registry.clone(),

@@ -41,6 +41,7 @@ async fn failover_when_one_worker_dies() {
                 cool_down_secs: 30,
             }),
             cache_aware: None,
+            tiered_spillover: None,
             sticky: None,
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
@@ -50,6 +51,7 @@ async fn failover_when_one_worker_dies() {
         proxy: ProxyConfig::default(),
         active_load: ActiveLoadConfig::default(),
         trace: TraceConfig::default(),
+        priority_override: PriorityOverrideConfig::default(),
         worker_introspect_key: None,
         load_poll_interval_secs: None,
         cache_tree_page_size: None,

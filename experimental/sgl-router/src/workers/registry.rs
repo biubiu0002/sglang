@@ -255,6 +255,8 @@ mod tests {
             bootstrap_port: None,
             min_priority: None,
             bearer_token: None,
+            backend: Default::default(),
+            tier: Default::default(),
         }
     }
 

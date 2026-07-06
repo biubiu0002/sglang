@@ -121,6 +121,7 @@ mod tests {
                 policy: PolicyKind::RoundRobin,
                 circuit_breaker: None,
                 cache_aware: None,
+                tiered_spillover: None,
                 sticky: None,
             },
             discovery: crate::config::DiscoveryBackend::StaticUrls(

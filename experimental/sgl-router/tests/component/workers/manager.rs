@@ -47,6 +47,8 @@ fn spec_for(id: &str, url: &str, mode: WorkerMode) -> WorkerSpec {
         bootstrap_port: None,
         min_priority: None,
         bearer_token: None,
+        backend: Default::default(),
+        tier: Default::default(),
     }
 }
 

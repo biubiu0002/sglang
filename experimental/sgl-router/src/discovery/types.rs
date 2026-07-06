@@ -35,6 +35,36 @@ pub enum WorkerMode {
     Decode,
 }
 
+/// Serving backend exposed by a worker URL.
+///
+/// Static URL discovery defaults to SGLang. Non-SGLang backends must be
+/// opted in explicitly because they may not expose SGLang-only control
+/// endpoints such as `/server_info`, `/get_load`, or KV event metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerBackend {
+    #[default]
+    Sglang,
+    Vllm,
+}
+
+/// Operator-defined capacity tier for cross-pool routing.
+///
+/// The default tier preserves existing behavior. Static URL discovery can
+/// seed `bulk` for internal H20/vLLM capacity and `shared` for production
+/// B200 workers that a low-priority gateway may borrow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerTier {
+    #[default]
+    #[value(name = "default")]
+    Default,
+    #[value(name = "bulk")]
+    Bulk,
+    #[value(name = "shared")]
+    Shared,
+}
+
 /// Immutable worker description emitted by a discovery backend.
 ///
 /// Backends emit [`DiscoveryEvent::Added`] carrying a `WorkerSpec` when a
@@ -79,6 +109,14 @@ pub struct WorkerSpec {
     /// shared-key pools on normal inbound Authorization forwarding.
     #[serde(default)]
     pub bearer_token: Option<String>,
+    /// Worker serving backend. Defaults to SGLang for backwards
+    /// compatibility with existing discovery payloads.
+    #[serde(default)]
+    pub backend: WorkerBackend,
+    /// Operator-defined routing tier. Defaults to `default` for backwards
+    /// compatibility with existing discovery payloads and policies.
+    #[serde(default)]
+    pub tier: WorkerTier,
 }
 
 /// Event produced by a discovery backend and consumed by `WorkerManager`.
@@ -120,6 +158,8 @@ mod tests {
             bootstrap_port: None,
             min_priority: None,
             bearer_token: None,
+            backend: WorkerBackend::Sglang,
+            tier: WorkerTier::Default,
         };
         let s = serde_json::to_string(&w).unwrap();
         let d: WorkerSpec = serde_json::from_str(&s).unwrap();
@@ -136,6 +176,8 @@ mod tests {
             bootstrap_port: Some(8997),
             min_priority: None,
             bearer_token: None,
+            backend: WorkerBackend::Sglang,
+            tier: WorkerTier::Default,
         };
         let s = serde_json::to_string(&w).unwrap();
         assert!(s.contains("\"bootstrap_port\":8997"));
@@ -153,6 +195,8 @@ mod tests {
             bootstrap_port: None,
             min_priority: Some(100),
             bearer_token: None,
+            backend: WorkerBackend::Sglang,
+            tier: WorkerTier::Default,
         };
         let s = serde_json::to_string(&w).unwrap();
         assert!(s.contains("\"min_priority\":100"));
@@ -167,6 +211,40 @@ mod tests {
         let json = r#"{"id":"w","url":"http://x","mode":"plain","model_ids":["m"]}"#;
         let w: WorkerSpec = serde_json::from_str(json).unwrap();
         assert_eq!(w.min_priority, None);
+    }
+
+    #[test]
+    fn worker_spec_deserializes_with_missing_backend() {
+        let json = r#"{"id":"w","url":"http://x","mode":"plain","model_ids":["m"]}"#;
+        let w: WorkerSpec = serde_json::from_str(json).unwrap();
+        assert_eq!(w.backend, WorkerBackend::Sglang);
+    }
+
+    #[test]
+    fn worker_spec_deserializes_with_missing_tier() {
+        let json = r#"{"id":"w","url":"http://x","mode":"plain","model_ids":["m"]}"#;
+        let w: WorkerSpec = serde_json::from_str(json).unwrap();
+        assert_eq!(w.tier, WorkerTier::Default);
+    }
+
+    #[test]
+    fn worker_spec_with_vllm_backend_round_trip() {
+        let w = WorkerSpec {
+            id: WorkerId("vllm1".into()),
+            url: "http://10.0.0.7:8006".into(),
+            mode: WorkerMode::Plain,
+            model_ids: vec![ModelId("glm".into())],
+            bootstrap_port: None,
+            min_priority: Some(100),
+            bearer_token: None,
+            backend: WorkerBackend::Vllm,
+            tier: WorkerTier::Bulk,
+        };
+        let s = serde_json::to_string(&w).unwrap();
+        assert!(s.contains("\"backend\":\"vllm\""));
+        assert!(s.contains("\"tier\":\"bulk\""));
+        let d: WorkerSpec = serde_json::from_str(&s).unwrap();
+        assert_eq!(w, d);
     }
 
     #[test]
@@ -205,6 +283,8 @@ mod tests {
             bootstrap_port: None,
             min_priority: None,
             bearer_token: None,
+            backend: WorkerBackend::Sglang,
+            tier: Default::default(),
         });
         let s = serde_json::to_string(&e).unwrap();
         let d: DiscoveryEvent = serde_json::from_str(&s).unwrap();

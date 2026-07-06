@@ -53,6 +53,13 @@ pub struct ServerInfo {
     pub disaggregation_role: Option<DisaggregationRole>,
 }
 
+/// Minimal OpenAI-compatible model discovery result for non-SGLang
+/// backends such as vLLM.
+#[derive(Debug, Clone, Default)]
+pub struct OpenAIModelsInfo {
+    pub model_ids: Vec<String>,
+}
+
 /// PD classification derived from a worker's `/server_info` response.
 ///
 /// `Some(_)` means the worker self-disclosed its role and we should trust
@@ -189,6 +196,36 @@ impl WorkerIntrospector {
         }
     }
 
+    /// Fetch an OpenAI-compatible `/v1/models` listing. Intended for vLLM
+    /// workers, which do not expose SGLang `/server_info`.
+    pub async fn fetch_openai_models_with_bearer(
+        &self,
+        worker_url: &str,
+        bearer: Option<&str>,
+    ) -> OpenAIModelsInfo {
+        let models_url = openai_models_url(worker_url);
+        let parsed = match Self::fetch_openai_models_with_retry(
+            &self.client,
+            &models_url,
+            worker_url,
+            bearer,
+        )
+        .await
+        {
+            Some(p) => p,
+            None => return OpenAIModelsInfo::default(),
+        };
+        let model_ids = parsed
+            .data
+            .into_iter()
+            .filter_map(|m| {
+                let id = m.id.trim().to_string();
+                (!id.is_empty()).then_some(id)
+            })
+            .collect();
+        OpenAIModelsInfo { model_ids }
+    }
+
     /// Issue the `/server_info` GET with bounded retry on transient
     /// errors. Returns `Some(body)` on success, `None` after exhausting
     /// retries (the caller falls back to default `ServerInfo`).
@@ -255,6 +292,80 @@ impl WorkerIntrospector {
             "introspect: /server_info failed after retries; registering worker with empty model_ids"
         );
         None
+    }
+
+    async fn fetch_openai_models_with_retry(
+        client: &reqwest::Client,
+        models_url: &str,
+        worker_url: &str,
+        bearer: Option<&str>,
+    ) -> Option<OpenAIModelsBody> {
+        let mut delay = FETCH_BACKOFF_BASE;
+        for attempt in 1..=FETCH_MAX_ATTEMPTS {
+            let mut req = client.get(models_url);
+            if let Some(token) = bearer {
+                let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+                    .expect("worker bearer token must be a valid HTTP header value");
+                value.set_sensitive(true);
+                req = req.header(reqwest::header::AUTHORIZATION, value);
+            }
+            match req.send().await {
+                Err(e) => {
+                    warn!(
+                        worker_url = %worker_url,
+                        attempt,
+                        error = %e,
+                        "introspect: /v1/models request failed; will retry"
+                    );
+                }
+                Ok(resp) if resp.status().is_server_error() => {
+                    warn!(
+                        worker_url = %worker_url,
+                        attempt,
+                        status = %resp.status(),
+                        "introspect: /v1/models returned 5xx; will retry"
+                    );
+                }
+                Ok(resp) if !resp.status().is_success() => {
+                    warn!(
+                        worker_url = %worker_url,
+                        status = %resp.status(),
+                        "introspect: /v1/models returned non-2xx; registering worker with empty model_ids"
+                    );
+                    return None;
+                }
+                Ok(resp) => match resp.json::<OpenAIModelsBody>().await {
+                    Ok(body) => return Some(body),
+                    Err(e) => {
+                        warn!(
+                            worker_url = %worker_url,
+                            error = %e,
+                            "introspect: /v1/models JSON parse failed; registering worker with empty model_ids"
+                        );
+                        return None;
+                    }
+                },
+            }
+            if attempt < FETCH_MAX_ATTEMPTS {
+                tokio::time::sleep(delay).await;
+                delay *= 2;
+            }
+        }
+        warn!(
+            worker_url = %worker_url,
+            attempts = FETCH_MAX_ATTEMPTS,
+            "introspect: /v1/models failed after retries; registering worker with empty model_ids"
+        );
+        None
+    }
+}
+
+fn openai_models_url(worker_url: &str) -> String {
+    let base = worker_url.trim_end_matches('/');
+    if base.ends_with("/v1") {
+        format!("{base}/models")
+    } else {
+        format!("{base}/v1/models")
     }
 }
 
@@ -381,6 +492,18 @@ struct ServerInfoBody {
     disaggregation_bootstrap_port: Option<u16>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct OpenAIModelsBody {
+    #[serde(default)]
+    data: Vec<OpenAIModelEntry>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct OpenAIModelEntry {
+    #[serde(default)]
+    id: String,
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct KvEventsBlock {
     // Forward-compatibility: the only publisher implementation
@@ -430,8 +553,66 @@ mod tests {
         (format!("http://127.0.0.1:{port}"), tx)
     }
 
+    async fn spawn_fake_openai_worker(body: Value) -> (String, oneshot::Sender<()>) {
+        let body = Arc::new(body);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route(
+                "/v1/models",
+                get({
+                    let body = body.clone();
+                    move || {
+                        let body = body.clone();
+                        async move { Json((*body).clone()) }
+                    }
+                }),
+            )
+            .route(
+                "/models",
+                get(move || {
+                    let body = body.clone();
+                    async move { Json((*body).clone()) }
+                }),
+            );
+        let (tx, rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = rx.await;
+                })
+                .await;
+        });
+        (format!("http://127.0.0.1:{port}"), tx)
+    }
+
     fn fast_introspector() -> WorkerIntrospector {
         WorkerIntrospector::new(Duration::from_millis(500))
+    }
+
+    #[tokio::test]
+    async fn fetch_openai_models_discovers_model_ids() {
+        let (url, _shutdown) = spawn_fake_openai_worker(json!({
+            "object": "list",
+            "data": [{"id": "glm-5.2-fp8-1m-mtp"}, {"id": ""}]
+        }))
+        .await;
+        let info = fast_introspector()
+            .fetch_openai_models_with_bearer(&url, None)
+            .await;
+        assert_eq!(info.model_ids, vec!["glm-5.2-fp8-1m-mtp"]);
+    }
+
+    #[tokio::test]
+    async fn openai_models_url_accepts_v1_base_url() {
+        let (url, _shutdown) = spawn_fake_openai_worker(json!({
+            "data": [{"id": "m"}]
+        }))
+        .await;
+        let info = fast_introspector()
+            .fetch_openai_models_with_bearer(&format!("{url}/v1"), None)
+            .await;
+        assert_eq!(info.model_ids, vec!["m"]);
     }
 
     /// The PRIMARY `/server_info` path (the introspector, not the discovery.rs

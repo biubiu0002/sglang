@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::config::Config;
-use crate::discovery::{DiscoveryEvent, ModelId, WorkerId, WorkerMode, WorkerSpec};
+use crate::discovery::{DiscoveryEvent, ModelId, WorkerBackend, WorkerId, WorkerMode, WorkerSpec};
 use crate::health::circuit_breaker::CircuitBreakerConfig;
 use crate::policies::active_load::ActiveLoadRegistry;
 use crate::policies::kv_events::KvEventIndex;
@@ -353,11 +353,12 @@ fn reconcile_unresolved_workers(
         // Rebuild a discovery-shaped spec: empty `model_ids` so
         // `register_one` re-resolves them from `/server_info`; current
         // mode + bootstrap_port as the seed (`register_one` re-applies
-        // any `/server_info` override). `min_priority` is a config-time
-        // capability that `/server_info` never carries, so it MUST be
-        // carried over from the live worker — dropping it here would let a
-        // priority-gated worker (e.g. `@min_priority=100`) silently start
-        // accepting priority-0 traffic once it finishes re-introspecting.
+        // any `/server_info` override). `min_priority`, backend, and tier are
+        // config-time facts that `/server_info` never carries, so they MUST be
+        // carried over from the live worker. Dropping min_priority here would
+        // let a priority-gated worker silently start accepting priority-0
+        // traffic; dropping backend would make a vLLM worker retry through
+        // SGLang-only endpoints; dropping tier would break tiered spillover.
         let spec = WorkerSpec {
             id: id.clone(),
             url: worker.url.clone(),
@@ -366,6 +367,8 @@ fn reconcile_unresolved_workers(
             bootstrap_port: worker.bootstrap_port(),
             min_priority: worker.min_priority(),
             bearer_token: worker.bearer_token().map(ToOwned::to_owned),
+            backend: worker.backend(),
+            tier: worker.tier(),
         };
         // `debug!` not `info!`: this fires every interval for each
         // still-unresolved worker, so info-level would spam for a worker
@@ -401,46 +404,69 @@ async fn register_one(
     introspector: Arc<WorkerIntrospector>,
 ) {
     let worker_url = spec.url.clone();
-    let info = introspector
-        .fetch_with_bearer(&worker_url, spec.bearer_token.as_deref())
-        .await;
-    if let Some(name) = info.served_model_name {
-        let mut model_ids = vec![ModelId(name)];
-        if let Some(public_model_id) = cfg.as_ref().map(|cfg| ModelId(cfg.model.id.clone())) {
-            if !model_ids.contains(&public_model_id) {
-                model_ids.push(public_model_id);
+    let backend = spec.backend;
+    let mut sglang_event_config = None;
+    match backend {
+        WorkerBackend::Sglang => {
+            let info = introspector
+                .fetch_with_bearer(&worker_url, spec.bearer_token.as_deref())
+                .await;
+            if let Some(name) = info.served_model_name {
+                let mut model_ids = vec![ModelId(name)];
+                if let Some(public_model_id) = cfg.as_ref().map(|cfg| ModelId(cfg.model.id.clone()))
+                {
+                    if !model_ids.contains(&public_model_id) {
+                        model_ids.push(public_model_id);
+                    }
+                }
+                spec.model_ids = model_ids;
             }
+            // Trust `/server_info` over the discovery backend when the worker
+            // self-disclosed its PD role: the server's own ServerArgs is the
+            // authoritative source for `disaggregation_mode` and
+            // `disaggregation_bootstrap_port`. The backend's mode (from K8s
+            // labels, static-urls seed, etc.) was a best-guess seed; if the
+            // server says it's actually a prefill peer on port 8998, that wins.
+            // `None` here means the worker didn't tell us — keep the backend's
+            // classification (older SGLang without the field, partial response,
+            // unknown mode value, etc.).
+            if let Some(role) = info.disaggregation_role {
+                let (new_mode, new_port) = match role {
+                    DisaggregationRole::Plain => (WorkerMode::Plain, None),
+                    DisaggregationRole::Prefill { bootstrap_port } => {
+                        (WorkerMode::Prefill, Some(bootstrap_port))
+                    }
+                    DisaggregationRole::Decode => (WorkerMode::Decode, None),
+                };
+                if (new_mode, new_port) != (spec.mode, spec.bootstrap_port) {
+                    tracing::info!(
+                        worker_url = %worker_url,
+                        backend_mode = ?spec.mode,
+                        resolved_mode = ?new_mode,
+                        backend_bootstrap_port = ?spec.bootstrap_port,
+                        resolved_bootstrap_port = ?new_port,
+                        "/server_info overrode discovery-backend classification",
+                    );
+                    spec.mode = new_mode;
+                    spec.bootstrap_port = new_port;
+                }
+            }
+            sglang_event_config = info.event_config;
         }
-        spec.model_ids = model_ids;
-    }
-    // Trust `/server_info` over the discovery backend when the worker
-    // self-disclosed its PD role: the server's own ServerArgs is the
-    // authoritative source for `disaggregation_mode` and
-    // `disaggregation_bootstrap_port`. The backend's mode (from K8s
-    // labels, static-urls seed, etc.) was a best-guess seed; if the
-    // server says it's actually a prefill peer on port 8998, that wins.
-    // `None` here means the worker didn't tell us — keep the backend's
-    // classification (older SGLang without the field, partial response,
-    // unknown mode value, etc.).
-    if let Some(role) = info.disaggregation_role {
-        let (new_mode, new_port) = match role {
-            DisaggregationRole::Plain => (WorkerMode::Plain, None),
-            DisaggregationRole::Prefill { bootstrap_port } => {
-                (WorkerMode::Prefill, Some(bootstrap_port))
+        WorkerBackend::Vllm => {
+            let info = introspector
+                .fetch_openai_models_with_bearer(&worker_url, spec.bearer_token.as_deref())
+                .await;
+            if !info.model_ids.is_empty() {
+                let mut model_ids: Vec<ModelId> = info.model_ids.into_iter().map(ModelId).collect();
+                if let Some(public_model_id) = cfg.as_ref().map(|cfg| ModelId(cfg.model.id.clone()))
+                {
+                    if !model_ids.contains(&public_model_id) {
+                        model_ids.push(public_model_id);
+                    }
+                }
+                spec.model_ids = model_ids;
             }
-            DisaggregationRole::Decode => (WorkerMode::Decode, None),
-        };
-        if (new_mode, new_port) != (spec.mode, spec.bootstrap_port) {
-            tracing::info!(
-                worker_url = %worker_url,
-                backend_mode = ?spec.mode,
-                resolved_mode = ?new_mode,
-                backend_bootstrap_port = ?spec.bootstrap_port,
-                resolved_bootstrap_port = ?new_port,
-                "/server_info overrode discovery-backend classification",
-            );
-            spec.mode = new_mode;
-            spec.bootstrap_port = new_port;
         }
     }
     let cb = cfg.as_ref().and_then(|c| cb_config_for_spec(&spec, c));
@@ -458,10 +484,10 @@ async fn register_one(
         );
         return;
     }
-    if let Some(idx) = kv_index {
+    if let (Some(idx), WorkerBackend::Sglang) = (kv_index, backend) {
         // Pass the pre-resolved EventConfig so the KvEventIndex does
         // not issue a second `/server_info` round-trip.
-        idx.add_worker(&worker_url, info.event_config).await;
+        idx.add_worker(&worker_url, sglang_event_config).await;
     }
 }
 
@@ -496,6 +522,7 @@ mod tests {
                     cool_down_secs,
                 }),
                 cache_aware: None,
+                tiered_spillover: None,
                 sticky: None,
             },
             discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
@@ -528,6 +555,8 @@ mod tests {
             bootstrap_port: None,
             min_priority: None,
             bearer_token: None,
+            backend: Default::default(),
+            tier: Default::default(),
         };
         let cb = cb_config_for_spec(&spec, &cfg).expect("model has cb config");
         assert_eq!(cb.threshold.get(), 5);
@@ -542,6 +571,28 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let app = Router::new().route(
             "/server_info",
+            get(move || {
+                let body = body.clone();
+                async move { Json((*body).clone()) }
+            }),
+        );
+        let (tx, rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = rx.await;
+                })
+                .await;
+        });
+        (format!("http://127.0.0.1:{port}"), tx)
+    }
+
+    async fn spawn_fake_openai_models_worker(body: Value) -> (String, oneshot::Sender<()>) {
+        let body = Arc::new(body);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new().route(
+            "/v1/models",
             get(move || {
                 let body = body.clone();
                 async move { Json((*body).clone()) }
@@ -597,6 +648,8 @@ mod tests {
             bootstrap_port: None,
             min_priority: None,
             bearer_token: None,
+            backend: Default::default(),
+            tier: Default::default(),
         };
         tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
 
@@ -642,6 +695,8 @@ mod tests {
             bootstrap_port: None,
             min_priority: None,
             bearer_token: None,
+            backend: Default::default(),
+            tier: Default::default(),
         };
         tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
 
@@ -665,6 +720,118 @@ mod tests {
 
         drop(tx);
         let _ = manager_handle.await;
+    }
+
+    #[tokio::test]
+    async fn manager_discovers_vllm_worker_via_openai_models() {
+        let (worker_url, _shutdown) = spawn_fake_openai_models_worker(json!({
+            "object": "list",
+            "data": [{"id": "glm-5.2-fp8-1m-mtp"}]
+        }))
+        .await;
+
+        let registry = Arc::new(WorkerRegistry::default());
+        let (tx, rx) = mpsc::channel::<DiscoveryEvent>(8);
+        let cfg = Arc::new(cfg_with_model_cb("zai-org/GLM-5.2-FP8", 3, 30));
+        let manager_handle = tokio::spawn(run_with_introspector(
+            rx,
+            registry.clone(),
+            Some(cfg),
+            None,
+            None,
+            fast_introspector(),
+        ));
+
+        let spec = WorkerSpec {
+            id: WorkerId("h20-vllm".into()),
+            url: worker_url,
+            mode: WorkerMode::Plain,
+            model_ids: Vec::new(),
+            bootstrap_port: None,
+            min_priority: Some(100),
+            bearer_token: None,
+            backend: WorkerBackend::Vllm,
+            tier: Default::default(),
+        };
+        tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
+
+        let registered = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let internal = registry.workers_for(&ModelId("glm-5.2-fp8-1m-mtp".into()));
+                let public = registry.workers_for(&ModelId("zai-org/GLM-5.2-FP8".into()));
+                if internal.iter().any(|w| w.id == spec.id)
+                    && public.iter().any(|w| {
+                        w.id == spec.id
+                            && w.backend() == WorkerBackend::Vllm
+                            && w.min_priority() == Some(100)
+                    })
+                {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            registered.is_ok(),
+            "manager did not register vLLM worker under internal and public model ids"
+        );
+
+        drop(tx);
+        let _ = manager_handle.await;
+    }
+
+    #[tokio::test]
+    async fn manager_keeps_vllm_worker_out_of_kv_event_index() {
+        let (worker_url, _shutdown) = spawn_fake_openai_models_worker(json!({
+            "data": [{"id": "glm-5.2-fp8-1m-mtp"}]
+        }))
+        .await;
+
+        let registry = Arc::new(WorkerRegistry::default());
+        let kv_index = KvEventIndex::new();
+        let (tx, rx) = mpsc::channel::<DiscoveryEvent>(8);
+        let manager_handle = tokio::spawn(run_with_introspector(
+            rx,
+            registry.clone(),
+            None,
+            Some(kv_index.clone()),
+            None,
+            fast_introspector(),
+        ));
+
+        let spec = WorkerSpec {
+            id: WorkerId("h20-vllm".into()),
+            url: worker_url,
+            mode: WorkerMode::Plain,
+            model_ids: Vec::new(),
+            bootstrap_port: None,
+            min_priority: None,
+            bearer_token: None,
+            backend: WorkerBackend::Vllm,
+            tier: Default::default(),
+        };
+        tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
+
+        let registered = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if registry.get(&spec.id).is_some() {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(registered.is_ok(), "manager did not register vLLM worker");
+        assert_eq!(
+            kv_index.known_worker_count(),
+            0,
+            "vLLM worker must not be attached to SGLang KV event index"
+        );
+
+        drop(tx);
+        let _ = manager_handle.await;
+        kv_index.shutdown().await;
     }
 
     /// Worker unreachable (connection refused) => registry still has the
@@ -693,6 +860,8 @@ mod tests {
             bootstrap_port: None,
             min_priority: None,
             bearer_token: None,
+            backend: Default::default(),
+            tier: Default::default(),
         };
         tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
 
@@ -744,6 +913,8 @@ mod tests {
                 bootstrap_port: None,
                 min_priority: None,
                 bearer_token: None,
+                backend: Default::default(),
+                tier: Default::default(),
             };
             tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
             let registered = tokio::time::timeout(Duration::from_secs(2), async {
@@ -816,6 +987,8 @@ mod tests {
             bootstrap_port: None,
             min_priority: None,
             bearer_token: None,
+            backend: Default::default(),
+            tier: Default::default(),
         };
         tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
         // Wait until the manager has both registered the worker AND
@@ -919,6 +1092,8 @@ mod tests {
             bootstrap_port: None,
             min_priority: None,
             bearer_token: None,
+            backend: Default::default(),
+            tier: Default::default(),
         };
         tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
         // Wait for the manager to land the registry write so the
@@ -1001,6 +1176,8 @@ mod tests {
             bootstrap_port: None,
             min_priority: None,
             bearer_token: None,
+            backend: Default::default(),
+            tier: Default::default(),
         };
         tx.send(DiscoveryEvent::Added(spec.clone())).await.unwrap();
 
@@ -1106,6 +1283,8 @@ mod tests {
             bootstrap_port: None,
             min_priority: None,
             bearer_token: None,
+            backend: Default::default(),
+            tier: Default::default(),
         };
         tx.send(DiscoveryEvent::Added(spec)).await.unwrap();
 
@@ -1193,6 +1372,8 @@ mod tests {
             bootstrap_port: None,
             min_priority: Some(100),
             bearer_token: None,
+            backend: Default::default(),
+            tier: Default::default(),
         };
         tx.send(DiscoveryEvent::Added(spec)).await.unwrap();
 
@@ -1309,6 +1490,8 @@ mod tests {
             bootstrap_port: None,
             min_priority: None,
             bearer_token: None,
+            backend: Default::default(),
+            tier: Default::default(),
         }))
         .await
         .unwrap();
@@ -1438,6 +1621,8 @@ mod tests {
             bootstrap_port: None,
             min_priority: None,
             bearer_token: None,
+            backend: Default::default(),
+            tier: Default::default(),
         }))
         .await
         .unwrap();
@@ -1511,6 +1696,8 @@ mod tests {
             bootstrap_port: None,
             min_priority: None,
             bearer_token: None,
+            backend: Default::default(),
+            tier: Default::default(),
         }))
         .await
         .unwrap();

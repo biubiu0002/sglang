@@ -379,10 +379,12 @@ impl CacheAwareZmqPolicy {
             }
         }
     }
-}
 
-impl Policy for CacheAwareZmqPolicy {
-    fn select(&self, workers: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Option<Arc<Worker>> {
+    pub(crate) fn select_from_candidates(
+        &self,
+        workers: &[Arc<Worker>],
+        ctx: &SelectionContext<'_>,
+    ) -> Option<Arc<Worker>> {
         if workers.is_empty() {
             return None;
         }
@@ -547,6 +549,12 @@ impl Policy for CacheAwareZmqPolicy {
         self.feed_route_history(ctx.model(), &chosen, &block_hashes);
         chosen
     }
+}
+
+impl Policy for CacheAwareZmqPolicy {
+    fn select(&self, workers: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Option<Arc<Worker>> {
+        self.select_from_candidates(workers, ctx)
+    }
 
     fn needs_request_tokens(&self) -> bool {
         true
@@ -688,6 +696,8 @@ mod tests {
             bootstrap_port: None,
             min_priority: None,
             bearer_token: None,
+            backend: Default::default(),
+            tier: Default::default(),
         }))
     }
 
@@ -705,6 +715,7 @@ mod tests {
                 policy: crate::config::PolicyKind::RoundRobin,
                 circuit_breaker: None,
                 cache_aware: None,
+                tiered_spillover: None,
                 sticky: None,
             },
             discovery: crate::config::DiscoveryBackend::StaticUrls(

@@ -1,5 +1,7 @@
 use std::num::NonZeroU32;
 
+use crate::discovery::WorkerTier;
+
 /// In-memory router configuration, built from CLI flags by
 /// [`crate::config::cli::Cli::into_config`] and validated by
 /// [`Config::validate`]. The router serves exactly one model.
@@ -151,9 +153,8 @@ impl Default for ActiveLoadConfig {
 /// policy factory.
 ///
 /// Accepted on the CLI (`--policy`) as `round_robin` / `random` /
-/// `power_of_two` / `load_based` / `cache_aware_zmq` / `sticky`.
-/// `cache_aware_spillover` is kept as a CLI compatibility alias for
-/// deployed environments that predate the `cache_aware_zmq` name.
+/// `power_of_two` / `load_based` / `cache_aware_zmq` / `sticky` /
+/// `tiered_spillover` / `cache_aware_spillover`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum PolicyKind {
     #[default]
@@ -169,7 +170,7 @@ pub enum PolicyKind {
     /// Cache-aware routing fed by SGLang's ZMQ KV-cache event publisher.
     /// Requires the model to have a tokenizer loaded; cache_aware tuning
     /// lives on `ModelConfig::cache_aware`.
-    #[value(name = "cache_aware_zmq", alias = "cache_aware_spillover")]
+    #[value(name = "cache_aware_zmq")]
     CacheAwareZmq,
     /// Sticky-session routing: pins a routing key (read from a
     /// configurable request header) to a worker via an in-memory map, so
@@ -178,6 +179,15 @@ pub enum PolicyKind {
     /// `ModelConfig::sticky`.
     #[value(name = "sticky")]
     Sticky,
+    /// Prefer one operator-defined worker tier and spill to a second tier only
+    /// when the primary tier is above a configured TTFT pressure threshold.
+    #[value(name = "tiered_spillover")]
+    TieredSpillover,
+    /// Run cache-aware TTFT-first routing inside the primary tier, but fall
+    /// back to a spillover tier once the primary tier violates the configured
+    /// pressure guard.
+    #[value(name = "cache_aware_spillover")]
+    CacheAwareSpillover,
 }
 
 #[derive(Debug, Clone)]
@@ -233,11 +243,59 @@ pub struct ModelConfig {
     /// `policy = "cache_aware_zmq"`. `None` falls back to defaults at
     /// policy construction time.
     pub cache_aware: Option<CacheAwareConfig>,
+    /// Tuning for the tiered-spillover policy. `Some` exactly when
+    /// `policy = "tiered_spillover"`.
+    pub tiered_spillover: Option<TieredSpilloverConfig>,
     /// Tuning for the sticky-session policy. `Some` exactly when
     /// `policy = "sticky"` (built by [`crate::config::cli::Cli::into_config`]).
     /// The chat handler reads `sticky.header_name` to populate
     /// [`crate::policies::SelectionContext::routing_key`].
     pub sticky: Option<StickyConfig>,
+}
+
+/// Per-model tiered-spillover tuning. `tiered_spillover` uses the tier
+/// pressure directly; `cache_aware_spillover` uses it as the guard around
+/// cache-aware selection inside the primary tier.
+#[derive(Debug, Clone, Copy)]
+pub struct TieredSpilloverConfig {
+    /// Preferred worker tier, e.g. H20/vLLM bulk capacity.
+    pub primary_tier: WorkerTier,
+    /// Borrowed worker tier, e.g. B200 production workers protected by
+    /// engine-side priority scheduling.
+    pub spillover_tier: WorkerTier,
+    /// Spill to `spillover_tier` only when the least-pressured primary worker
+    /// is above this TTFT pressure threshold.
+    pub primary_pressure_threshold: usize,
+    /// Whether to include worker-reported `/get_load` queue depth for SGLang
+    /// workers. vLLM workers are never polled and use local pending pressure.
+    pub use_reported_load: bool,
+    /// Prompt-token units that count as one local TTFT pressure unit.
+    pub pressure_token_scale: usize,
+}
+
+pub fn default_tier_primary() -> WorkerTier {
+    WorkerTier::Bulk
+}
+pub fn default_tier_spillover() -> WorkerTier {
+    WorkerTier::Shared
+}
+pub fn default_tier_primary_pressure_threshold() -> usize {
+    0
+}
+pub fn default_tier_pressure_token_scale() -> usize {
+    64
+}
+
+impl Default for TieredSpilloverConfig {
+    fn default() -> Self {
+        Self {
+            primary_tier: default_tier_primary(),
+            spillover_tier: default_tier_spillover(),
+            primary_pressure_threshold: default_tier_primary_pressure_threshold(),
+            use_reported_load: false,
+            pressure_token_scale: default_tier_pressure_token_scale(),
+        }
+    }
 }
 
 /// Source of the prefix HashTree's data for `cache_aware_zmq`.

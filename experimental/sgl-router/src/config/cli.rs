@@ -15,8 +15,9 @@ use crate::config::{
     CacheAwareConfig, CacheTreeSource, CircuitBreakerConfig, Config, DiscoveryBackend,
     K8sDiscoveryConfig, LogFormat, ModelConfig, ObservabilityConfig, PolicyKind,
     PriorityOverrideConfig, ProxyConfig, RuntimeMode, ServerConfig, StaticUrlsDiscoveryConfig,
-    StickyConfig, TraceConfig, WorkerBearerKeyConfig,
+    StickyConfig, TieredSpilloverConfig, TraceConfig, WorkerBearerKeyConfig,
 };
+use crate::discovery::WorkerTier;
 
 /// `sgl-router` — slim KV-aware OpenAI-compatible router for SGLang workers.
 ///
@@ -68,7 +69,7 @@ pub struct Cli {
     #[arg(long)]
     pub cb_cool_down_secs: Option<u64>,
 
-    // ---- cache-aware-zmq tuning (only used by that policy) ----
+    // ---- cache-aware tuning (cache_aware_zmq / cache_aware_spillover) ----
     /// Min `matched_blocks / total_blocks` for a cache match to win.
     #[arg(long)]
     pub cache_threshold: Option<f32>,
@@ -92,8 +93,7 @@ pub struct Cli {
     /// worker ZMQ KV-events, precise but needs the worker ZMQ port reachable)
     /// or `route_history` (router feeds the tree from its own routing
     /// decisions — approximate, but needs NO worker ZMQ port; works over
-    /// NAT/Vast public mappings). Only meaningful with
-    /// `--policy cache_aware_zmq`.
+    /// NAT/Vast public mappings). Only meaningful with cache-aware policies.
     #[arg(long, value_enum)]
     pub cache_tree_source: Option<CacheTreeSource>,
     /// Block (page) size for route-history prefix hashing. REQUIRED when
@@ -116,7 +116,7 @@ pub struct Cli {
     pub cache_tree_max_nodes: Option<usize>,
     /// Enable TTFT-first cache-aware routing. Selection ranks workers by
     /// predicted first-token pressure and uses prefix cache only inside the
-    /// configured score band. Only meaningful with `--policy cache_aware_zmq`.
+    /// configured score band. Only meaningful with cache-aware policies.
     #[arg(long)]
     pub ttft_first_routing: bool,
     /// Prompt-token count that maps to one local TTFT pressure unit for
@@ -158,6 +158,22 @@ pub struct Cli {
     /// Defaults to 60.
     #[arg(long)]
     pub sticky_eviction_interval_secs: Option<u64>,
+
+    // ---- tiered-spillover policy (only used by `--policy tiered_spillover`) ----
+    /// Preferred worker tier for `tiered_spillover`.
+    #[arg(long, value_enum)]
+    pub tier_primary: Option<WorkerTier>,
+    /// Borrowed worker tier for `tiered_spillover`.
+    #[arg(long, value_enum)]
+    pub tier_spillover: Option<WorkerTier>,
+    /// Spill from primary tier to spillover tier only when the best primary
+    /// worker's TTFT pressure is greater than this threshold. Defaults to 0.
+    #[arg(long)]
+    pub tier_primary_pressure_threshold: Option<usize>,
+    /// Prompt-token count that maps to one local TTFT pressure unit for
+    /// tiered-spillover. Must be greater than zero.
+    #[arg(long)]
+    pub tier_pressure_token_scale: Option<usize>,
 
     // ---- discovery: static ----
     /// Static worker URLs (space-separated or repeated). Mutually
@@ -352,7 +368,10 @@ impl Cli {
             || self.cache_state_timeout_ms != 20;
         if self.mode == RuntimeMode::Gateway
             && tuned_cache_aware
-            && self.policy != PolicyKind::CacheAwareZmq
+            && !matches!(
+                self.policy,
+                PolicyKind::CacheAwareZmq | PolicyKind::CacheAwareSpillover
+            )
         {
             return Err(anyhow!(
                 "--cache-threshold / --balance-abs-threshold / --balance-rel-threshold \
@@ -360,7 +379,7 @@ impl Cli {
                  / --cache-tree-source / --cache-tree-page-size / --cache-tree-bigram \
                  / --cache-tree-max-nodes / --ttft-first-routing / --ttft-token-scale \
                  / --ttft-cache-score-margin / --cache-state-url / --cache-state-timeout-ms \
-                 require --policy cache_aware_zmq"
+                 require --policy cache_aware_zmq or --policy cache_aware_spillover"
             ));
         }
         if self.cache_state_timeout_ms == 0 {
@@ -414,6 +433,30 @@ impl Cli {
             ));
         }
 
+        let tuned_tiered = self.tier_primary.is_some()
+            || self.tier_spillover.is_some()
+            || self.tier_primary_pressure_threshold.is_some()
+            || self.tier_pressure_token_scale.is_some();
+        if tuned_tiered
+            && !matches!(
+                self.policy,
+                PolicyKind::TieredSpillover | PolicyKind::CacheAwareSpillover
+            )
+        {
+            return Err(anyhow!(
+                "--tier-primary / --tier-spillover / --tier-primary-pressure-threshold / \
+                 --tier-pressure-token-scale require --policy tiered_spillover or \
+                 --policy cache_aware_spillover"
+            ));
+        }
+        if let Some(scale) = self.tier_pressure_token_scale {
+            if scale == 0 {
+                return Err(anyhow!(
+                    "--tier-pressure-token-scale must be greater than 0"
+                ));
+            }
+        }
+
         // Build (and validate) the sticky config exactly when the sticky
         // policy is selected. The header name must parse as an HTTP header
         // name so a typo fails at startup rather than silently never
@@ -428,11 +471,15 @@ impl Cli {
             let fallback_policy = self.sticky_fallback_policy.unwrap_or(d.fallback_policy);
             if matches!(
                 fallback_policy,
-                PolicyKind::Sticky | PolicyKind::CacheAwareZmq
+                PolicyKind::Sticky
+                    | PolicyKind::CacheAwareZmq
+                    | PolicyKind::TieredSpillover
+                    | PolicyKind::CacheAwareSpillover
             ) {
                 return Err(anyhow!(
                     "--sticky-fallback-policy must be one of round_robin / random / \
-                     power_of_two / load_based; cache_aware_zmq and sticky are not allowed"
+                     power_of_two / load_based; cache-aware, sticky, and tiered-spillover \
+                     policies are not allowed"
                 ));
             }
             let idle_secs = self.sticky_idle_secs.unwrap_or(d.idle_secs);
@@ -469,17 +516,22 @@ impl Cli {
             cool_down_secs: self.cb_cool_down_secs.unwrap_or_else(default_cb_cool_down),
         });
 
-        // Real-load polling: validate, and decide whether cache_aware_zmq
-        // should consume reported load. The poller only makes sense for the
-        // cache_aware_zmq policy (it feeds that policy's load decisions).
+        // Real-load polling: validate, and decide whether policies should
+        // consume reported load. SGLang workers are polled; vLLM workers are
+        // skipped by the poller and rely on local pending pressure.
         if let Some(secs) = self.load_poll_interval_secs {
             if secs == 0 {
                 return Err(anyhow!("--load-poll-interval-secs must be >= 1"));
             }
-            if self.policy != PolicyKind::CacheAwareZmq {
+            if !matches!(
+                self.policy,
+                PolicyKind::CacheAwareZmq
+                    | PolicyKind::TieredSpillover
+                    | PolicyKind::CacheAwareSpillover
+            ) {
                 return Err(anyhow!(
-                    "--load-poll-interval-secs requires --policy cache_aware_zmq \
-                     (it feeds that policy's load decisions)"
+                    "--load-poll-interval-secs requires a load-aware policy \
+                     (cache_aware_zmq, tiered_spillover, or cache_aware_spillover)"
                 ));
             }
         }
@@ -541,7 +593,11 @@ impl Cli {
         // the load poller (which flips use_reported_load on); otherwise leave
         // it None so the policy uses its own defaults. Unset knobs fall back
         // to the per-field defaults.
-        let cache_aware = if tuned_cache_aware || use_reported_load {
+        let cache_aware = if matches!(
+            self.policy,
+            PolicyKind::CacheAwareZmq | PolicyKind::CacheAwareSpillover
+        ) && (tuned_cache_aware || use_reported_load)
+        {
             let d = CacheAwareConfig::default();
             Some(CacheAwareConfig {
                 cache_threshold: self.cache_threshold.unwrap_or(d.cache_threshold),
@@ -564,6 +620,33 @@ impl Cli {
                 ttft_cache_score_margin: self
                     .ttft_cache_score_margin
                     .unwrap_or(d.ttft_cache_score_margin),
+            })
+        } else {
+            None
+        };
+
+        let tiered_spillover = if matches!(
+            self.policy,
+            PolicyKind::TieredSpillover | PolicyKind::CacheAwareSpillover
+        ) {
+            let d = TieredSpilloverConfig::default();
+            let primary_tier = self.tier_primary.unwrap_or(d.primary_tier);
+            let spillover_tier = self.tier_spillover.unwrap_or(d.spillover_tier);
+            if primary_tier == spillover_tier {
+                return Err(anyhow!(
+                    "--tier-primary and --tier-spillover must be different"
+                ));
+            }
+            Some(TieredSpilloverConfig {
+                primary_tier,
+                spillover_tier,
+                primary_pressure_threshold: self
+                    .tier_primary_pressure_threshold
+                    .unwrap_or(d.primary_pressure_threshold),
+                use_reported_load,
+                pressure_token_scale: self
+                    .tier_pressure_token_scale
+                    .unwrap_or(d.pressure_token_scale),
             })
         } else {
             None
@@ -620,6 +703,7 @@ impl Cli {
                 policy: self.policy,
                 circuit_breaker,
                 cache_aware,
+                tiered_spillover,
                 sticky,
             },
             discovery,
@@ -1069,15 +1153,112 @@ mod tests {
     }
 
     #[test]
-    fn parses_cache_aware_spillover_policy_alias() {
+    fn tiered_spillover_flags_build_config_and_force_priority() {
         let c = into_config_owned(with_model(&[
-            "--worker-urls",
-            "http://10.0.0.1:30000",
             "--policy",
-            "cache_aware_spillover",
+            "tiered_spillover",
+            "--tier-primary",
+            "bulk",
+            "--tier-spillover",
+            "shared",
+            "--tier-primary-pressure-threshold",
+            "3",
+            "--tier-pressure-token-scale",
+            "128",
+            "--force-request-priority",
+            "0",
+            "--load-poll-interval-secs",
+            "2",
+            "--worker-urls",
+            "http://h20:8006@backend=vllm@tier=bulk",
+            "http://b200:30000@tier=shared",
         ]))
         .unwrap();
-        assert_eq!(c.model.policy, PolicyKind::CacheAwareZmq);
+
+        assert_eq!(c.model.policy, PolicyKind::TieredSpillover);
+        assert_eq!(c.priority_override.force_request_priority, Some(0));
+        let t = c.model.tiered_spillover.unwrap();
+        assert_eq!(t.primary_tier, WorkerTier::Bulk);
+        assert_eq!(t.spillover_tier, WorkerTier::Shared);
+        assert_eq!(t.primary_pressure_threshold, 3);
+        assert!(t.use_reported_load);
+        assert_eq!(t.pressure_token_scale, 128);
+    }
+
+    #[test]
+    fn cache_aware_spillover_accepts_cache_and_tier_knobs() {
+        let c = into_config_owned(with_model(&[
+            "--policy",
+            "cache_aware_spillover",
+            "--tier-primary",
+            "shared",
+            "--tier-spillover",
+            "bulk",
+            "--tier-primary-pressure-threshold",
+            "1",
+            "--cache-tree-source",
+            "route_history",
+            "--cache-tree-page-size",
+            "64",
+            "--cache-tree-bigram",
+            "--cache-tree-max-nodes",
+            "50000",
+            "--ttft-first-routing",
+            "--ttft-token-scale",
+            "64",
+            "--ttft-cache-score-margin",
+            "0",
+            "--load-poll-interval-secs",
+            "1",
+            "--worker-urls",
+            "http://h20:8006@tier=bulk",
+            "http://b200:30000@tier=shared",
+        ]))
+        .unwrap();
+
+        assert_eq!(c.model.policy, PolicyKind::CacheAwareSpillover);
+        let t = c.model.tiered_spillover.unwrap();
+        assert_eq!(t.primary_tier, WorkerTier::Shared);
+        assert_eq!(t.spillover_tier, WorkerTier::Bulk);
+        assert_eq!(t.primary_pressure_threshold, 1);
+        assert!(t.use_reported_load);
+        let ca = c.model.cache_aware.unwrap();
+        assert_eq!(ca.tree_source, CacheTreeSource::RouteHistory);
+        assert!(ca.ttft_first_routing);
+        assert!(ca.use_reported_load);
+        assert_eq!(c.cache_tree_page_size, Some(64));
+        assert!(c.cache_tree_bigram);
+        assert_eq!(c.cache_tree_max_nodes, 50000);
+    }
+
+    #[test]
+    fn rejects_tiered_flags_without_tiered_policy() {
+        let err = into_config_owned(with_model(&[
+            "--tier-primary",
+            "bulk",
+            "--worker-urls",
+            "http://x:30000",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("tiered_spillover"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_same_tiered_primary_and_spillover() {
+        let err = into_config_owned(with_model(&[
+            "--policy",
+            "tiered_spillover",
+            "--tier-primary",
+            "bulk",
+            "--tier-spillover",
+            "bulk",
+            "--worker-urls",
+            "http://x:30000",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("must be different"), "got: {err}");
     }
 
     /// clap rejects `--cb-threshold 0` because the field is `NonZeroU32`.

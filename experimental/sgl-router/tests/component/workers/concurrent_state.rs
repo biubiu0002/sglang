@@ -79,6 +79,8 @@ fn registry_concurrent_add_remove_keeps_indexes_consistent() {
                     bootstrap_port: None,
                     min_priority: None,
                     bearer_token: None,
+                    backend: Default::default(),
+                    tier: Default::default(),
                 });
                 let snapshot = r.workers_for(&model);
                 for w in &snapshot {
@@ -134,6 +136,8 @@ fn load_guard_decrements_on_panic_unwind() {
         bootstrap_port: None,
         min_priority: None,
         bearer_token: None,
+        backend: Default::default(),
+        tier: Default::default(),
     }));
     assert_eq!(w.active_load(), 0);
 

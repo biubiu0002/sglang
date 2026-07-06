@@ -29,6 +29,8 @@ fn build_test_app(cfg: Config, worker_url: String, bearer_token: Option<String>)
         bootstrap_port: None,
         min_priority: None,
         bearer_token,
+        backend: Default::default(),
+        tier: Default::default(),
     });
     let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(Duration::from_secs(5)).unwrap());
@@ -51,6 +53,7 @@ fn base_config() -> Config {
             policy: PolicyKind::RoundRobin,
             circuit_breaker: None,
             cache_aware: None,
+            tiered_spillover: None,
             sticky: None,
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
@@ -60,6 +63,7 @@ fn base_config() -> Config {
         proxy: ProxyConfig::default(),
         active_load: ActiveLoadConfig::default(),
         trace: sgl_router::config::TraceConfig::default(),
+        priority_override: sgl_router::config::PriorityOverrideConfig::default(),
         worker_introspect_key: None,
         load_poll_interval_secs: None,
         cache_tree_page_size: None,

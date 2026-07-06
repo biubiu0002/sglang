@@ -17,9 +17,9 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use sgl_router::config::{
     ActiveLoadConfig, Config, DiscoveryBackend, ModelConfig, ObservabilityConfig, PolicyKind,
-    ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
+    ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig, TieredSpilloverConfig,
 };
-use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
+use sgl_router::discovery::{ModelId, WorkerBackend, WorkerId, WorkerMode, WorkerSpec, WorkerTier};
 use sgl_router::policies::factory::build_registry_with_defaults;
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
@@ -49,6 +49,7 @@ fn config() -> Config {
             policy: PolicyKind::RoundRobin,
             circuit_breaker: None,
             cache_aware: None,
+            tiered_spillover: None,
             sticky: None,
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
@@ -58,6 +59,7 @@ fn config() -> Config {
         proxy: ProxyConfig::default(),
         active_load: ActiveLoadConfig::default(),
         trace: sgl_router::config::TraceConfig::default(),
+        priority_override: sgl_router::config::PriorityOverrideConfig::default(),
         worker_introspect_key: None,
         load_poll_interval_secs: None,
         cache_tree_page_size: None,
@@ -71,6 +73,10 @@ fn config() -> Config {
 
 fn build_ctx(specs: Vec<WorkerSpec>) -> Arc<AppContext> {
     let cfg = config();
+    build_ctx_with_config(cfg, specs)
+}
+
+fn build_ctx_with_config(cfg: Config, specs: Vec<WorkerSpec>) -> Arc<AppContext> {
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     let registry = Arc::new(WorkerRegistry::default());
     for s in specs {
@@ -82,6 +88,19 @@ fn build_ctx(specs: Vec<WorkerSpec>) -> Arc<AppContext> {
 }
 
 fn plain_spec(id: &str, url: &str, min_priority: Option<i64>) -> WorkerSpec {
+    spec_with_backend(id, url, min_priority, WorkerBackend::Sglang)
+}
+
+fn vllm_spec(id: &str, url: &str, min_priority: Option<i64>) -> WorkerSpec {
+    spec_with_backend(id, url, min_priority, WorkerBackend::Vllm)
+}
+
+fn spec_with_backend(
+    id: &str,
+    url: &str,
+    min_priority: Option<i64>,
+    backend: WorkerBackend,
+) -> WorkerSpec {
     WorkerSpec {
         id: WorkerId(id.into()),
         url: url.into(),
@@ -90,7 +109,21 @@ fn plain_spec(id: &str, url: &str, min_priority: Option<i64>) -> WorkerSpec {
         bootstrap_port: None,
         min_priority,
         bearer_token: None,
+        backend,
+        tier: WorkerTier::Default,
     }
+}
+
+fn forced_priority(value: i64) -> Config {
+    let mut cfg = config();
+    cfg.priority_override.force_request_priority = Some(value);
+    cfg
+}
+
+fn captured_priority(w: &MockWorker) -> Option<i64> {
+    let body = w.captured.lock().unwrap().last_body.clone()?;
+    let value: serde_json::Value = serde_json::from_slice(&body).ok()?;
+    value.get("priority").and_then(|v| v.as_i64())
 }
 
 fn chat_request(priority: Option<i64>) -> Request<Body> {
@@ -104,6 +137,42 @@ fn chat_request(priority: Option<i64>) -> Request<Body> {
     Request::builder()
         .method("POST")
         .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap()
+}
+
+fn responses_request(priority: Option<i64>) -> Request<Body> {
+    let mut body = serde_json::json!({
+        "model": "tiny",
+        "input": "hi",
+        "max_output_tokens": 8,
+        "stream": false,
+    });
+    if let Some(p) = priority {
+        body["priority"] = serde_json::json!(p);
+    }
+    Request::builder()
+        .method("POST")
+        .uri("/v1/responses")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap()
+}
+
+fn messages_request(priority: Option<i64>) -> Request<Body> {
+    let mut body = serde_json::json!({
+        "model": "tiny",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 8,
+        "stream": false,
+    });
+    if let Some(p) = priority {
+        body["priority"] = serde_json::json!(p);
+    }
+    Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap()
@@ -204,6 +273,137 @@ async fn empty_eligible_set_is_rejected_not_served() {
     );
 }
 
+#[tokio::test]
+async fn low_priority_request_never_hits_gated_vllm_worker() {
+    let untagged = MockWorker::start(vec![]).await;
+    let vllm = MockWorker::start(vec![]).await;
+    let ctx = build_ctx(vec![
+        plain_spec("untagged", &untagged.url, None),
+        vllm_spec("h20-vllm", &vllm.url, Some(100)),
+    ]);
+
+    for _ in 0..6 {
+        let app = build_router(Arc::clone(&ctx));
+        let res = app.oneshot(chat_request(None)).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    assert!(was_hit(&untagged));
+    assert!(
+        !was_hit(&vllm),
+        "priority-0 traffic must not reach a gated vLLM worker"
+    );
+}
+
+#[tokio::test]
+async fn low_priority_only_gated_vllm_is_rejected() {
+    let vllm = MockWorker::start(vec![]).await;
+    let ctx = build_ctx(vec![vllm_spec("h20-vllm", &vllm.url, Some(100))]);
+
+    let app = build_router(Arc::clone(&ctx));
+    let res = app.oneshot(chat_request(None)).await.unwrap();
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        !was_hit(&vllm),
+        "sub-threshold traffic must not spill onto the only gated vLLM worker"
+    );
+}
+
+#[tokio::test]
+async fn high_priority_chat_can_hit_gated_vllm_worker() {
+    let vllm = MockWorker::start(vec![]).await;
+    let ctx = build_ctx(vec![vllm_spec("h20-vllm", &vllm.url, Some(100))]);
+
+    let app = build_router(Arc::clone(&ctx));
+    let res = app.oneshot(chat_request(Some(100))).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(was_hit(&vllm));
+}
+
+#[tokio::test]
+async fn high_priority_responses_can_hit_gated_vllm_worker() {
+    let vllm = MockWorker::start(vec![]).await;
+    let ctx = build_ctx(vec![vllm_spec("h20-vllm", &vllm.url, Some(100))]);
+
+    let app = build_router(Arc::clone(&ctx));
+    let res = app.oneshot(responses_request(Some(100))).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(was_hit(&vllm));
+}
+
+#[tokio::test]
+async fn high_priority_messages_can_hit_gated_vllm_worker() {
+    let vllm = MockWorker::start(vec![]).await;
+    let ctx = build_ctx(vec![vllm_spec("h20-vllm", &vllm.url, Some(100))]);
+
+    let app = build_router(Arc::clone(&ctx));
+    let res = app.oneshot(messages_request(Some(100))).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(was_hit(&vllm));
+}
+
+#[tokio::test]
+async fn forced_priority_overrides_client_priority_before_routing_and_forwarding() {
+    let bulk = MockWorker::start(vec![]).await;
+    let gated = MockWorker::start(vec![]).await;
+    let ctx = build_ctx_with_config(
+        forced_priority(0),
+        vec![
+            plain_spec("bulk", &bulk.url, None),
+            plain_spec("gated", &gated.url, Some(100)),
+        ],
+    );
+
+    for _ in 0..4 {
+        let app = build_router(Arc::clone(&ctx));
+        let res = app.oneshot(chat_request(Some(100))).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    assert!(was_hit(&bulk));
+    assert!(!was_hit(&gated));
+    assert_eq!(captured_priority(&bulk), Some(0));
+}
+
+#[tokio::test]
+async fn tiered_spillover_prefers_bulk_until_primary_pressure_crosses_threshold() {
+    let bulk = MockWorker::start(vec![]).await;
+    let shared = MockWorker::start(vec![]).await;
+    let mut bulk_spec = vllm_spec("bulk-h20", &bulk.url, None);
+    bulk_spec.tier = WorkerTier::Bulk;
+    let mut shared_spec = plain_spec("shared-b200", &shared.url, None);
+    shared_spec.tier = WorkerTier::Shared;
+
+    let mut cfg = forced_priority(0);
+    cfg.model.policy = PolicyKind::TieredSpillover;
+    cfg.model.tiered_spillover = Some(TieredSpilloverConfig {
+        primary_pressure_threshold: 0,
+        ..TieredSpilloverConfig::default()
+    });
+    let ctx = build_ctx_with_config(cfg, vec![bulk_spec, shared_spec]);
+
+    let bulk_worker = ctx
+        .registry
+        .all()
+        .into_iter()
+        .find(|w| w.tier() == WorkerTier::Bulk)
+        .unwrap();
+
+    let app = build_router(Arc::clone(&ctx));
+    let res = app.oneshot(chat_request(Some(100))).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(was_hit(&bulk));
+    assert!(!was_hit(&shared));
+    assert_eq!(captured_priority(&bulk), Some(0));
+
+    let _pressure = bulk_worker.pending_guard_with_tokens(128);
+    let app = build_router(Arc::clone(&ctx));
+    let res = app.oneshot(chat_request(Some(100))).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(was_hit(&shared));
+    assert_eq!(captured_priority(&shared), Some(0));
+}
+
 /// Ordering regression: a request for a model that has registered workers but
 /// NO policy entry must surface as 404 `ModelNotFound`, NOT 503 — even when
 /// the only registered worker is gated above the request priority. The
@@ -222,6 +422,8 @@ async fn unknown_model_with_gated_worker_is_404_not_503() {
         bootstrap_port: None,
         min_priority: Some(100),
         bearer_token: None,
+        backend: Default::default(),
+        tier: Default::default(),
     };
     let ctx = build_ctx(vec![spec]);
 

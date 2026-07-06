@@ -361,6 +361,7 @@ pub async fn messages(
     body: Bytes,
 ) -> Response<Body> {
     let result = async {
+        let body = apply_request_priority_override(&ctx.config.priority_override, &headers, body)?;
         let probe = parse_probe(&body)?;
         let model_str = probe
             .model
@@ -453,7 +454,12 @@ pub async fn count_tokens(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response<Body> {
-    match messages_inner(State(ctx), headers, body, "/v1/messages/count_tokens").await {
+    let result = async {
+        let body = apply_request_priority_override(&ctx.config.priority_override, &headers, body)?;
+        messages_inner(State(ctx), headers, body, "/v1/messages/count_tokens").await
+    }
+    .await;
+    match result {
         Ok(resp) => resp,
         Err(e) => anthropic_error_response(e),
     }
@@ -513,7 +519,6 @@ async fn messages_inner(
     forward_path: &'static str,
 ) -> Result<Response<Body>, ApiError> {
     let start = std::time::Instant::now();
-    let body = apply_request_priority_override(&ctx.config.priority_override, &headers, body)?;
     let probe = parse_probe(&body)?;
     let streaming = probe.stream.unwrap_or(false);
     let model_str = probe
@@ -1039,6 +1044,7 @@ mod tests {
                 policy: PolicyKind::RoundRobin,
                 circuit_breaker: None,
                 cache_aware: None,
+                tiered_spillover: None,
                 sticky: None,
             },
             discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {

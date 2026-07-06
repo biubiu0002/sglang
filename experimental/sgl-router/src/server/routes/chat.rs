@@ -153,6 +153,7 @@ pub async fn chat_completions(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
+    let body = apply_request_priority_override(&ctx.config.priority_override, &headers, body)?;
     let probe = parse_probe(&body)?;
     let model_str = probe
         .model
@@ -229,7 +230,6 @@ async fn chat_completions_inner(
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
     let start = std::time::Instant::now();
-    let body = apply_request_priority_override(&ctx.config.priority_override, &headers, body)?;
     let probe = parse_probe(&body)?;
     let streaming = probe.stream.unwrap_or(false);
     let model_str = probe

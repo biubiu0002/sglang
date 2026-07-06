@@ -12,6 +12,7 @@ use crate::policies::{
     random::RandomPolicy,
     round_robin::RoundRobinPolicy,
     sticky::StickyPolicy,
+    tiered_spillover::{CacheAwareSpilloverPolicy, TieredSpilloverPolicy},
     Policy, PolicyRegistry,
 };
 use crate::tokenizer::TokenizerRegistry;
@@ -29,7 +30,10 @@ fn build_sticky_fallback(kind: PolicyKind) -> Arc<dyn Policy> {
         PolicyKind::Random => Arc::new(RandomPolicy::new()),
         PolicyKind::PowerOfTwo => Arc::new(PowerOfTwoChoicesPolicy::new()),
         PolicyKind::LoadBased => Arc::new(LoadBasedPolicy::new()),
-        PolicyKind::CacheAwareZmq | PolicyKind::Sticky => {
+        PolicyKind::CacheAwareZmq
+        | PolicyKind::Sticky
+        | PolicyKind::TieredSpillover
+        | PolicyKind::CacheAwareSpillover => {
             unreachable!("sticky fallback is validated to be dependency-free in Cli::into_config")
         }
     }
@@ -76,6 +80,21 @@ pub fn build_policy(
             Arc::new(policy)
         }
         PolicyKind::Sticky => build_sticky(model),
+        PolicyKind::TieredSpillover => Arc::new(TieredSpilloverPolicy::new(
+            model.tiered_spillover.unwrap_or_default(),
+        )),
+        PolicyKind::CacheAwareSpillover => {
+            let cache_cfg = model.cache_aware.unwrap_or_default();
+            let primary = CacheAwareZmqPolicy::new(cache_cfg, tree, tokenizers, block_size_oracle);
+            let primary = match remote_cache_state {
+                Some(client) => primary.with_remote_cache_state(client),
+                None => primary,
+            };
+            Arc::new(CacheAwareSpilloverPolicy::new(
+                model.tiered_spillover.unwrap_or_default(),
+                primary,
+            ))
+        }
     }
 }
 
@@ -110,6 +129,16 @@ pub fn build_policy_kind_only(kind: PolicyKind) -> Arc<dyn Policy> {
                 build_sticky_fallback(s.fallback_policy),
             ))
         }
+        PolicyKind::TieredSpillover => Arc::new(TieredSpilloverPolicy::new(Default::default())),
+        PolicyKind::CacheAwareSpillover => Arc::new(CacheAwareSpilloverPolicy::new(
+            Default::default(),
+            CacheAwareZmqPolicy::new(
+                crate::config::CacheAwareConfig::default(),
+                Arc::new(HashTree::new()),
+                Arc::new(TokenizerRegistry::default()),
+                BlockSizeOracle::new(),
+            ),
+        )),
     }
 }
 
@@ -182,6 +211,7 @@ mod tests {
                 policy,
                 circuit_breaker: None,
                 cache_aware: None,
+                tiered_spillover: None,
                 sticky: None,
             },
             discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
@@ -212,6 +242,8 @@ mod tests {
         let _ = build_policy_kind_only(PolicyKind::LoadBased);
         let _ = build_policy_kind_only(PolicyKind::CacheAwareZmq);
         let _ = build_policy_kind_only(PolicyKind::Sticky);
+        let _ = build_policy_kind_only(PolicyKind::TieredSpillover);
+        let _ = build_policy_kind_only(PolicyKind::CacheAwareSpillover);
     }
 
     #[test]
@@ -266,6 +298,34 @@ mod tests {
         assert!(
             dbg.contains("StickyPolicy"),
             "expected StickyPolicy debug repr, got: {dbg}",
+        );
+    }
+
+    #[test]
+    fn tiered_spillover_builds_via_factory() {
+        let cfg = cfg_with_model("modelA", PolicyKind::TieredSpillover);
+        let tree = Arc::new(HashTree::new());
+        let tokenizers = Arc::new(TokenizerRegistry::default());
+        let reg = build_registry(&cfg, tree, tokenizers, BlockSizeOracle::new()).unwrap();
+        let p = reg.get(&ModelId("modelA".into())).unwrap();
+        let dbg = format!("{p:?}");
+        assert!(
+            dbg.contains("TieredSpilloverPolicy"),
+            "expected TieredSpilloverPolicy debug repr, got: {dbg}",
+        );
+    }
+
+    #[test]
+    fn cache_aware_spillover_builds_via_factory() {
+        let cfg = cfg_with_model("modelA", PolicyKind::CacheAwareSpillover);
+        let tree = Arc::new(HashTree::new());
+        let tokenizers = Arc::new(TokenizerRegistry::default());
+        let reg = build_registry(&cfg, tree, tokenizers, BlockSizeOracle::new()).unwrap();
+        let p = reg.get(&ModelId("modelA".into())).unwrap();
+        let dbg = format!("{p:?}");
+        assert!(
+            dbg.contains("CacheAwareSpilloverPolicy"),
+            "expected CacheAwareSpilloverPolicy debug repr, got: {dbg}",
         );
     }
 }

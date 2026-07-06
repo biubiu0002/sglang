@@ -44,6 +44,7 @@ fn build_ctx_with_worker(url: &str) -> Arc<AppContext> {
             policy: PolicyKind::RoundRobin,
             circuit_breaker: None,
             cache_aware: None,
+            tiered_spillover: None,
             sticky: None,
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
@@ -53,6 +54,7 @@ fn build_ctx_with_worker(url: &str) -> Arc<AppContext> {
         proxy: ProxyConfig::default(),
         active_load: ActiveLoadConfig::default(),
         trace: sgl_router::config::TraceConfig::default(),
+        priority_override: sgl_router::config::PriorityOverrideConfig::default(),
         worker_introspect_key: None,
         load_poll_interval_secs: None,
         cache_tree_page_size: None,
@@ -72,6 +74,8 @@ fn build_ctx_with_worker(url: &str) -> Arc<AppContext> {
         bootstrap_port: None,
         min_priority: None,
         bearer_token: None,
+        backend: Default::default(),
+        tier: Default::default(),
     });
     let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(TEST_TIMEOUT).unwrap());
@@ -94,6 +98,7 @@ fn build_ctx_with_prefill_worker(url: &str) -> Arc<AppContext> {
             policy: PolicyKind::RoundRobin,
             circuit_breaker: None,
             cache_aware: None,
+            tiered_spillover: None,
             sticky: None,
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
@@ -103,6 +108,7 @@ fn build_ctx_with_prefill_worker(url: &str) -> Arc<AppContext> {
         proxy: ProxyConfig::default(),
         active_load: ActiveLoadConfig::default(),
         trace: sgl_router::config::TraceConfig::default(),
+        priority_override: sgl_router::config::PriorityOverrideConfig::default(),
         worker_introspect_key: None,
         load_poll_interval_secs: None,
         cache_tree_page_size: None,
@@ -122,6 +128,8 @@ fn build_ctx_with_prefill_worker(url: &str) -> Arc<AppContext> {
         bootstrap_port: None,
         min_priority: None,
         bearer_token: None,
+        backend: Default::default(),
+        tier: Default::default(),
     });
     let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(TEST_TIMEOUT).unwrap());
@@ -148,6 +156,7 @@ fn build_cache_aware_ctx_with_workers(urls: [&str; 2]) -> Arc<AppContext> {
                 tree_source: sgl_router::config::CacheTreeSource::RouteHistory,
                 ..sgl_router::config::CacheAwareConfig::default()
             }),
+            tiered_spillover: None,
             sticky: None,
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
@@ -157,6 +166,7 @@ fn build_cache_aware_ctx_with_workers(urls: [&str; 2]) -> Arc<AppContext> {
         proxy: ProxyConfig::default(),
         active_load: ActiveLoadConfig::default(),
         trace: sgl_router::config::TraceConfig::default(),
+        priority_override: sgl_router::config::PriorityOverrideConfig::default(),
         worker_introspect_key: None,
         load_poll_interval_secs: Some(2),
         cache_tree_page_size: Some(1),
@@ -179,6 +189,8 @@ fn build_cache_aware_ctx_with_workers(urls: [&str; 2]) -> Arc<AppContext> {
                 bootstrap_port: None,
                 min_priority: None,
                 bearer_token: None,
+                backend: Default::default(),
+                tier: Default::default(),
             })
             .unwrap();
         registry
@@ -460,6 +472,7 @@ async fn messages_pd_rejection_wins_over_priority_filter() {
             policy: PolicyKind::RoundRobin,
             circuit_breaker: None,
             cache_aware: None,
+            tiered_spillover: None,
             sticky: None,
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
@@ -469,6 +482,7 @@ async fn messages_pd_rejection_wins_over_priority_filter() {
         proxy: ProxyConfig::default(),
         active_load: ActiveLoadConfig::default(),
         trace: sgl_router::config::TraceConfig::default(),
+        priority_override: sgl_router::config::PriorityOverrideConfig::default(),
         worker_introspect_key: None,
         load_poll_interval_secs: None,
         cache_tree_page_size: None,
@@ -488,6 +502,8 @@ async fn messages_pd_rejection_wins_over_priority_filter() {
         bootstrap_port: None,
         min_priority: Some(100),
         bearer_token: None,
+        backend: Default::default(),
+        tier: Default::default(),
     });
     let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(TEST_TIMEOUT).unwrap());

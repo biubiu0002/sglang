@@ -12,6 +12,7 @@ pub mod random;
 pub mod registry;
 pub mod round_robin;
 pub mod sticky;
+pub mod tiered_spillover;
 
 use crate::discovery::ModelId;
 use crate::server::metrics::MetricsRegistry;

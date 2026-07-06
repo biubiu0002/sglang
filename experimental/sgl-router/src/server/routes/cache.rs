@@ -233,6 +233,8 @@ mod tests {
                     bootstrap_port: None,
                     min_priority: None,
                     bearer_token: None,
+                    backend: Default::default(),
+                    tier: Default::default(),
                 })
                 .expect("worker accepted");
         }
@@ -354,6 +356,8 @@ mod tests {
                 bootstrap_port: Some(8998),
                 min_priority: None,
                 bearer_token: None,
+                backend: Default::default(),
+                tier: Default::default(),
             })
             .expect("prefill accepted");
         ctx.registry
@@ -365,6 +369,8 @@ mod tests {
                 bootstrap_port: None,
                 min_priority: None,
                 bearer_token: None,
+                backend: Default::default(),
+                tier: Default::default(),
             })
             .expect("decode accepted");
 

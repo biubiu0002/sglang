@@ -45,6 +45,7 @@ fn build_sticky_ctx(header_name: &str, worker_urls: &[String]) -> Arc<AppContext
             policy: PolicyKind::Sticky,
             circuit_breaker: None,
             cache_aware: None,
+            tiered_spillover: None,
             sticky: Some(StickyConfig {
                 header_name: header_name.to_string(),
                 fallback_policy: PolicyKind::RoundRobin,
@@ -59,6 +60,7 @@ fn build_sticky_ctx(header_name: &str, worker_urls: &[String]) -> Arc<AppContext
         proxy: ProxyConfig::default(),
         active_load: ActiveLoadConfig::default(),
         trace: sgl_router::config::TraceConfig::default(),
+        priority_override: sgl_router::config::PriorityOverrideConfig::default(),
         worker_introspect_key: None,
         load_poll_interval_secs: None,
         cache_tree_page_size: None,
@@ -79,6 +81,8 @@ fn build_sticky_ctx(header_name: &str, worker_urls: &[String]) -> Arc<AppContext
             bootstrap_port: None,
             min_priority: None,
             bearer_token: None,
+            backend: Default::default(),
+            tier: Default::default(),
         });
     }
     let policies = Arc::new(build_policy_registry(&cfg).unwrap());
@@ -308,6 +312,8 @@ async fn adding_a_worker_does_not_redistribute_existing_key() {
             bootstrap_port: None,
             min_priority: None,
             bearer_token: None,
+            backend: Default::default(),
+            tier: Default::default(),
         })
         .unwrap();
     // Guard the premise: w2 really is an eligible candidate now, so the

@@ -24,6 +24,7 @@ use crate::server::routes::alias_fallback::{
     fallback_reason_for_error, fallback_reason_for_response, forward_to_fallback, rewrite_model,
 };
 use crate::server::routes::chat::{make_client_disconnect_hook, reserve_pending_load};
+use crate::server::routes::priority_override::apply_request_priority_override;
 use crate::server::trace::TraceContext;
 use crate::workers::LoadGuard;
 use axum::body::Body;
@@ -512,6 +513,7 @@ async fn messages_inner(
     forward_path: &'static str,
 ) -> Result<Response<Body>, ApiError> {
     let start = std::time::Instant::now();
+    let body = apply_request_priority_override(&ctx.config.priority_override, &headers, body)?;
     let probe = parse_probe(&body)?;
     let streaming = probe.stream.unwrap_or(false);
     let model_str = probe
@@ -1046,6 +1048,7 @@ mod tests {
             proxy: ProxyConfig::default(),
             active_load: ActiveLoadConfig::default(),
             trace: crate::config::TraceConfig::default(),
+            priority_override: crate::config::PriorityOverrideConfig::default(),
             worker_introspect_key: None,
             load_poll_interval_secs: None,
             cache_tree_page_size: None,

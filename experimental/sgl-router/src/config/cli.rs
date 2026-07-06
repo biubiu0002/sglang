@@ -13,9 +13,9 @@ use crate::config::{
     default_cb_cool_down, default_proxy_request_timeout_secs, default_stale_request_timeout_secs,
     default_trace_body_max_bytes, resolve_mode, ActiveLoadConfig, AliasFallbackConfig,
     CacheAwareConfig, CacheTreeSource, CircuitBreakerConfig, Config, DiscoveryBackend,
-    K8sDiscoveryConfig, LogFormat, ModelConfig, ObservabilityConfig, PolicyKind, ProxyConfig,
-    RuntimeMode, ServerConfig, StaticUrlsDiscoveryConfig, StickyConfig, TraceConfig,
-    WorkerBearerKeyConfig,
+    K8sDiscoveryConfig, LogFormat, ModelConfig, ObservabilityConfig, PolicyKind,
+    PriorityOverrideConfig, ProxyConfig, RuntimeMode, ServerConfig, StaticUrlsDiscoveryConfig,
+    StickyConfig, TraceConfig, WorkerBearerKeyConfig,
 };
 
 /// `sgl-router` — slim KV-aware OpenAI-compatible router for SGLang workers.
@@ -244,6 +244,23 @@ pub struct Cli {
     /// Maximum body bytes captured per request/response trace field.
     #[arg(long, env = "TRACE_BODY_MAX_BYTES", default_value_t = default_trace_body_max_bytes())]
     pub trace_body_max_bytes: usize,
+
+    // ---- request priority override (optional) ----
+    /// Force every proxied JSON request body to this priority unless a
+    /// trusted priority override header is present.
+    #[arg(long)]
+    pub force_request_priority: Option<i64>,
+    /// Header carrying a trusted per-request priority value. It is honored
+    /// only when --trusted-priority-secret-header carries the matching secret.
+    #[arg(long)]
+    pub trusted_priority_header: Option<String>,
+    /// Header carrying the shared secret that authorizes
+    /// --trusted-priority-header.
+    #[arg(long)]
+    pub trusted_priority_secret_header: Option<String>,
+    /// Shared secret required before --trusted-priority-header is honored.
+    #[arg(long)]
+    pub trusted_priority_secret: Option<String>,
 
     // ---- real-load polling (cache_aware_zmq load source) ----
     /// Interval (seconds) at which a background task polls each worker's
@@ -475,6 +492,50 @@ impl Cli {
         if self.trace_body_max_bytes == 0 {
             return Err(anyhow!("--trace-body-max-bytes must be greater than 0"));
         }
+        let trusted_priority_fields = [
+            self.trusted_priority_header.is_some(),
+            self.trusted_priority_secret_header.is_some(),
+            self.trusted_priority_secret.is_some(),
+        ];
+        let trusted_priority_count = trusted_priority_fields
+            .iter()
+            .filter(|configured| **configured)
+            .count();
+        if trusted_priority_count != 0 && trusted_priority_count != trusted_priority_fields.len() {
+            return Err(anyhow!(
+                "--trusted-priority-header / --trusted-priority-secret-header / \
+                 --trusted-priority-secret must be set together"
+            ));
+        }
+        if let Some(header) = self.trusted_priority_header.as_deref() {
+            axum::http::HeaderName::try_from(header).map_err(|e| {
+                anyhow!("--trusted-priority-header {header:?} is not a valid HTTP header name: {e}")
+            })?;
+        }
+        if let Some(header) = self.trusted_priority_secret_header.as_deref() {
+            axum::http::HeaderName::try_from(header).map_err(|e| {
+                anyhow!(
+                    "--trusted-priority-secret-header {header:?} is not a valid HTTP header name: {e}"
+                )
+            })?;
+        }
+        if let (Some(priority_header), Some(secret_header)) = (
+            self.trusted_priority_header.as_deref(),
+            self.trusted_priority_secret_header.as_deref(),
+        ) {
+            if priority_header.eq_ignore_ascii_case(secret_header) {
+                return Err(anyhow!(
+                    "--trusted-priority-header and --trusted-priority-secret-header must differ"
+                ));
+            }
+        }
+        if self
+            .trusted_priority_secret
+            .as_deref()
+            .is_some_and(|secret| secret.trim().is_empty())
+        {
+            return Err(anyhow!("--trusted-priority-secret must be non-empty"));
+        }
 
         // Build a CacheAwareConfig when the operator tuned a knob OR enabled
         // the load poller (which flips use_reported_load on); otherwise leave
@@ -572,6 +633,12 @@ impl Cli {
                 sink_url: self.trace_sink_url,
                 capture_bodies: self.trace_capture_bodies,
                 body_max_bytes: self.trace_body_max_bytes,
+            },
+            priority_override: PriorityOverrideConfig {
+                force_request_priority: self.force_request_priority,
+                trusted_priority_header: self.trusted_priority_header,
+                trusted_priority_secret_header: self.trusted_priority_secret_header,
+                trusted_priority_secret: self.trusted_priority_secret,
             },
             worker_introspect_key: self.worker_introspect_key,
             load_poll_interval_secs: self.load_poll_interval_secs,

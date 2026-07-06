@@ -18,6 +18,7 @@ use crate::server::routes::alias_fallback::{
     fallback_reason_for_error, fallback_reason_for_response, forward_to_fallback, rewrite_model,
 };
 use crate::server::routes::chat::{make_client_disconnect_hook, reserve_pending_load};
+use crate::server::routes::priority_override::apply_request_priority_override;
 use crate::workers::LoadGuard;
 use axum::body::Body;
 use axum::extract::State;
@@ -138,6 +139,7 @@ async fn passthrough_primary(
     log_name: &'static str,
 ) -> Result<Response<Body>, ApiError> {
     let start = std::time::Instant::now();
+    let body = apply_request_priority_override(&ctx.config.priority_override, &headers, body)?;
     let probe = parse_probe(&body)?;
     let streaming = probe.stream.unwrap_or(false);
     let model_str = probe

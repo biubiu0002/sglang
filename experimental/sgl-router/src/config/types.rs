@@ -18,6 +18,7 @@ pub struct Config {
     pub proxy: ProxyConfig,
     pub active_load: ActiveLoadConfig,
     pub trace: TraceConfig,
+    pub priority_override: PriorityOverrideConfig,
     /// Optional bearer token the router presents on its OWN requests to
     /// each worker's `/server_info` (introspection + cache_aware_zmq
     /// KV-event publisher discovery). `None` => unauthenticated
@@ -109,6 +110,14 @@ pub struct TraceConfig {
     pub sink_url: Option<String>,
     pub capture_bodies: bool,
     pub body_max_bytes: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PriorityOverrideConfig {
+    pub force_request_priority: Option<i64>,
+    pub trusted_priority_header: Option<String>,
+    pub trusted_priority_secret_header: Option<String>,
+    pub trusted_priority_secret: Option<String>,
 }
 
 pub fn default_trace_body_max_bytes() -> usize {

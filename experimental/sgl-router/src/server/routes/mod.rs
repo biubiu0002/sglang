@@ -9,5 +9,6 @@ pub mod messages;
 pub mod metrics;
 pub mod models;
 pub mod passthrough;
+pub mod priority_override;
 pub mod responses;
 pub mod tokenize;

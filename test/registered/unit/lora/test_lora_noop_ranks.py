@@ -11,7 +11,6 @@ import torch
 
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-
 register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=9, suite="stage-b-test-1-gpu-small-amd")
 
@@ -59,8 +58,44 @@ with patch.dict(
 ):
     _moe_spec.loader.exec_module(_lora_moe_runners)
 
+_FUSED_MOE_LORA_KERNEL_PATH = (
+    Path(__file__).parents[4]
+    / "python"
+    / "sglang"
+    / "srt"
+    / "lora"
+    / "triton_ops"
+    / "fused_moe_lora_kernel.py"
+)
+_kernel_spec = importlib.util.spec_from_file_location(
+    "fused_moe_lora_kernel_under_test", _FUSED_MOE_LORA_KERNEL_PATH
+)
+_fused_moe_lora_kernel = importlib.util.module_from_spec(_kernel_spec)
+assert _kernel_spec.loader is not None
+_distributed_stub = types.ModuleType("sglang.srt.distributed")
+_distributed_stub.tensor_model_parallel_all_gather = lambda x: x
+_distributed_stub.tensor_model_parallel_all_reduce = lambda x: x
+_utils_common_stub = types.ModuleType("sglang.srt.utils.common")
+_utils_common_stub.is_blackwell_supported = lambda: False
+_utils_common_stub.is_sm90_supported = lambda: False
+_utils_common_stub.direct_register_custom_op = lambda **_: None
+with patch.dict(
+    sys.modules,
+    {
+        "sglang.srt.distributed": _distributed_stub,
+        "sglang.srt.utils.common": _utils_common_stub,
+    },
+):
+    _kernel_spec.loader.exec_module(_fused_moe_lora_kernel)
+
 
 class TestLoRANoopRanks(unittest.TestCase):
+    def test_moe_lora_down_input_with_padding_is_expanded(self):
+        is_expanded = _fused_moe_lora_kernel._is_expanded_moe_lora_input
+        self.assertTrue(is_expanded(input_rows=4455, token_topk_rows=585))
+        self.assertTrue(is_expanded(input_rows=585, token_topk_rows=585))
+        self.assertFalse(is_expanded(input_rows=65, token_topk_rows=585))
+
     def test_rank_zero_skips_zero_weight_a_gemm_with_inf_input(self):
         inputs = torch.tensor([[float("inf"), 1.0]], dtype=torch.float32)
         weights = torch.zeros((1, 2, 2), dtype=torch.float32)
@@ -135,12 +170,13 @@ class TestLoRANoopRanks(unittest.TestCase):
             def has_active_lora_for_current_batch(self, batch_info=None):
                 if getattr(batch_info, "use_cuda_graph", False):
                     return True
-                active_weight_indices = getattr(batch_info, "active_weight_indices", None)
+                active_weight_indices = getattr(
+                    batch_info, "active_weight_indices", None
+                )
                 if active_weight_indices is None:
                     return True
                 return any(
-                    self.lora_ranks_cpu[idx].item() > 0
-                    for idx in active_weight_indices
+                    self.lora_ranks_cpu[idx].item() > 0 for idx in active_weight_indices
                 )
 
         @dataclass
@@ -154,12 +190,8 @@ class TestLoRANoopRanks(unittest.TestCase):
         self.assertFalse(
             layer.has_active_lora_for_current_batch(FakeBatchInfo(tuple()))
         )
-        self.assertFalse(
-            layer.has_active_lora_for_current_batch(FakeBatchInfo((0,)))
-        )
-        self.assertTrue(
-            layer.has_active_lora_for_current_batch(FakeBatchInfo((1,)))
-        )
+        self.assertFalse(layer.has_active_lora_for_current_batch(FakeBatchInfo((0,))))
+        self.assertTrue(layer.has_active_lora_for_current_batch(FakeBatchInfo((1,))))
         self.assertTrue(
             layer.has_active_lora_for_current_batch(
                 FakeBatchInfo(tuple(), use_cuda_graph=True)

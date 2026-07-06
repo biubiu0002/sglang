@@ -552,7 +552,7 @@ def _merged_experts_fused_moe_lora_add_impl(
     4. Mask out tokens with token_lora_mapping == -1 on the add path.
     """
     max_loras, _, max_lora_rank, _ = lora_a.shape
-    input_top_k = 1 if hidden_states.shape[0] == topk_ids.numel() else topk_ids.shape[1]
+    input_top_k = 1 if hidden_states.shape[0] >= topk_ids.numel() else topk_ids.shape[1]
 
     def _merge_lora_expert_weight(t: torch.Tensor) -> torch.Tensor:
         # [max_loras, num_experts, x, y] -> [max_loras * num_experts, x, y]

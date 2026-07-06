@@ -16,6 +16,10 @@ from sglang.srt.utils.common import is_blackwell_supported, is_sm90_supported
 _LORA_PTR_DICT: dict[tuple[int, ...], torch.Tensor] = {}
 
 
+def _is_expanded_moe_lora_input(input_rows: int, token_topk_rows: int) -> bool:
+    return input_rows >= token_topk_rows
+
+
 def _get_ptr(lora_weights: list[torch.Tensor], device: torch.device):
     """
     `_LORA_PTR_DICT` collects the required information during `profile_run`,
@@ -469,9 +473,14 @@ def _fused_moe_lora(
     num_tokens = M * top_k_num
     w1_output_dim_size = w1_lora_b_stacked.shape[2]
 
-    # Detect whether input is already expanded (down path: [M*top_k, dim])
-    # or not (gate_up path: [M, dim]). Down path needs divisor=1.
-    input_is_expanded = qcurr_hidden_states.shape[0] == M * top_k_num
+    # Detect whether input is already expanded (down path:
+    # [M*top_k + padding, dim]) or not (gate_up path: [M, dim]).
+    # The Triton MoE runner keeps the first M*top_k rows in token-topk order
+    # and may append padding rows for grouped GEMM alignment; those padded
+    # rows must still use divisor=1 when addressing the real rows.
+    input_is_expanded = _is_expanded_moe_lora_input(
+        qcurr_hidden_states.shape[0], M * top_k_num
+    )
     shrink_top_k_divisor = 1 if input_is_expanded else top_k_num
 
     a_intermediate_cache1 = torch.zeros(

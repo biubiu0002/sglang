@@ -467,10 +467,11 @@ def _fused_moe_kernel_sequence(
     E, N, _ = w1.shape
     topk = topk_ids.shape[1]
     compute_type = tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
+    effective_down_moe_use_tma = down_moe_use_tma and not (hooks and hooks.after_down)
 
     padded_tokens = (
         min(num_tokens * topk, E + 1) * (config["BLOCK_SIZE_M"] - 1)
-        if down_moe_use_tma
+        if effective_down_moe_use_tma
         else 0
     )
     total_tokens = num_tokens * topk + padded_tokens
@@ -524,7 +525,7 @@ def _fused_moe_kernel_sequence(
         use_int4_w4a16=use_int4_w4a16,
         per_channel_quant=per_channel_quant,
         block_shape=block_shape,
-        c_sorted=down_moe_use_tma,
+        c_sorted=effective_down_moe_use_tma,
         filter_expert=filter_expert,
     )
 
@@ -614,7 +615,7 @@ def _fused_moe_kernel_sequence(
                     config,
                     topk_ids,
                     expert_ids,
-                    down_moe_use_tma,
+                    effective_down_moe_use_tma,
                     activation,
                     swiglu_limit=swiglu_limit_for_triton,
                 )
@@ -625,8 +626,12 @@ def _fused_moe_kernel_sequence(
                 silu_and_mul(
                     intermediate_cache1.view(-1, N),
                     intermediate_cache2,
-                    expert_ids=(expert_ids if down_moe_use_tma else topk_ids.view(-1)),
-                    expert_step=(config["BLOCK_SIZE_M"] if down_moe_use_tma else 1),
+                    expert_ids=(
+                        expert_ids if effective_down_moe_use_tma else topk_ids.view(-1)
+                    ),
+                    expert_step=(
+                        config["BLOCK_SIZE_M"] if effective_down_moe_use_tma else 1
+                    ),
                 )
             else:
                 silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
@@ -650,8 +655,12 @@ def _fused_moe_kernel_sequence(
                 gelu_and_mul(
                     intermediate_cache1.view(-1, N),
                     intermediate_cache2,
-                    expert_ids=(expert_ids if down_moe_use_tma else topk_ids.view(-1)),
-                    expert_step=(config["BLOCK_SIZE_M"] if down_moe_use_tma else 1),
+                    expert_ids=(
+                        expert_ids if effective_down_moe_use_tma else topk_ids.view(-1)
+                    ),
+                    expert_step=(
+                        config["BLOCK_SIZE_M"] if effective_down_moe_use_tma else 1
+                    ),
                 )
             else:
                 gelu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
@@ -723,8 +732,8 @@ def _fused_moe_kernel_sequence(
         use_int4_w4a16=use_int4_w4a16,
         per_channel_quant=per_channel_quant,
         block_shape=block_shape,
-        a_use_tma=down_moe_use_tma,
-        b_use_tma=down_moe_use_tma,
+        a_use_tma=effective_down_moe_use_tma,
+        b_use_tma=effective_down_moe_use_tma,
         filter_expert=filter_expert,
         fuse_sum_all_reduce=use_fused_moe_sum_all_reduce,
         router_topk=topk,

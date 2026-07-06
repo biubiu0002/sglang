@@ -161,7 +161,7 @@ class LoRAMemoryPool:
         self.strict_loading: bool = strict_loading
         self.enable_lora_overlap_loading: bool = enable_lora_overlap_loading
         self.pin_memory_available: bool = is_pin_memory_available()
-        self._warned_partial_moe_lora_keys: Set[Tuple[str, str]] = set()
+        self._warned_shared_moe_lora_keys: Set[Tuple[str, str]] = set()
 
         # Under EP with a Triton/DeepGEMM runner, `StandardDispatcher` remaps
         # global `topk_ids` -> local expert IDs before the MoE kernel, so
@@ -729,22 +729,29 @@ class LoRAMemoryPool:
             maps[layer_id][buffer_id].fill_(-1)
 
     def _set_moe_lora_expert_map(
-        self, target_module: str, layer_id: int, buffer_id: int, local_eids: Set[int]
+        self,
+        target_module: str,
+        layer_id: int,
+        buffer_id: int,
+        expert_map: Dict[int, int],
     ):
         maps = self.moe_lora_expert_maps.get(target_module)
         if maps is None:
             return
         maps[layer_id][buffer_id].fill_(-1)
-        if not local_eids:
+        if not expert_map:
             return
-        expert_ids = torch.tensor(
-            sorted(local_eids), dtype=torch.long, device=maps[layer_id].device
+        dst_ids = torch.tensor(
+            sorted(expert_map), dtype=torch.long, device=maps[layer_id].device
         )
-        maps[layer_id][buffer_id, expert_ids] = expert_ids.to(torch.int32)
+        src_ids = torch.tensor(
+            [expert_map[int(dst)] for dst in dst_ids.tolist()],
+            dtype=torch.int32,
+            device=maps[layer_id].device,
+        )
+        maps[layer_id][buffer_id, dst_ids] = src_ids
 
-    def _set_embedding_lora_rank(
-        self, target_module: str, buffer_id: int, rank: int
-    ):
+    def _set_embedding_lora_rank(self, target_module: str, buffer_id: int, rank: int):
         if target_module not in self.embedding_lora_ranks:
             return
         self.embedding_lora_ranks[target_module][buffer_id] = rank
@@ -782,13 +789,13 @@ class LoRAMemoryPool:
             }
         if isinstance(a_weights, torch.Tensor) and isinstance(b_weights, torch.Tensor):
             if a_weights.dim() == 3 and b_weights.dim() == 3:
-                count = min(a_weights.shape[0], b_weights.shape[0], self._num_experts_local)
+                count = min(
+                    a_weights.shape[0], b_weights.shape[0], self._num_experts_local
+                )
                 return set(range(count))
         return set()
 
-    def _looks_like_exported_expert_parallel_shard(
-        self, local_eids: Set[int]
-    ) -> bool:
+    def _looks_like_tp_strided_shared_moe_lora(self, local_eids: Set[int]) -> bool:
         if not local_eids or len(local_eids) >= self._num_experts_local:
             return False
 
@@ -804,41 +811,96 @@ class LoRAMemoryPool:
         residue = ids[0] % tp_size
         return ids == list(range(residue, self._num_experts_local, tp_size))
 
-    def _should_disable_partial_moe_lora(
+    def _is_shared_moe_lora_expert_set(
         self,
         uid: str,
         target_module: str,
         layer_id: int,
         local_eids: Set[int],
     ) -> bool:
-        if not self._looks_like_exported_expert_parallel_shard(local_eids):
+        if not self._looks_like_tp_strided_shared_moe_lora(local_eids):
             return False
 
-        msg = (
-            f"LoRA adapter '{uid}' has only {len(local_eids)}/"
-            f"{self._num_experts_local} TP-strided routed MoE experts for "
-            f"module '{target_module}' at layer {layer_id}. This looks like "
-            f"one expert-parallel training shard was loaded as a complete "
-            f"PEFT adapter."
-        )
-        if self.strict_loading:
-            raise ValueError(
-                f"{msg} Re-convert all mp_rank_* adapter shards into one "
-                f"complete PEFT adapter, or disable strict loading."
-            )
-
-        warned = getattr(self, "_warned_partial_moe_lora_keys", set())
+        tp_size = max(getattr(self, "tp_size", 1), 1)
+        residue = min(local_eids) % tp_size
+        warned = getattr(self, "_warned_shared_moe_lora_keys", set())
         key = (uid, target_module)
         if key not in warned:
-            logger.warning(
-                "%s Disabling this routed-MoE LoRA branch to avoid applying "
-                "partial expert deltas in the MoE kernel. Re-convert all "
-                "mp_rank_* adapter shards for full LoRA quality.",
-                msg,
+            logger.info(
+                "LoRA adapter '%s' has %s/%s TP-strided shared routed MoE "
+                "experts for module '%s' at layer %s. Expanding each group of "
+                "%s base experts to the representative LoRA expert "
+                "(e.g. experts.%s covers experts.%s..%s).",
+                uid,
+                len(local_eids),
+                self._num_experts_local,
+                target_module,
+                layer_id,
+                tp_size,
+                residue,
+                residue,
+                min(residue + tp_size - 1, self._num_experts_local - 1),
             )
             warned.add(key)
-            self._warned_partial_moe_lora_keys = warned
+            self._warned_shared_moe_lora_keys = warned
         return True
+
+    def _build_moe_lora_expert_map(
+        self,
+        uid: str,
+        target_module: str,
+        layer_id: int,
+        local_eids: Set[int],
+    ) -> Dict[int, int]:
+        if not local_eids:
+            return {}
+
+        if not self._is_shared_moe_lora_expert_set(
+            uid, target_module, layer_id, local_eids
+        ):
+            return {eid: eid for eid in local_eids}
+
+        # The training/export format intentionally stores one routed MoE LoRA
+        # expert per TP-strided group (e.g. experts.0 covers base experts
+        # 0..7). We materialize that sharing into the runtime expert slots
+        # below, so the forward-time expert map should remain identity.
+        return {
+            eid: eid
+            for destinations in self._expanded_shared_moe_destinations(
+                local_eids
+            ).values()
+            for eid in destinations
+        }
+
+    def _expanded_shared_moe_destinations(
+        self, local_eids: Set[int]
+    ) -> Dict[int, List[int]]:
+        if not self._looks_like_tp_strided_shared_moe_lora(local_eids):
+            return {eid: [eid] for eid in local_eids}
+
+        tp_size = max(getattr(self, "tp_size", 1), 1)
+        residue = min(local_eids) % tp_size
+        groups: Dict[int, List[int]] = {eid: [] for eid in local_eids}
+        for eid in range(self._num_experts_local):
+            representative = (eid // tp_size) * tp_size + residue
+            if representative in groups:
+                groups[representative].append(eid)
+        return groups
+
+    def _build_moe_lora_load_plan(
+        self,
+        uid: str,
+        target_module: str,
+        layer_id: int,
+        local_eids: Set[int],
+    ) -> Dict[int, List[int]]:
+        if not local_eids:
+            return {}
+        if self._is_shared_moe_lora_expert_set(
+            uid, target_module, layer_id, local_eids
+        ):
+            return self._expanded_shared_moe_destinations(local_eids)
+        return {eid: [eid] for eid in local_eids}
 
     @staticmethod
     def _has_nonzero_weight(
@@ -1194,22 +1256,22 @@ class LoRAMemoryPool:
                     f"tp{self.tp_rank}",
                 )
 
+            moe_lora_load_plans: Dict[str, Dict[int, List[int]]] = {}
             for name, weights in temp_A_buffer.items():
                 if name not in active_target_modules:
                     continue
-                disable_partial_moe_lora = False
+                expert_map = {}
                 if name in ["gate_up_proj_moe", "down_proj_moe"]:
                     active_experts = self._active_moe_expert_ids(
                         temp_A_buffer[name], temp_B_buffer[name]
                     )
-                    disable_partial_moe_lora = self._should_disable_partial_moe_lora(
+                    expert_map = self._build_moe_lora_expert_map(
                         uid, name, layer_id, active_experts
                     )
-                    if disable_partial_moe_lora:
-                        active_experts = set()
-                    self._set_moe_lora_expert_map(
-                        name, layer_id, buffer_id, active_experts
+                    moe_lora_load_plans[name] = self._build_moe_lora_load_plan(
+                        uid, name, layer_id, active_experts
                     )
+                    self._set_moe_lora_expert_map(name, layer_id, buffer_id, expert_map)
                 else:
                     self._reset_moe_lora_expert_map(name, layer_id, buffer_id)
                 self._set_lora_rank(
@@ -1218,12 +1280,12 @@ class LoRAMemoryPool:
                     buffer_id,
                     (
                         lora_rank
-                        if not (
-                            name in ["gate_up_proj_moe", "down_proj_moe"]
-                            and disable_partial_moe_lora
-                        )
-                        and self._has_active_weight_pair(
+                        if self._has_active_weight_pair(
                             lora_adapter, temp_A_buffer[name], temp_B_buffer[name]
+                        )
+                        and (
+                            name not in ["gate_up_proj_moe", "down_proj_moe"]
+                            or bool(expert_map)
                         )
                         else 0
                     ),
@@ -1306,13 +1368,11 @@ class LoRAMemoryPool:
                         # is correct.
                         target_buffer[buffer_id].zero_()
                         assert isinstance(weights_cache_key, (str, dict))
-                        for (
-                            local_eid,
-                            expert_weight,
-                            expert_cache_key,
-                        ) in self._iter_local_expert_weights(
-                            weights, weights_cache_key
-                        ):
+                        load_plan = moe_lora_load_plans.get(name, {})
+                        items = list(
+                            self._iter_local_expert_weights(weights, weights_cache_key)
+                        )
+                        for local_eid, expert_weight, expert_cache_key in items:
                             if expert_weight is None:
                                 continue
                             expert_weight = self._get_maybe_cached_weight_for_transfer(
@@ -1320,19 +1380,19 @@ class LoRAMemoryPool:
                                 expert_cache_key,
                                 expert_weight,
                             )
+                            destination_eids = load_plan.get(local_eid, [local_eid])
                             for ci in range(c):
-                                buffer_view = target_buffer[
-                                    buffer_id,
-                                    local_eid,
-                                    ci * max_r : ci * max_r + lora_rank,
-                                    :,
+                                source_view = expert_weight[
+                                    ci * lora_rank : (ci + 1) * lora_rank, :
                                 ]
-                                load_lora_weight_tensor(
-                                    buffer_view,
-                                    expert_weight[
-                                        ci * lora_rank : (ci + 1) * lora_rank, :
-                                    ],
-                                )
+                                for destination_eid in destination_eids:
+                                    buffer_view = target_buffer[
+                                        buffer_id,
+                                        destination_eid,
+                                        ci * max_r : ci * max_r + lora_rank,
+                                        :,
+                                    ]
+                                    load_lora_weight_tensor(buffer_view, source_view)
                 else:
                     buffer_view = target_buffer[buffer_id, : lora_rank * c, :]
                     if weights is not None:
@@ -1408,13 +1468,11 @@ class LoRAMemoryPool:
                         # then scale+load the ones it does.
                         target_buffer[buffer_id].zero_()
                         assert isinstance(weights_cache_key, (str, dict))
-                        for (
-                            local_eid,
-                            w,
-                            w_cache_key,
-                        ) in self._iter_local_expert_weights(
-                            weights, weights_cache_key
-                        ):
+                        load_plan = moe_lora_load_plans.get(name, {})
+                        items = list(
+                            self._iter_local_expert_weights(weights, weights_cache_key)
+                        )
+                        for local_eid, w, w_cache_key in items:
                             if w is not None:
                                 w = w * lora_adapter.scaling
                                 w = self._get_maybe_cached_weight_for_transfer(
@@ -1422,10 +1480,12 @@ class LoRAMemoryPool:
                                     w_cache_key,
                                     w,
                                 )
-                            buffer_view = target_buffer[
-                                buffer_id, local_eid, :, :lora_rank
-                            ]
-                            load_lora_weight_tensor(buffer_view, w)
+                            destination_eids = load_plan.get(local_eid, [local_eid])
+                            for destination_eid in destination_eids:
+                                buffer_view = target_buffer[
+                                    buffer_id, destination_eid, :, :lora_rank
+                                ]
+                                load_lora_weight_tensor(buffer_view, w)
                 else:
                     buffer_view = target_buffer[buffer_id, :, :lora_rank]
                     if weights is not None:

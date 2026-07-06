@@ -57,7 +57,7 @@ def _make_pool(
     pool.tp_size = 1
     pool.tp_rank = 0
     pool.strict_loading = False
-    pool._warned_partial_moe_lora_keys = set()
+    pool._warned_shared_moe_lora_keys = set()
     if moe_use_local_expert_ids and num_experts_global % moe_ep_size == 0:
         pool._num_experts_local = num_experts_global // moe_ep_size
     else:
@@ -259,7 +259,7 @@ class TestIterLocalExpertWeightsDict(unittest.TestCase):
 
         self.assertEqual(pool._active_moe_expert_ids(a_weights, b_weights), {2, 6})
 
-    def test_tp_strided_partial_experts_are_detected_as_export_shard(self):
+    def test_tp_strided_experts_are_detected_as_shared_moe_lora(self):
         pool = _make_pool(
             num_experts_global=8,
             moe_ep_size=1,
@@ -268,13 +268,13 @@ class TestIterLocalExpertWeightsDict(unittest.TestCase):
         )
         pool.tp_size = 2
 
-        self.assertTrue(pool._looks_like_exported_expert_parallel_shard({0, 2, 4, 6}))
-        self.assertTrue(pool._looks_like_exported_expert_parallel_shard({1, 3, 5, 7}))
-        self.assertFalse(pool._looks_like_exported_expert_parallel_shard({0, 4}))
-        self.assertFalse(pool._looks_like_exported_expert_parallel_shard({0, 1, 2, 3}))
-        self.assertFalse(pool._looks_like_exported_expert_parallel_shard(set(range(8))))
+        self.assertTrue(pool._looks_like_tp_strided_shared_moe_lora({0, 2, 4, 6}))
+        self.assertTrue(pool._looks_like_tp_strided_shared_moe_lora({1, 3, 5, 7}))
+        self.assertFalse(pool._looks_like_tp_strided_shared_moe_lora({0, 4}))
+        self.assertFalse(pool._looks_like_tp_strided_shared_moe_lora({0, 1, 2, 3}))
+        self.assertFalse(pool._looks_like_tp_strided_shared_moe_lora(set(range(8))))
 
-    def test_partial_export_shard_disables_moe_lora_without_strict_loading(self):
+    def test_tp_strided_shared_moe_lora_expands_to_expert_groups(self):
         pool = _make_pool(
             num_experts_global=8,
             moe_ep_size=1,
@@ -283,13 +283,24 @@ class TestIterLocalExpertWeightsDict(unittest.TestCase):
         )
         pool.tp_size = 2
 
-        self.assertTrue(
-            pool._should_disable_partial_moe_lora(
+        self.assertEqual(
+            pool._build_moe_lora_expert_map(
                 "adapter", "gate_up_proj_moe", 0, {0, 2, 4, 6}
-            )
+            ),
+            {eid: eid for eid in range(8)},
+        )
+        self.assertEqual(
+            pool._build_moe_lora_load_plan(
+                "adapter", "gate_up_proj_moe", 0, {0, 2, 4, 6}
+            ),
+            {0: [0, 1], 2: [2, 3], 4: [4, 5], 6: [6, 7]},
+        )
+        self.assertEqual(
+            pool._expanded_shared_moe_destinations({0, 2, 4, 6}),
+            {0: [0, 1], 2: [2, 3], 4: [4, 5], 6: [6, 7]},
         )
 
-    def test_partial_export_shard_raises_with_strict_loading(self):
+    def test_tp_strided_shared_moe_lora_supports_nonzero_residue(self):
         pool = _make_pool(
             num_experts_global=8,
             moe_ep_size=1,
@@ -297,12 +308,21 @@ class TestIterLocalExpertWeightsDict(unittest.TestCase):
             moe_use_local_expert_ids=False,
         )
         pool.tp_size = 2
-        pool.strict_loading = True
 
-        with self.assertRaisesRegex(ValueError, "one expert-parallel training shard"):
-            pool._should_disable_partial_moe_lora(
-                "adapter", "down_proj_moe", 0, {0, 2, 4, 6}
-            )
+        self.assertEqual(
+            pool._build_moe_lora_expert_map(
+                "adapter", "down_proj_moe", 0, {1, 3, 5, 7}
+            ),
+            {eid: eid for eid in range(8)},
+        )
+        self.assertEqual(
+            pool._build_moe_lora_load_plan("adapter", "down_proj_moe", 0, {1, 3, 5, 7}),
+            {1: [0, 1], 3: [2, 3], 5: [4, 5], 7: [6, 7]},
+        )
+        self.assertEqual(
+            pool._expanded_shared_moe_destinations({1, 3, 5, 7}),
+            {1: [0, 1], 3: [2, 3], 5: [4, 5], 7: [6, 7]},
+        )
 
     def test_sparse_dict_without_full_tp_stride_remains_sparse(self):
         pool = _make_pool(
@@ -321,6 +341,27 @@ class TestIterLocalExpertWeightsDict(unittest.TestCase):
         }
 
         self.assertEqual(got, {0: [0.0, 0.0], 4: [4.0, 4.0]})
+
+    def test_non_shared_sparse_moe_lora_uses_identity_map(self):
+        pool = _make_pool(
+            num_experts_global=8,
+            moe_ep_size=1,
+            moe_ep_rank=0,
+            moe_use_local_expert_ids=False,
+        )
+        pool.tp_size = 2
+
+        self.assertEqual(
+            pool._build_moe_lora_expert_map("adapter", "gate_up_proj_moe", 0, {0, 4}),
+            {0: 0, 4: 4},
+        )
+        self.assertEqual(
+            pool._build_moe_lora_load_plan("adapter", "gate_up_proj_moe", 0, {0, 4}),
+            {0: [0], 4: [4]},
+        )
+        self.assertEqual(
+            pool._expanded_shared_moe_destinations({0, 4}), {0: [0], 4: [4]}
+        )
 
     def test_ep_local_id_mapping_does_not_expand_tp_strided_exports(self):
         pool = _make_pool(

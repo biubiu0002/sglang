@@ -669,7 +669,7 @@ def _merged_experts_fused_moe_lora_add_impl(
     # dim 1) while lora_b is per-expert, so take the max for the true global count.
     per_expert_dim = max(lora_a.shape[1], lora_b.shape[1])
     ep_local = local_num_experts is not None and local_num_experts < per_expert_dim
-    input_top_k = 1 if hidden_states.shape[0] == topk_ids.numel() else topk_ids.shape[1]
+    input_top_k = 1 if hidden_states.shape[0] >= topk_ids.numel() else topk_ids.shape[1]
 
     def _merge_lora_expert_weight(t: torch.Tensor) -> torch.Tensor:
         # [max_loras, num_experts, x, y] -> [max_loras * num_experts, x, y]

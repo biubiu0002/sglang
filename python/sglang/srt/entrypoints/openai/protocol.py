@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 import uuid
@@ -621,9 +622,9 @@ _GENERIC_MESSAGE_ROLES: Tuple[str, ...] = get_args(_GenericMessageRole)
 
 class ChatCompletionMessageGenericParam(BaseModel):
     role: _GenericMessageRole
-    content: Union[str, List[ChatCompletionMessageContentPart], None] = Field(
-        default=None
-    )
+    content: Union[
+        str, List[ChatCompletionMessageContentPart], Dict[str, Any], None
+    ] = Field(default=None)
     tool_call_id: Optional[str] = None
     name: Optional[str] = None
     reasoning_content: Optional[str] = None
@@ -640,6 +641,21 @@ class ChatCompletionMessageGenericParam(BaseModel):
                 raise ValueError(f"'role' must be one of {allowed} (case-insensitive).")
             return v_lower
         raise ValueError("'role' must be a string")
+
+    @model_validator(mode="after")
+    def _normalize_content(self):
+        if self.content is None or isinstance(self.content, str):
+            return self
+        if isinstance(self.content, list):
+            return self
+        if self.role == "tool":
+            self.content = json.dumps(
+                self.content, ensure_ascii=False, separators=(",", ":")
+            )
+            return self
+        raise ValueError(
+            "content must be a string, a list of content parts, or null"
+        )
 
 
 class ChatCompletionMessageUserParam(BaseModel):

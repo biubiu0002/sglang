@@ -161,6 +161,58 @@ class TestChatCompletionRequest(unittest.TestCase):
         )
         self.assertEqual(request2.tool_choice, "auto")
 
+    def test_chat_completion_tool_message_object_content(self):
+        """Tool result content objects are serialized for compatibility."""
+        messages = [
+            {"role": "user", "content": "What is in this image?"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "recognize_image",
+                            "arguments": "{}",
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": {"message": "beauty products / cosmetics assortment"},
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_2",
+                "content": {"image_url": "https://example.com/image.png"},
+            },
+        ]
+
+        request = ChatCompletionRequest(model="test-model", messages=messages)
+
+        self.assertEqual(
+            request.messages[2].content,
+            '{"message":"beauty products / cosmetics assortment"}',
+        )
+        self.assertEqual(
+            request.messages[3].content,
+            '{"image_url":"https://example.com/image.png"}',
+        )
+
+    def test_chat_completion_non_tool_message_rejects_object_content(self):
+        """Only tool result messages accept object content."""
+        with self.assertRaises(ValidationError):
+            ChatCompletionRequest(
+                model="test-model",
+                messages=[
+                    {"role": "system", "content": {"message": "not accepted"}},
+                    {"role": "user", "content": "Hello"},
+                ],
+            )
+
     def test_chat_completion_sglang_extensions(self):
         """Test chat completion with SGLang extensions"""
         messages = [{"role": "user", "content": "Hello"}]

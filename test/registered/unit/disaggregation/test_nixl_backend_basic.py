@@ -265,6 +265,55 @@ class TestNixlKVArgsRegisterInfo(CustomTestCase):
         self.assertIsNone(info.staging)
 
 
+class TestNixlEqualTPPreparedGeometry(CustomTestCase):
+    def _make_manager(self):
+        mgr = object.__new__(NixlKVManager)
+        mgr.src_mem_kind = "VRAM"
+        mgr.is_mla_backend = False
+        mgr.attn_tp_size = 8
+        mgr.prep_handles = {}
+        mgr._num_slots_src = 10
+        mgr.kv_args = SimpleNamespace(
+            kv_item_lens=[128, 128],
+            kv_data_ptrs=[0x1000, 0x2000],
+            kv_data_mem_kinds=["VRAM", "VRAM"],
+            gpu_id=0,
+        )
+        mgr._init_equal_tp_prep_handle = MagicMock()
+        return mgr
+
+    def _make_peer_info(self, *, dst_kv_count=3, dst_mem_kinds=None):
+        return SimpleNamespace(
+            agent_name="decode-peer",
+            decode_tp_size=8,
+            dst_kv_ptrs=[0x3000 + 0x1000 * i for i in range(dst_kv_count)],
+            dst_kv_item_lens=[128] * dst_kv_count,
+            dst_kv_mem_kinds=dst_mem_kinds or ["VRAM"] * dst_kv_count,
+            dst_num_slots=10,
+            gpu_id=1,
+        )
+
+    def test_decode_only_speculative_tail_kv_is_excluded_from_dst_dlist(self):
+        mgr = self._make_manager()
+        peer_info = self._make_peer_info(dst_kv_count=3)
+
+        mgr._prepare_payload_xfer(peer_info)
+
+        self.assertEqual(mgr._init_equal_tp_prep_handle.call_count, 2)
+        dst_call = mgr._init_equal_tp_prep_handle.call_args_list[1]
+        self.assertEqual(dst_call.args[:3], ("decode-peer", [0x3000, 0x4000], 1))
+        self.assertEqual(dst_call.kwargs["kv_item_lens"], [128, 128])
+        self.assertEqual(dst_call.kwargs["kv_data_lens"], [1280, 1280])
+        self.assertEqual(dst_call.kwargs["kv_xfer_lens"], [128, 128])
+
+    def test_decode_fewer_kv_regions_than_prefill_is_fatal(self):
+        mgr = self._make_manager()
+        peer_info = self._make_peer_info(dst_kv_count=1)
+
+        with self.assertRaisesRegex(ValueError, "decode registered fewer KV regions"):
+            mgr._prepare_payload_xfer(peer_info)
+
+
 class TestNixlTransferStatus(CustomTestCase):
     def test_not_done_until_aux_and_expected_count_arrive(self):
         status = TransferStatus()

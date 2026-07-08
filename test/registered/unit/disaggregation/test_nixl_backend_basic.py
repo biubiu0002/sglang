@@ -23,6 +23,7 @@ from sglang.srt.disaggregation.nixl.conn import (
     TransferInfo,
     TransferKVChunk,
     TransferStatus,
+    _align_equal_tp_dst_kv_geometry,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -263,6 +264,40 @@ class TestNixlKVArgsRegisterInfo(CustomTestCase):
         self.assertEqual(info.dst_state_dim_per_tensor, [])
         self.assertEqual(info.dst_kv_item_lens, [256])
         self.assertIsNone(info.staging)
+
+
+class TestNixlEqualTPGeometry(CustomTestCase):
+    def test_mtp_decode_tail_kv_buffers_are_excluded(self):
+        ptrs = [0x1000, 0x2000, 0x3000]
+        item_lens = [128, 128, 128]
+        data_lens = [1280, 1280, 1280]
+        xfer_lens = [128, 128]
+
+        aligned = _align_equal_tp_dst_kv_geometry(
+            "decode-peer",
+            ptrs,
+            item_lens,
+            data_lens,
+            xfer_lens,
+        )
+
+        self.assertEqual(aligned, (ptrs[:2], item_lens[:2], data_lens[:2], xfer_lens))
+
+    def test_non_tail_geometry_mismatch_is_not_rewritten(self):
+        ptrs = [0x1000, 0x2000]
+        item_lens = [128]
+        data_lens = [1280, 1280]
+        xfer_lens = [128]
+
+        aligned = _align_equal_tp_dst_kv_geometry(
+            "decode-peer",
+            ptrs,
+            item_lens,
+            data_lens,
+            xfer_lens,
+        )
+
+        self.assertEqual(aligned, (ptrs, item_lens, data_lens, xfer_lens))
 
 
 class TestNixlTransferStatus(CustomTestCase):

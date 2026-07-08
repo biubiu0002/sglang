@@ -128,6 +128,41 @@ def _kv_xfer_mem_segments(
     return segments
 
 
+def _align_equal_tp_dst_kv_geometry(
+    peer_name: str,
+    kv_ptrs: list[int],
+    kv_item_lens: list[int],
+    kv_data_lens: list[int],
+    kv_xfer_lens: list[int],
+) -> tuple[list[int], list[int], list[int], list[int]]:
+    """Drop decode-only tail buffers from prefilled KV transfer geometry.
+
+    With EAGLE/MTP, decode can expose a draft KV pool in addition to the target
+    model KV pool. Prefill has no matching source buffer for that tail pool, so
+    the prebuilt NIXL dlist must cover only the shared target KV buffers. Other
+    geometry mismatches stay fatal in _prep_equal_tp_dlist().
+    """
+    if (
+        len(kv_ptrs) == len(kv_item_lens) == len(kv_data_lens)
+        and len(kv_ptrs) > len(kv_xfer_lens)
+    ):
+        extra = len(kv_ptrs) - len(kv_xfer_lens)
+        logger.info(
+            "NIXL equal-TP destination has %s decode-only tail KV buffer(s) "
+            "for peer %s; excluding them from prefilled KV transfer dlist",
+            extra,
+            peer_name,
+        )
+        keep = len(kv_xfer_lens)
+        return (
+            kv_ptrs[:keep],
+            kv_item_lens[:keep],
+            kv_data_lens[:keep],
+            kv_xfer_lens,
+        )
+    return kv_ptrs, kv_item_lens, kv_data_lens, kv_xfer_lens
+
+
 @dataclasses.dataclass
 class _KVXferPreparedSegment:
     start: int
@@ -941,15 +976,27 @@ class NixlKVManager(CommonKVManager):
             dst_kv_data_lens = [
                 item_len * dst_num_slots for item_len in dst_kv_item_lens
             ]
-            self._init_equal_tp_prep_handle(
+            (
+                dst_kv_ptrs,
+                dst_kv_item_lens,
+                dst_kv_data_lens,
+                dst_kv_xfer_lens,
+            ) = _align_equal_tp_dst_kv_geometry(
                 peer_info.agent_name,
                 peer_info.dst_kv_ptrs,
+                dst_kv_item_lens,
+                dst_kv_data_lens,
+                self.kv_args.kv_item_lens,
+            )
+            self._init_equal_tp_prep_handle(
+                peer_info.agent_name,
+                dst_kv_ptrs,
                 peer_info.gpu_id,
                 num_slots=peer_info.dst_num_slots,
                 mem_kind=dst_mem_kind,
                 kv_item_lens=dst_kv_item_lens,
                 kv_data_lens=dst_kv_data_lens,
-                kv_xfer_lens=self.kv_args.kv_item_lens,
+                kv_xfer_lens=dst_kv_xfer_lens,
             )
         else:
             dst_mem_kind = _homogeneous_kv_mem_kind(

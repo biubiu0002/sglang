@@ -104,6 +104,8 @@ fn env_to_cli_args() -> Vec<OsString> {
     let mut args = vec![std::env::args_os()
         .next()
         .unwrap_or_else(|| OsString::from("sgl-router"))];
+    push_env_arg_or_default(&mut args, "HOST", "--host", "0.0.0.0");
+    push_env_arg_or_default(&mut args, "PORT", "--port", "8080");
     push_env_arg(&mut args, "MODEL_ID", "--model-id");
     push_env_arg(&mut args, "POLICY", "--policy");
     push_env_arg(&mut args, "REQUEST_TIMEOUT_SECS", "--request-timeout-secs");
@@ -150,6 +152,13 @@ fn push_env_arg(args: &mut Vec<OsString>, env_name: &str, flag: &str) {
         args.push(OsString::from(flag));
         args.push(OsString::from(value));
     }
+}
+
+fn push_env_arg_or_default(args: &mut Vec<OsString>, env_name: &str, flag: &str, default: &str) {
+    args.push(OsString::from(flag));
+    args.push(OsString::from(
+        non_empty_env(env_name).unwrap_or_else(|| default.to_string()),
+    ));
 }
 
 fn push_env_flag(args: &mut Vec<OsString>, env_name: &str, flag: &str) {

@@ -154,6 +154,7 @@ pub async fn chat_completions(
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
     let body = apply_request_priority_override(&ctx.config.priority_override, &headers, body)?;
+    let body = normalize_chat_thinking_blocks(body)?;
     let probe = parse_probe(&body)?;
     let model_str = probe
         .model
@@ -936,6 +937,106 @@ fn build_outgoing_body(
     Ok(Bytes::from(bytes))
 }
 
+/// Accept Anthropic-style assistant thinking blocks on the OpenAI chat path.
+///
+/// Some upstream clients replay prior assistant turns as content blocks like
+/// `{"type":"thinking","thinking":"..."}`. SGLang's OpenAI schema accepts
+/// prior reasoning as a top-level assistant `reasoning_content` string, but
+/// rejects `thinking` as a `content[]` part. Normalize that compatibility case
+/// at the router edge so worker validation sees the native SGLang shape.
+fn normalize_chat_thinking_blocks(body: Bytes) -> Result<Bytes, ApiError> {
+    if !body
+        .windows(b"thinking".len())
+        .any(|window| window == b"thinking")
+    {
+        return Ok(body);
+    }
+
+    let mut value: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
+        tracing::debug!(error = %e, "chat-completions thinking-normalize parse failed");
+        ApiError::BadRequest("invalid request: body must be a JSON object".to_string())
+    })?;
+    let Some(messages) = value.get_mut("messages").and_then(|v| v.as_array_mut()) else {
+        return Ok(body);
+    };
+
+    let mut changed = false;
+    for message in messages {
+        if message.get("role").and_then(|v| v.as_str()) != Some("assistant") {
+            continue;
+        }
+        let Some(obj) = message.as_object_mut() else {
+            continue;
+        };
+        let Some(content) = obj.get_mut("content").and_then(|v| v.as_array_mut()) else {
+            continue;
+        };
+
+        let mut reasoning_parts = Vec::new();
+        let mut kept_parts = Vec::with_capacity(content.len());
+        for part in std::mem::take(content) {
+            let part_type = part.get("type").and_then(|v| v.as_str());
+            match part_type {
+                Some("thinking") => {
+                    if let Some(text) = part.get("thinking").and_then(|v| v.as_str()) {
+                        if !text.is_empty() {
+                            reasoning_parts.push(text.to_string());
+                        }
+                    }
+                    changed = true;
+                }
+                Some("redacted_thinking") => {
+                    changed = true;
+                }
+                _ => kept_parts.push(part),
+            }
+        }
+
+        if !reasoning_parts.is_empty() {
+            let new_reasoning = reasoning_parts.join("\n");
+            match obj.get_mut("reasoning_content") {
+                Some(existing) if existing.is_string() => {
+                    let existing = existing.as_str().unwrap_or_default();
+                    *obj.get_mut("reasoning_content").expect("checked above") =
+                        serde_json::Value::String(if existing.is_empty() {
+                            new_reasoning
+                        } else {
+                            format!("{existing}\n{new_reasoning}")
+                        });
+                }
+                Some(existing) if existing.is_null() => {
+                    *existing = serde_json::Value::String(new_reasoning);
+                }
+                None => {
+                    obj.insert(
+                        "reasoning_content".to_string(),
+                        serde_json::Value::String(new_reasoning),
+                    );
+                }
+                Some(_) => {}
+            }
+        }
+
+        if kept_parts.is_empty() {
+            obj.insert(
+                "content".to_string(),
+                serde_json::Value::String(String::new()),
+            );
+        } else {
+            obj.insert("content".to_string(), serde_json::Value::Array(kept_parts));
+        }
+    }
+
+    if !changed {
+        return Ok(body);
+    }
+    serde_json::to_vec(&value).map(Bytes::from).map_err(|e| {
+        ApiError::Internal(
+            anyhow::Error::new(e).context("re-serialize normalized chat request body"),
+        )
+    })
+}
+
 /// Whether the router's `input_ids` may be forwarded for this request.
 ///
 /// We forward only when the engine, fed `input_ids`, would have produced the
@@ -1292,6 +1393,61 @@ mod tests {
             Some(&serde_json::Value::Number(2.into()))
         );
         assert!(parsed.get("input_ids").is_none());
+    }
+
+    #[test]
+    fn normalize_chat_thinking_blocks_promotes_assistant_reasoning() {
+        let body = Bytes::from_static(
+            br#"{"model":"x","messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"plan","signature":"sig"},{"type":"text","text":"answer"}]}]}"#,
+        );
+
+        let out = normalize_chat_thinking_blocks(body).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let msg = &parsed["messages"][0];
+
+        assert_eq!(msg["reasoning_content"], "plan");
+        assert_eq!(
+            msg["content"],
+            serde_json::json!([{"type":"text","text":"answer"}])
+        );
+    }
+
+    #[test]
+    fn normalize_chat_thinking_blocks_merges_existing_reasoning() {
+        let body = Bytes::from_static(
+            br#"{"model":"x","messages":[{"role":"assistant","reasoning_content":"old","content":[{"type":"thinking","thinking":"new"},{"type":"thinking","thinking":"newer"},{"type":"text","text":""}]}]}"#,
+        );
+
+        let out = normalize_chat_thinking_blocks(body).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+
+        assert_eq!(
+            parsed["messages"][0]["reasoning_content"],
+            "old\nnew\nnewer"
+        );
+    }
+
+    #[test]
+    fn normalize_chat_thinking_blocks_drops_redacted_and_uses_empty_content() {
+        let body = Bytes::from_static(
+            br#"{"model":"x","messages":[{"role":"assistant","content":[{"type":"redacted_thinking","data":"opaque"}]}]}"#,
+        );
+
+        let out = normalize_chat_thinking_blocks(body).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+
+        assert_eq!(parsed["messages"][0]["content"], "");
+        assert!(parsed["messages"][0].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn normalize_chat_thinking_blocks_leaves_user_content_unchanged() {
+        let body = Bytes::from_static(
+            br#"{"model":"x","messages":[{"role":"user","content":[{"type":"thinking","thinking":"not accepted here"}]}]}"#,
+        );
+        let out = normalize_chat_thinking_blocks(body.clone()).unwrap();
+
+        assert_eq!(out, body);
     }
 
     /// A chat request on a chat-encoder model that yields engine-equivalent

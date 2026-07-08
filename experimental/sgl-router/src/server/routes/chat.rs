@@ -11,6 +11,7 @@ use crate::server::metrics::{
     MetricsRegistry, PriorityFilterOutcome, RequestOutcome, SseClientDisconnectPhase,
     StaleRequestOutcome, WorkerModeLabel,
 };
+use crate::server::routes::admission::enforce_external_queue_admission;
 use crate::server::routes::alias_fallback::{
     fallback_reason_for_error, fallback_reason_for_response, forward_to_fallback, rewrite_model,
 };
@@ -307,6 +308,7 @@ async fn chat_completions_inner(
             .record_priority_filtered(PriorityFilterOutcome::WorkerExcluded);
     }
     let workers = eligible.workers;
+    enforce_external_queue_admission(&ctx, &model_str, &workers)?;
 
     // Tokenize once at ingress whenever it can pay off — decoupled from the
     // routing policy, because forwarding `input_ids` is a property of the

@@ -13,9 +13,10 @@ use crate::config::{
     default_cb_cool_down, default_proxy_request_timeout_secs, default_stale_request_timeout_secs,
     default_trace_body_max_bytes, resolve_mode, ActiveLoadConfig, AliasFallbackConfig,
     CacheAwareConfig, CacheTreeSource, CircuitBreakerConfig, Config, DiscoveryBackend,
-    K8sDiscoveryConfig, LogFormat, ModelConfig, ObservabilityConfig, PolicyKind,
-    PriorityOverrideConfig, ProxyConfig, RuntimeMode, ServerConfig, StaticUrlsDiscoveryConfig,
-    StickyConfig, TieredSpilloverConfig, TraceConfig, WorkerBearerKeyConfig,
+    ExternalQueueAdmissionConfig, K8sDiscoveryConfig, LogFormat, ModelConfig, ObservabilityConfig,
+    PolicyKind, PriorityOverrideConfig, ProxyConfig, RuntimeMode, ServerConfig,
+    StaticUrlsDiscoveryConfig, StickyConfig, TieredSpilloverConfig, TraceConfig,
+    WorkerBearerKeyConfig,
 };
 use crate::discovery::WorkerTier;
 
@@ -247,6 +248,23 @@ pub struct Cli {
     /// reaps it (returns 504 `stale_request_expired`).
     #[arg(long, default_value_t = default_stale_request_timeout_secs())]
     pub stale_request_timeout_secs: u64,
+
+    // ---- external queue admission (optional) ----
+    /// Enable router-side fail-fast admission control for external traffic.
+    /// When enabled, a request is rejected before policy selection if every
+    /// healthy priority-eligible worker is above
+    /// `--external-queue-admission-threshold`.
+    #[arg(
+        long,
+        env = "EXTERNAL_QUEUE_ADMISSION_ENABLED",
+        default_value_t = false
+    )]
+    pub external_queue_admission_enabled: bool,
+    /// Effective queue threshold used by external queue admission control.
+    /// The router rejects only when every eligible worker's effective load is
+    /// greater than this value; equal is admitted.
+    #[arg(long, env = "EXTERNAL_QUEUE_ADMISSION_THRESHOLD")]
+    pub external_queue_admission_threshold: Option<usize>,
 
     // ---- request trace sink (optional) ----
     /// Optional HTTP endpoint that receives best-effort JSON trace events.
@@ -588,6 +606,13 @@ impl Cli {
         {
             return Err(anyhow!("--trusted-priority-secret must be non-empty"));
         }
+        if self.external_queue_admission_enabled
+            && self.external_queue_admission_threshold.is_none()
+        {
+            return Err(anyhow!(
+                "--external-queue-admission-enabled requires --external-queue-admission-threshold"
+            ));
+        }
 
         // Build a CacheAwareConfig when the operator tuned a knob OR enabled
         // the load poller (which flips use_reported_load on); otherwise leave
@@ -709,6 +734,10 @@ impl Cli {
             discovery,
             proxy: ProxyConfig {
                 request_timeout_secs: self.request_timeout_secs,
+                external_queue_admission: ExternalQueueAdmissionConfig {
+                    enabled: self.external_queue_admission_enabled,
+                    queue_threshold: self.external_queue_admission_threshold,
+                },
             },
             active_load: ActiveLoadConfig {
                 stale_request_timeout_secs: self.stale_request_timeout_secs,
@@ -1533,6 +1562,37 @@ mod tests {
         .unwrap();
         assert_eq!(c.proxy.request_timeout_secs, 120);
         assert_eq!(c.active_load.stale_request_timeout_secs, 240);
+    }
+
+    #[test]
+    fn external_queue_admission_requires_threshold_when_enabled() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--external-queue-admission-enabled",
+        ]))
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("--external-queue-admission-threshold"),
+            "{err:#}",
+        );
+    }
+
+    #[test]
+    fn external_queue_admission_flags_land_in_proxy_config() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--external-queue-admission-enabled",
+            "--external-queue-admission-threshold",
+            "8",
+        ]))
+        .unwrap();
+
+        assert!(c.proxy.external_queue_admission.enabled);
+        assert_eq!(c.proxy.external_queue_admission.queue_threshold, Some(8));
     }
 
     #[test]

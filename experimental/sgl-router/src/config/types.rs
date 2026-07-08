@@ -81,6 +81,10 @@ pub struct ProxyConfig {
     /// return headers + body. Default 300 s. The circuit breaker
     /// records a failure when this fires.
     pub request_timeout_secs: u64,
+    /// Router-side admission control for external traffic. Disabled by
+    /// default; production/internal routers opt out simply by not configuring
+    /// it.
+    pub external_queue_admission: ExternalQueueAdmissionConfig,
 }
 
 pub fn default_proxy_request_timeout_secs() -> u64 {
@@ -91,6 +95,7 @@ impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
             request_timeout_secs: default_proxy_request_timeout_secs(),
+            external_queue_admission: ExternalQueueAdmissionConfig::default(),
         }
     }
 }
@@ -105,6 +110,14 @@ pub struct ActiveLoadConfig {
     /// janitor fires its `cancel_token` and the chat handler returns
     /// 504 `stale_request_expired`. Default 600 s.
     pub stale_request_timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ExternalQueueAdmissionConfig {
+    pub enabled: bool,
+    /// Reject when every eligible worker's effective queue pressure is greater
+    /// than this threshold. Equal-to-threshold is still admitted.
+    pub queue_threshold: Option<usize>,
 }
 
 #[derive(Debug, Clone)]

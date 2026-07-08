@@ -88,6 +88,12 @@ pub enum ApiError {
     #[error("policy selected no worker for model {model}")]
     PolicySelectionFailed { model: String },
 
+    /// External-only admission control rejected the request before policy
+    /// selection because every healthy, priority-eligible worker is already
+    /// above the configured queue threshold.
+    #[error("external queue overloaded for model {model}")]
+    ExternalQueueOverloaded { model: String },
+
     /// The worker's circuit breaker was open at the moment of dispatch.
     /// Surfaced post-policy-selection (race with `healthy_workers_for`);
     /// the next selection will skip this worker.
@@ -136,6 +142,9 @@ impl ApiError {
             }
             ApiError::PolicySelectionFailed { .. } => {
                 (StatusCode::SERVICE_UNAVAILABLE, "policy_selection_failed")
+            }
+            ApiError::ExternalQueueOverloaded { .. } => {
+                (StatusCode::TOO_MANY_REQUESTS, "external_queue_overloaded")
             }
             ApiError::BreakerOpen { .. } => (StatusCode::SERVICE_UNAVAILABLE, "breaker_open"),
             ApiError::WorkerMisconfigured { .. } => {
@@ -195,6 +204,10 @@ impl ApiError {
                 tracing::warn!(model = %model, reason = "policy_selection_failed", "service unavailable");
                 "service unavailable".to_string()
             }
+            ApiError::ExternalQueueOverloaded { model } => {
+                tracing::warn!(model = %model, reason = "external_queue_overloaded", "external queue admission rejected request");
+                "all external workers are overloaded".to_string()
+            }
             ApiError::BreakerOpen { worker } => {
                 tracing::warn!(upstream = %worker, reason = "breaker_open", "service unavailable");
                 "service unavailable".to_string()
@@ -225,6 +238,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, code) = self.status_and_code();
         let typ = match status.as_u16() {
+            429 => "rate_limit_error",
             400..=499 => "invalid_request_error",
             _ => "server_error",
         };
@@ -370,6 +384,21 @@ mod tests {
         );
         assert_ne!(env.error.code, "internal_error");
         assert_ne!(env.error.code, "model_not_found");
+    }
+
+    #[test]
+    fn external_queue_overloaded_envelope_is_429_rate_limit() {
+        let err = ApiError::ExternalQueueOverloaded {
+            model: "tiny".into(),
+        };
+        let resp = err.into_response();
+        let (status, code_header, env) = parse_envelope(resp);
+
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(code_header.as_deref(), Some("external_queue_overloaded"));
+        assert_eq!(env.error.code, "external_queue_overloaded");
+        assert_eq!(env.error.typ, "rate_limit_error");
+        assert_eq!(env.error.message, "all external workers are overloaded");
     }
 
     #[test]

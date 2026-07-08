@@ -26,6 +26,7 @@ use crate::policies::{request_tokens_for, RequestTokens, SelectionContext};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{PriorityFilterOutcome, RequestOutcome, WorkerModeLabel};
+use crate::server::routes::admission::enforce_external_queue_admission;
 use crate::server::routes::alias_fallback::{
     fallback_reason_for_error, fallback_reason_for_response, forward_to_fallback, rewrite_model,
 };
@@ -529,6 +530,7 @@ async fn responses_inner(
             .record_priority_filtered(PriorityFilterOutcome::WorkerExcluded);
     }
     let workers = eligible.workers;
+    enforce_external_queue_admission(&ctx, &model_str, &workers)?;
 
     // Produce routing-only tokens for stateless /v1/responses generation
     // requests. The worker still receives the original native Responses body;

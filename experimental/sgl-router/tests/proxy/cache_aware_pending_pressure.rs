@@ -11,10 +11,13 @@
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use axum::response::Response;
+use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use sgl_router::config::{
-    ActiveLoadConfig, CacheAwareConfig, Config, DiscoveryBackend, ModelConfig, ObservabilityConfig,
-    PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
+    ActiveLoadConfig, CacheAwareConfig, Config, DiscoveryBackend, ExternalQueueAdmissionConfig,
+    ModelConfig, ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig,
+    StaticUrlsDiscoveryConfig,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::factory::build_registry;
@@ -88,27 +91,24 @@ fn build_ctx(urls: [&str; 2]) -> Arc<AppContext> {
 }
 
 fn build_ctx_with_config(urls: [&str; 2], cfg: Config) -> Arc<AppContext> {
+    let specs = urls
+        .iter()
+        .enumerate()
+        .map(|(idx, url)| (worker_spec(&format!("w{idx}"), url, None), 0))
+        .collect();
+    build_ctx_with_specs(cfg, specs)
+}
+
+fn build_ctx_with_specs(cfg: Config, specs: Vec<(WorkerSpec, i64)>) -> Arc<AppContext> {
     let tokenizers = Arc::new(TokenizerRegistry::default());
     let registry = Arc::new(WorkerRegistry::default());
-    for (idx, url) in urls.iter().enumerate() {
-        let id = WorkerId(format!("w{idx}"));
-        registry
-            .add(WorkerSpec {
-                id: id.clone(),
-                url: (*url).to_string(),
-                mode: WorkerMode::Plain,
-                model_ids: vec![ModelId(MODEL.into())],
-                bootstrap_port: None,
-                min_priority: None,
-                bearer_token: None,
-                backend: Default::default(),
-                tier: Default::default(),
-            })
-            .unwrap();
+    for (spec, reported_load) in specs {
+        let id = spec.id.clone();
+        registry.add(spec).unwrap();
         registry
             .get(&id)
             .expect("worker was registered")
-            .set_reported_load(0);
+            .set_reported_load(reported_load);
     }
 
     let policies = Arc::new(
@@ -124,14 +124,32 @@ fn build_ctx_with_config(urls: [&str; 2], cfg: Config) -> Arc<AppContext> {
     Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies))
 }
 
-async fn send(app: axum::Router, body: Value) -> StatusCode {
+fn worker_spec(id: &str, url: &str, min_priority: Option<i64>) -> WorkerSpec {
+    WorkerSpec {
+        id: WorkerId(id.into()),
+        url: url.to_string(),
+        mode: WorkerMode::Plain,
+        model_ids: vec![ModelId(MODEL.into())],
+        bootstrap_port: None,
+        min_priority,
+        bearer_token: None,
+        backend: Default::default(),
+        tier: Default::default(),
+    }
+}
+
+async fn send_response(app: axum::Router, body: Value) -> Response {
     let req = Request::builder()
         .method("POST")
         .uri("/v1/chat/completions")
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap();
-    app.oneshot(req).await.unwrap().status()
+    app.oneshot(req).await.unwrap()
+}
+
+async fn send(app: axum::Router, body: Value) -> StatusCode {
+    send_response(app, body).await.status()
 }
 
 async fn send_after(app: axum::Router, body: Value, delay: Duration) -> StatusCode {
@@ -191,5 +209,49 @@ async fn ttft_first_burst_uses_token_weighted_local_pending_pressure() {
     assert!(
         captured(&a) && captured(&b),
         "TTFT-first routing should see the long prompt's token-weighted local pending pressure and spill the next request",
+    );
+}
+
+#[tokio::test]
+async fn external_queue_admission_rejects_before_dispatch_using_priority_eligible_workers() {
+    let eligible = MockWorker::start(Vec::new()).await;
+    let reserved = MockWorker::start(Vec::new()).await;
+    let mut cfg = config();
+    cfg.proxy.external_queue_admission = ExternalQueueAdmissionConfig {
+        enabled: true,
+        queue_threshold: Some(0),
+    };
+    let ctx = build_ctx_with_specs(
+        cfg,
+        vec![
+            (worker_spec("eligible", &eligible.url, None), 1),
+            (worker_spec("reserved", &reserved.url, Some(100)), 0),
+        ],
+    );
+    let app = build_router(ctx);
+
+    let res = send_response(
+        app,
+        json!({
+            "model": MODEL,
+            "messages": [{"role": "user", "content": "low priority external request"}],
+        }),
+    )
+    .await;
+
+    assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        res.headers()
+            .get("x-router-error-code")
+            .and_then(|v| v.to_str().ok()),
+        Some("external_queue_overloaded"),
+    );
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"]["type"], "rate_limit_error");
+    assert_eq!(body["error"]["code"], "external_queue_overloaded");
+    assert!(
+        !captured(&eligible) && !captured(&reserved),
+        "admission rejection must happen before dispatch; ineligible low-load worker must not mask eligible overload",
     );
 }

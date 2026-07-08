@@ -14,6 +14,7 @@ use crate::policies::{request_tokens_for, RequestTokens};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{PriorityFilterOutcome, RequestOutcome, WorkerModeLabel};
+use crate::server::routes::admission::enforce_external_queue_admission;
 use crate::server::routes::alias_fallback::{
     fallback_reason_for_error, fallback_reason_for_response, forward_to_fallback, rewrite_model,
 };
@@ -193,6 +194,7 @@ async fn passthrough_primary(
             .record_priority_filtered(PriorityFilterOutcome::WorkerExcluded);
     }
     let workers = eligible.workers;
+    enforce_external_queue_admission(&ctx, &model_str, &workers)?;
 
     // /v1/completions has an explicit raw `prompt`; feed those tokens to
     // cache-aware routing without changing the worker-facing passthrough body.

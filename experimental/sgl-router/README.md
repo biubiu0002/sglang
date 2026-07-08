@@ -50,6 +50,27 @@ Omit `--service-discovery-namespace` to watch all namespaces (requires
 cluster-wide RBAC). For prefill/decode disaggregation, replace `--selector`
 with `--prefill-selector` and `--decode-selector`.
 
+## External Queue Admission
+
+External routers can opt in to fail-fast overload protection:
+
+```bash
+sgl-router \
+  --external-queue-admission-enabled \
+  --external-queue-admission-threshold 8 \
+  ...
+```
+
+When enabled, generation requests are rejected with HTTP 429
+`external_queue_overloaded` before policy selection only if every healthy,
+priority-eligible worker has effective load greater than the threshold.
+Equal-to-threshold is admitted. With load polling enabled, effective load uses
+reported worker queue depth plus router-local pending reservations; otherwise
+it uses router-local pending reservations only.
+
+The feature is disabled by default. Enabling it on live ACA/APIM deployments
+requires a separate rollout approval and configuration change.
+
 ## License
 
 Apache-2.0.

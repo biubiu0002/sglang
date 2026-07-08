@@ -34,6 +34,7 @@
 //! | `sgl_router_sticky_total` | Counter | `outcome` |
 //! | `sgl_router_ingress_tokenize_errors_total` | Counter | `model_id` |
 //! | `sgl_router_priority_filtered_total` | Counter | `reason` |
+//! | `sgl_router_external_queue_admission_total` | Counter | `outcome` |
 //! | `sgl_router_alias_route_total` | Counter | `alias_model_id`, `route`, `reason` |
 //! | `sgl_router_remote_cache_state_query_total` | Counter | `outcome` |
 //! | `sgl_router_remote_cache_state_feed_total` | Counter | `outcome` |
@@ -177,6 +178,22 @@ impl PriorityFilterOutcome {
     }
 }
 
+/// External queue admission decision outcome.
+#[derive(Debug, Clone, Copy)]
+pub enum ExternalQueueAdmissionOutcome {
+    Admitted,
+    Rejected,
+}
+
+impl ExternalQueueAdmissionOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Admitted => "admitted",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
 /// Sticky-policy selection outcome — see `StickyPolicy::select` for the
 /// four branches.
 #[derive(Debug, Clone, Copy)]
@@ -311,6 +328,7 @@ pub struct MetricsRegistry {
     sticky_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     ingress_tokenize_errors_total: Mutex<HashMap<String, Arc<AtomicU64>>>,
     priority_filtered_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
+    external_queue_admission_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     alias_route_total: Mutex<HashMap<AliasRouteKey, Arc<AtomicU64>>>,
     remote_cache_state_query_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     remote_cache_state_feed_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
@@ -617,6 +635,17 @@ impl MetricsRegistry {
     /// eligible (e.g. B200) capacity is under-provisioned or unhealthy.
     pub fn record_priority_filtered(&self, outcome: PriorityFilterOutcome) {
         let mut guard = self.priority_filtered_total.lock();
+        let counter = guard
+            .entry(outcome.as_str())
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump `sgl_router_external_queue_admission_total{outcome}`.
+    pub fn record_external_queue_admission(&self, outcome: ExternalQueueAdmissionOutcome) {
+        let mut guard = self.external_queue_admission_total.lock();
         let counter = guard
             .entry(outcome.as_str())
             .or_insert_with(|| Arc::new(AtomicU64::new(0)))
@@ -1014,6 +1043,25 @@ impl MetricsRegistry {
         }
         drop(guard);
 
+        // external_queue_admission_total
+        out.push_str(
+            "# HELP sgl_router_external_queue_admission_total External queue admission decisions (admitted = at least one eligible worker within threshold; rejected = every eligible worker above threshold and request returned 429).\n",
+        );
+        out.push_str("# TYPE sgl_router_external_queue_admission_total counter\n");
+        let guard = self.external_queue_admission_total.lock();
+        let mut entries: Vec<(&&str, u64)> = guard
+            .iter()
+            .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by_key(|e| *e.0);
+        for (outcome, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_external_queue_admission_total{{outcome=\"{}\"}} {}\n",
+                outcome, value,
+            ));
+        }
+        drop(guard);
+
         // alias_route_total
         out.push_str(
             "# HELP sgl_router_alias_route_total Explicit model-alias routing decisions.\n",
@@ -1165,6 +1213,7 @@ mod tests {
         assert!(out.contains("# TYPE sgl_router_sticky_total counter"));
         assert!(out.contains("# TYPE sgl_router_ingress_tokenize_errors_total counter"));
         assert!(out.contains("# TYPE sgl_router_priority_filtered_total counter"));
+        assert!(out.contains("# TYPE sgl_router_external_queue_admission_total counter"));
         assert!(out.contains("# TYPE sgl_router_remote_cache_state_query_total counter"));
         assert!(out.contains("# TYPE sgl_router_remote_cache_state_feed_total counter"));
         assert!(out.contains("# TYPE sgl_router_sse_client_disconnects_total counter"));
@@ -1217,6 +1266,23 @@ mod tests {
         );
         assert!(
             out.contains(r#"sgl_router_priority_filtered_total{reason="empty_set_rejected"} 1"#),
+            "got:\n{out}",
+        );
+    }
+
+    #[test]
+    fn external_queue_admission_counts_both_outcomes_separately() {
+        let reg = MetricsRegistry::new();
+        reg.record_external_queue_admission(ExternalQueueAdmissionOutcome::Admitted);
+        reg.record_external_queue_admission(ExternalQueueAdmissionOutcome::Rejected);
+        reg.record_external_queue_admission(ExternalQueueAdmissionOutcome::Rejected);
+        let out = reg.render();
+        assert!(
+            out.contains(r#"sgl_router_external_queue_admission_total{outcome="admitted"} 1"#),
+            "got:\n{out}",
+        );
+        assert!(
+            out.contains(r#"sgl_router_external_queue_admission_total{outcome="rejected"} 2"#),
             "got:\n{out}",
         );
     }

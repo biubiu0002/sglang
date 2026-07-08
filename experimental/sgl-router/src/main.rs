@@ -175,6 +175,66 @@ fn push_worker_urls_env(args: &mut Vec<OsString>) {
     args.extend(value.split_whitespace().map(OsString::from));
 }
 
+async fn push_worker_registry_env(args: &mut Vec<OsString>) -> Result<()> {
+    if non_empty_env("WORKER_URLS").is_some() {
+        return Ok(());
+    }
+    let source = worker_registry_source_from_env()?;
+    if !source.is_configured() {
+        return Ok(());
+    }
+    let Some(pool) = non_empty_env("WORKER_REGISTRY_POOL") else {
+        anyhow::bail!(
+            "WORKER_REGISTRY_POOL is required when a worker registry source is configured"
+        );
+    };
+    let raw_json = source.load().await?;
+    let registry = sgl_router::app_config_registry::parse_registry(&raw_json)?;
+    let default_suffix = non_empty_env("WORKER_REGISTRY_URL_SUFFIX");
+    let worker_urls = sgl_router::app_config_registry::worker_urls_for_pool(
+        &registry,
+        &pool,
+        default_suffix.as_deref(),
+    )?;
+    tracing::info!(
+        pool = %pool,
+        worker_count = worker_urls.len(),
+        "loaded worker URLs from worker registry"
+    );
+    args.push(OsString::from("--worker-urls"));
+    args.extend(worker_urls.into_iter().map(OsString::from));
+    Ok(())
+}
+
+fn worker_registry_source_from_env() -> Result<sgl_router::app_config_registry::RegistrySource> {
+    let endpoint = non_empty_env("WORKER_REGISTRY_APP_CONFIG_ENDPOINT")
+        .or_else(|| non_empty_env("APP_CONFIG_ENDPOINT"));
+    let key =
+        non_empty_env("WORKER_REGISTRY_APP_CONFIG_KEY").or_else(|| non_empty_env("APP_CONFIG_KEY"));
+    let app_config = match (endpoint, key) {
+        (Some(endpoint), Some(key)) => Some(sgl_router::app_config_registry::AppConfigSource {
+            endpoint,
+            key,
+            label: non_empty_env("WORKER_REGISTRY_APP_CONFIG_LABEL")
+                .or_else(|| non_empty_env("APP_CONFIG_LABEL")),
+            managed_identity_client_id: non_empty_env(
+                "WORKER_REGISTRY_APP_CONFIG_MANAGED_IDENTITY_CLIENT_ID",
+            )
+            .or_else(|| non_empty_env("AZURE_CLIENT_ID")),
+            timeout_secs: env_u64("WORKER_REGISTRY_APP_CONFIG_TIMEOUT_SECS")?.unwrap_or(5),
+        }),
+        (None, None) => None,
+        _ => anyhow::bail!(
+            "WORKER_REGISTRY_APP_CONFIG_ENDPOINT and WORKER_REGISTRY_APP_CONFIG_KEY must be set together"
+        ),
+    };
+    Ok(sgl_router::app_config_registry::RegistrySource {
+        inline_json: non_empty_env("WORKER_REGISTRY_JSON"),
+        file: non_empty_env("WORKER_REGISTRY_FILE"),
+        app_config,
+    })
+}
+
 fn non_empty_env(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
@@ -188,21 +248,23 @@ fn is_truthy(value: &str) -> bool {
     )
 }
 
-fn cli_from_args_or_env() -> Cli {
+async fn cli_from_args_or_env() -> Result<Cli> {
     if std::env::args_os().len() > 1 {
-        Cli::parse()
+        Ok(Cli::parse())
     } else {
-        Cli::parse_from(env_to_cli_args())
+        let mut args = env_to_cli_args();
+        push_worker_registry_env(&mut args).await?;
+        Ok(Cli::parse_from(args))
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = cli_from_args_or_env();
     // Bootstrap subscriber so a config-resolution error has structured
     // output. The configured-format subscriber installs after this and
     // becomes a no-op via try_init's idempotency.
     install_bootstrap_subscriber();
+    let cli = cli_from_args_or_env().await?;
     let cfg = cli
         .into_config()
         .context("resolve configuration from CLI flags")?;

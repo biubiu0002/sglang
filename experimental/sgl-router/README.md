@@ -34,6 +34,34 @@ sgl-router \
   --worker-urls http://10.0.0.1:30000 http://10.0.0.2:30000
 ```
 
+ACA-style environment variables are also supported when the process starts
+without CLI flags. `WORKER_URLS` has priority. If it is unset, the router can
+load the static worker list from a macaron worker registry at startup:
+
+```bash
+MODEL_ID=zai-org/GLM-5.2-FP8 \
+WORKER_REGISTRY_POOL=glm52-main \
+WORKER_REGISTRY_APP_CONFIG_ENDPOINT=https://macaron-llm-deploy-prod.azconfig.io \
+WORKER_REGISTRY_APP_CONFIG_KEY=macaron/prod/worker-registry/glm52/current \
+WORKER_REGISTRY_APP_CONFIG_LABEL=prod \
+sgl-router
+```
+
+Registry source options are mutually exclusive:
+
+- `WORKER_REGISTRY_JSON`: inline registry JSON.
+- `WORKER_REGISTRY_FILE`: local registry JSON file.
+- `WORKER_REGISTRY_APP_CONFIG_ENDPOINT` + `WORKER_REGISTRY_APP_CONFIG_KEY`
+  with optional `WORKER_REGISTRY_APP_CONFIG_LABEL`.
+
+The App Configuration path authenticates with Azure managed identity. Set
+`WORKER_REGISTRY_APP_CONFIG_MANAGED_IDENTITY_CLIENT_ID` when a user-assigned
+identity should be used. `WORKER_REGISTRY_URL_SUFFIX` may append a common
+static-discovery suffix such as `@tier=shared`; per-worker
+`pool_url_suffixes` in the registry take precedence. This is startup discovery,
+not hot reload: changing the registry requires a new revision/restart unless a
+future runtime polling path is enabled.
+
 Kubernetes EndpointSlice discovery:
 
 ```bash

@@ -47,6 +47,9 @@ RUN mkdir -p src && echo "fn main() {}" > src/main.rs \
 
 ######################## STAGE 2 — builder ##############################
 FROM rust:${RUST_VERSION}-${DEBIAN_VERSION} AS builder
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends cmake \
+    && rm -rf /var/lib/apt/lists/*
 RUN cargo install cargo-chef --locked --version ^0.1
 WORKDIR /work
 

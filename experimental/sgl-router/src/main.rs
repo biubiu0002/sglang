@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use sgl_router::config::{Cli, LogFormat, RuntimeMode};
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::signal::unix::{signal, Signal, SignalKind};
@@ -99,9 +100,96 @@ fn kv_event_endpoint_overrides_from_env(
     }
 }
 
+fn env_to_cli_args() -> Vec<OsString> {
+    let mut args = vec![std::env::args_os()
+        .next()
+        .unwrap_or_else(|| OsString::from("sgl-router"))];
+    push_env_arg(&mut args, "MODEL_ID", "--model-id");
+    push_env_arg(&mut args, "POLICY", "--policy");
+    push_env_arg(&mut args, "REQUEST_TIMEOUT_SECS", "--request-timeout-secs");
+    push_env_arg(
+        &mut args,
+        "STALE_REQUEST_TIMEOUT_SECS",
+        "--stale-request-timeout-secs",
+    );
+    push_env_arg(
+        &mut args,
+        "WORKER_INTROSPECT_KEY",
+        "--worker-introspect-key",
+    );
+    push_env_arg(
+        &mut args,
+        "LOAD_POLL_INTERVAL_SECS",
+        "--load-poll-interval-secs",
+    );
+    push_env_arg(&mut args, "CACHE_TREE_SOURCE", "--cache-tree-source");
+    push_env_arg(&mut args, "CACHE_TREE_PAGE_SIZE", "--cache-tree-page-size");
+    push_env_flag(&mut args, "CACHE_TREE_BIGRAM", "--cache-tree-bigram");
+    push_env_arg(&mut args, "CACHE_TREE_MAX_NODES", "--cache-tree-max-nodes");
+    push_env_arg(&mut args, "HIT_LOAD_ABS", "--hit-load-abs-threshold");
+    push_env_arg(&mut args, "HIT_LOAD_REL", "--hit-load-rel-threshold");
+    push_env_arg(&mut args, "CACHE_STATE_URL", "--cache-state-url");
+    push_env_arg(
+        &mut args,
+        "CACHE_STATE_TIMEOUT_MS",
+        "--cache-state-timeout-ms",
+    );
+    push_env_arg(&mut args, "TTFT_TOKEN_SCALE", "--ttft-token-scale");
+    push_env_arg(
+        &mut args,
+        "TTFT_CACHE_SCORE_MARGIN",
+        "--ttft-cache-score-margin",
+    );
+    push_env_flag(&mut args, "TTFT_FIRST_ROUTING", "--ttft-first-routing");
+    push_worker_urls_env(&mut args);
+    args
+}
+
+fn push_env_arg(args: &mut Vec<OsString>, env_name: &str, flag: &str) {
+    if let Some(value) = non_empty_env(env_name) {
+        args.push(OsString::from(flag));
+        args.push(OsString::from(value));
+    }
+}
+
+fn push_env_flag(args: &mut Vec<OsString>, env_name: &str, flag: &str) {
+    if non_empty_env(env_name).is_some_and(|value| is_truthy(&value)) {
+        args.push(OsString::from(flag));
+    }
+}
+
+fn push_worker_urls_env(args: &mut Vec<OsString>) {
+    let Some(value) = non_empty_env("WORKER_URLS") else {
+        return;
+    };
+    args.push(OsString::from("--worker-urls"));
+    args.extend(value.split_whitespace().map(OsString::from));
+}
+
+fn non_empty_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn is_truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn cli_from_args_or_env() -> Cli {
+    if std::env::args_os().len() > 1 {
+        Cli::parse()
+    } else {
+        Cli::parse_from(env_to_cli_args())
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = cli_from_args_or_env();
     // Bootstrap subscriber so a config-resolution error has structured
     // output. The configured-format subscriber installs after this and
     // becomes a no-op via try_init's idempotency.

@@ -155,6 +155,7 @@ pub async fn chat_completions(
 ) -> Result<Response<Body>, ApiError> {
     let body = apply_request_priority_override(&ctx.config.priority_override, &headers, body)?;
     let body = normalize_chat_thinking_blocks(body)?;
+    let body = normalize_chat_tool_message_object_content(body)?;
     let probe = parse_probe(&body)?;
     let model_str = probe
         .model
@@ -1037,6 +1038,59 @@ fn normalize_chat_thinking_blocks(body: Bytes) -> Result<Bytes, ApiError> {
     })
 }
 
+/// Accept object-valued `content` only for OpenAI chat `role="tool"` messages.
+///
+/// SGLang worker validation accepts tool message content as a string. Some
+/// upstream clients send the tool result as a structured JSON object instead.
+/// Match the worker-side compatibility patch by JSON-compacting that object at
+/// the router edge, while leaving non-tool object content to fail validation.
+fn normalize_chat_tool_message_object_content(body: Bytes) -> Result<Bytes, ApiError> {
+    if !body.windows(b"tool".len()).any(|window| window == b"tool") {
+        return Ok(body);
+    }
+
+    let mut value: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
+        tracing::debug!(error = %e, "chat-completions tool-content-normalize parse failed");
+        ApiError::BadRequest("invalid request: body must be a JSON object".to_string())
+    })?;
+    let Some(messages) = value.get_mut("messages").and_then(|v| v.as_array_mut()) else {
+        return Ok(body);
+    };
+
+    let mut changed = false;
+    for message in messages {
+        if message.get("role").and_then(|v| v.as_str()) != Some("tool") {
+            continue;
+        }
+        let Some(obj) = message.as_object_mut() else {
+            continue;
+        };
+        let Some(content) = obj.get_mut("content") else {
+            continue;
+        };
+        if !content.is_object() {
+            continue;
+        }
+
+        let compacted = serde_json::to_string(content).map_err(|e| {
+            ApiError::Internal(
+                anyhow::Error::new(e).context("serialize normalized tool message content"),
+            )
+        })?;
+        *content = serde_json::Value::String(compacted);
+        changed = true;
+    }
+
+    if !changed {
+        return Ok(body);
+    }
+    serde_json::to_vec(&value).map(Bytes::from).map_err(|e| {
+        ApiError::Internal(
+            anyhow::Error::new(e).context("re-serialize normalized chat request body"),
+        )
+    })
+}
+
 /// Whether the router's `input_ids` may be forwarded for this request.
 ///
 /// We forward only when the engine, fed `input_ids`, would have produced the
@@ -1446,6 +1500,43 @@ mod tests {
             br#"{"model":"x","messages":[{"role":"user","content":[{"type":"thinking","thinking":"not accepted here"}]}]}"#,
         );
         let out = normalize_chat_thinking_blocks(body.clone()).unwrap();
+
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn normalize_chat_tool_message_object_content_compacts_tool_content() {
+        let body = Bytes::from_static(
+            br#"{"model":"x","messages":[{"role":"tool","tool_call_id":"call_1","content":{"status":"ok","items":[1,2],"nested":{"a":true}}}]}"#,
+        );
+
+        let out = normalize_chat_tool_message_object_content(body).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let content = parsed["messages"][0]["content"].as_str().unwrap();
+
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(content).unwrap(),
+            serde_json::json!({"status":"ok","items":[1,2],"nested":{"a":true}})
+        );
+        assert!(!content.contains(' '));
+    }
+
+    #[test]
+    fn normalize_chat_tool_message_object_content_leaves_string_and_array() {
+        let body = Bytes::from_static(
+            br#"{"model":"x","messages":[{"role":"tool","content":"already string"},{"role":"tool","content":[{"type":"text","text":"kept"}]}]}"#,
+        );
+        let out = normalize_chat_tool_message_object_content(body.clone()).unwrap();
+
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn normalize_chat_tool_message_object_content_leaves_non_tool_object_unchanged() {
+        let body = Bytes::from_static(
+            br#"{"model":"x","messages":[{"role":"user","content":{"not":"accepted here"}},{"role":"assistant","content":{"not":"accepted here"}}]}"#,
+        );
+        let out = normalize_chat_tool_message_object_content(body.clone()).unwrap();
 
         assert_eq!(out, body);
     }

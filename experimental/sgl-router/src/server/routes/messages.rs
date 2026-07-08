@@ -26,6 +26,7 @@ use crate::server::routes::alias_fallback::{
 };
 use crate::server::routes::chat::{make_client_disconnect_hook, reserve_pending_load};
 use crate::server::routes::priority_override::apply_request_priority_override;
+use crate::server::routes::tool_schema::normalize_tool_schema;
 use crate::server::trace::TraceContext;
 use crate::workers::LoadGuard;
 use axum::body::Body;
@@ -162,7 +163,8 @@ fn anthropic_tools_for_chat(value: &Value) -> Option<Option<Value>> {
             continue;
         }
         let name = obj.get("name").and_then(|n| n.as_str())?;
-        let parameters = obj.get("input_schema")?.clone();
+        let mut parameters = obj.get("input_schema")?.clone();
+        normalize_tool_schema(&mut parameters);
         let mut out = Map::new();
         out.insert("type".to_string(), Value::String("function".to_string()));
         if let Some(v) = obj.get("defer_loading") {
@@ -891,6 +893,35 @@ mod tests {
                 }]
             })
         );
+    }
+
+    #[test]
+    fn routing_value_normalizes_anthropic_tool_required_null() {
+        let b = Bytes::from(
+            r#"{
+                "model":"claude-3",
+                "tools":[{
+                    "name":"lookup",
+                    "description":"Look up data",
+                    "input_schema":{
+                        "type":"object",
+                        "required":null,
+                        "properties":{
+                            "filters":{"type":"object","required":null}
+                        }
+                    }
+                }],
+                "messages":[{"role":"user","content":"find x"}]
+            }"#,
+        );
+
+        let routed = anthropic_routing_value(&b).expect("routing value");
+        let parameters = &routed["tools"][0]["function"]["parameters"];
+
+        assert!(parameters.get("required").is_none());
+        assert!(parameters["properties"]["filters"]
+            .get("required")
+            .is_none());
     }
 
     #[test]

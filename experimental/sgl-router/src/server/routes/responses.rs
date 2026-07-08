@@ -32,6 +32,7 @@ use crate::server::routes::alias_fallback::{
 };
 use crate::server::routes::chat::{make_client_disconnect_hook, reserve_pending_load};
 use crate::server::routes::priority_override::apply_request_priority_override;
+use crate::server::routes::tool_schema::normalize_tool_schema;
 use crate::server::trace::TraceContext;
 use crate::workers::LoadGuard;
 use axum::body::Body;
@@ -294,12 +295,14 @@ fn response_tools_for_chat(value: &Value) -> Option<Option<Value>> {
         if obj.get("type").and_then(|t| t.as_str()) != Some("function") {
             continue;
         }
+        let mut parameters = obj.get("parameters").cloned().unwrap_or(Value::Null);
+        normalize_tool_schema(&mut parameters);
         chat_tools.push(serde_json::json!({
             "type": "function",
             "function": {
                 "name": obj.get("name").cloned().unwrap_or(Value::Null),
                 "description": obj.get("description").cloned().unwrap_or(Value::Null),
-                "parameters": obj.get("parameters").cloned().unwrap_or(Value::Null),
+                "parameters": parameters,
                 "strict": obj.get("strict").cloned().unwrap_or(Value::Null),
             },
         }));
@@ -797,6 +800,36 @@ mod tests {
                 }]
             })
         );
+    }
+
+    #[test]
+    fn routing_value_normalizes_response_tool_required_null() {
+        let b = Bytes::from(
+            r#"{
+                "model":"gpt",
+                "tools":[{
+                    "type":"function",
+                    "name":"lookup",
+                    "description":"Look up",
+                    "parameters":{
+                        "type":"object",
+                        "required":null,
+                        "properties":{
+                            "filters":{"type":"object","required":null}
+                        }
+                    }
+                }],
+                "input":"hello"
+            }"#,
+        );
+
+        let routed = responses_routing_value(&b).expect("routing value");
+        let parameters = &routed["tools"][0]["function"]["parameters"];
+
+        assert!(parameters.get("required").is_none());
+        assert!(parameters["properties"]["filters"]
+            .get("required")
+            .is_none());
     }
 
     #[test]

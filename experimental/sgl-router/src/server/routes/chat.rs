@@ -16,6 +16,7 @@ use crate::server::routes::alias_fallback::{
     fallback_reason_for_error, fallback_reason_for_response, forward_to_fallback, rewrite_model,
 };
 use crate::server::routes::priority_override::apply_request_priority_override;
+use crate::server::routes::tool_schema::normalize_chat_tool_schemas;
 use crate::server::trace::TraceContext;
 use crate::workers::{LoadGuard, Worker};
 use axum::body::Body;
@@ -157,6 +158,7 @@ pub async fn chat_completions(
     let body = apply_request_priority_override(&ctx.config.priority_override, &headers, body)?;
     let body = normalize_chat_thinking_blocks(body)?;
     let body = normalize_chat_tool_message_object_content(body)?;
+    let body = normalize_chat_tool_schema_required_nulls(body)?;
     let probe = parse_probe(&body)?;
     let model_str = probe
         .model
@@ -1093,6 +1095,33 @@ fn normalize_chat_tool_message_object_content(body: Bytes) -> Result<Bytes, ApiE
     })
 }
 
+/// Accept `required: null` emitted by some upstream tool-schema generators.
+///
+/// This is intentionally narrow: `required: null` means "no required
+/// properties" in those generators, so dropping it preserves optional-property
+/// semantics. Other malformed schema fields are left untouched for SGLang's
+/// worker-side JSON Schema validator to reject clearly.
+fn normalize_chat_tool_schema_required_nulls(body: Bytes) -> Result<Bytes, ApiError> {
+    if !body.windows(b"required".len()).any(|w| w == b"required")
+        || !body.windows(b"tools".len()).any(|w| w == b"tools")
+    {
+        return Ok(body);
+    }
+
+    let mut value: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
+        tracing::debug!(error = %e, "chat-completions tool-schema normalize parse failed");
+        ApiError::BadRequest("invalid request: body must be a JSON object".to_string())
+    })?;
+    let before = value.clone();
+    normalize_chat_tool_schemas(&mut value);
+    if value == before {
+        return Ok(body);
+    }
+    serde_json::to_vec(&value).map(Bytes::from).map_err(|e| {
+        ApiError::Internal(anyhow::Error::new(e).context("re-serialize normalized tool schemas"))
+    })
+}
+
 /// Whether the router's `input_ids` may be forwarded for this request.
 ///
 /// We forward only when the engine, fed `input_ids`, would have produced the
@@ -1541,6 +1570,68 @@ mod tests {
         let out = normalize_chat_tool_message_object_content(body.clone()).unwrap();
 
         assert_eq!(out, body);
+    }
+
+    #[test]
+    fn normalize_chat_tool_schema_required_nulls_drops_nested_required_null() {
+        let body = Bytes::from_static(
+            br#"{
+                "model":"x",
+                "messages":[{"role":"user","content":"hi"}],
+                "tools":[{
+                    "type":"function",
+                    "function":{
+                        "name":"lookup",
+                        "parameters":{
+                            "type":"object",
+                            "required":null,
+                            "properties":{
+                                "filters":{
+                                    "type":"object",
+                                    "required":null,
+                                    "properties":{"tag":{"type":"string"}}
+                                }
+                            }
+                        }
+                    }
+                }]
+            }"#,
+        );
+
+        let out = normalize_chat_tool_schema_required_nulls(body).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let parameters = &parsed["tools"][0]["function"]["parameters"];
+
+        assert!(parameters.get("required").is_none());
+        assert!(parameters["properties"]["filters"]
+            .get("required")
+            .is_none());
+        assert_eq!(parameters["type"], "object");
+    }
+
+    #[test]
+    fn normalize_chat_tool_schema_required_nulls_preserves_invalid_required_type() {
+        let body = Bytes::from_static(
+            br#"{
+                "model":"x",
+                "messages":[{"role":"user","content":"hi"}],
+                "tools":[{
+                    "type":"function",
+                    "function":{
+                        "name":"lookup",
+                        "parameters":{"type":"object","required":"query"}
+                    }
+                }]
+            }"#,
+        );
+
+        let out = normalize_chat_tool_schema_required_nulls(body).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+
+        assert_eq!(
+            parsed["tools"][0]["function"]["parameters"]["required"],
+            "query"
+        );
     }
 
     /// A chat request on a chat-encoder model that yields engine-equivalent

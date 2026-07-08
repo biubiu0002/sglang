@@ -9,6 +9,8 @@ use url::Url;
 
 const APP_CONFIG_SCOPE_RESOURCE: &str = "https://azconfig.io";
 const MANAGED_IDENTITY_TOKEN_URL: &str = "http://169.254.169.254/metadata/identity/oauth2/token";
+const ACA_MANAGED_IDENTITY_API_VERSION: &str = "2019-08-01";
+const IMDS_MANAGED_IDENTITY_API_VERSION: &str = "2018-02-01";
 
 #[derive(Clone, Debug, Default)]
 pub struct RegistrySource {
@@ -52,6 +54,12 @@ struct ManagedIdentityToken {
 #[derive(Debug, Deserialize)]
 struct AppConfigKeyValue {
     value: String,
+}
+
+#[derive(Debug)]
+struct ManagedIdentityRequest {
+    url: Url,
+    headers: Vec<(&'static str, String)>,
 }
 
 fn default_enabled() -> bool {
@@ -193,18 +201,12 @@ async fn fetch_managed_identity_token(
     client: &reqwest::Client,
     client_id: Option<&str>,
 ) -> Result<String> {
-    let mut url = Url::parse(MANAGED_IDENTITY_TOKEN_URL).expect("valid IMDS token URL");
-    {
-        let mut query = url.query_pairs_mut();
-        query.append_pair("api-version", "2018-02-01");
-        query.append_pair("resource", APP_CONFIG_SCOPE_RESOURCE);
-        if let Some(client_id) = client_id.filter(|value| !value.trim().is_empty()) {
-            query.append_pair("client_id", client_id);
-        }
+    let token_request = managed_identity_token_request(client_id)?;
+    let mut request = client.get(token_request.url);
+    for (name, value) in token_request.headers {
+        request = request.header(name, value);
     }
-    let token = client
-        .get(url)
-        .header("Metadata", "true")
+    let token = request
         .send()
         .await
         .context("fetch managed identity token for Azure App Configuration")?
@@ -219,9 +221,54 @@ async fn fetch_managed_identity_token(
     Ok(token.access_token)
 }
 
+fn managed_identity_token_request(client_id: Option<&str>) -> Result<ManagedIdentityRequest> {
+    let mut headers = Vec::new();
+    let mut url = if let Some(endpoint) = std::env::var("IDENTITY_ENDPOINT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        let header = std::env::var("IDENTITY_HEADER")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .context("IDENTITY_HEADER is required when IDENTITY_ENDPOINT is set")?;
+        headers.push(("X-IDENTITY-HEADER", header));
+        Url::parse(&endpoint).context("parse IDENTITY_ENDPOINT managed identity URL")?
+    } else {
+        headers.push(("Metadata", "true".to_string()));
+        Url::parse(MANAGED_IDENTITY_TOKEN_URL).expect("valid IMDS token URL")
+    };
+    {
+        let mut query = url.query_pairs_mut();
+        query.append_pair(
+            "api-version",
+            if headers.iter().any(|(name, _)| *name == "X-IDENTITY-HEADER") {
+                ACA_MANAGED_IDENTITY_API_VERSION
+            } else {
+                IMDS_MANAGED_IDENTITY_API_VERSION
+            },
+        );
+        query.append_pair("resource", APP_CONFIG_SCOPE_RESOURCE);
+        if let Some(client_id) = client_id.filter(|value| !value.trim().is_empty()) {
+            query.append_pair("client_id", client_id);
+        }
+    }
+    for (name, value) in &headers {
+        if value.trim().is_empty() {
+            return Err(anyhow!("managed identity header {name} is empty"));
+        }
+    }
+    Ok(ManagedIdentityRequest { url, headers })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     fn sample_registry() -> WorkerRegistry {
         parse_registry(
@@ -279,5 +326,35 @@ mod tests {
         assert!(rendered.contains("/kv/macaron%2Fprod%2Fworker-registry%2Fglm52%2Fcurrent"));
         assert!(rendered.contains("api-version=1.0"));
         assert!(rendered.contains("label=prod-candidate"));
+    }
+
+    #[test]
+    fn managed_identity_request_uses_aca_identity_endpoint_when_present() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::set_var("IDENTITY_ENDPOINT", "http://localhost:42356/msi/token");
+        std::env::set_var("IDENTITY_HEADER", "secret-header");
+        let req = managed_identity_token_request(Some("client-1")).unwrap();
+        let rendered = req.url.as_str();
+        assert!(rendered.starts_with("http://localhost:42356/msi/token?"));
+        assert!(rendered.contains("api-version=2019-08-01"));
+        assert!(rendered.contains("resource=https%3A%2F%2Fazconfig.io"));
+        assert!(rendered.contains("client_id=client-1"));
+        assert_eq!(
+            req.headers,
+            vec![("X-IDENTITY-HEADER", "secret-header".to_string())]
+        );
+        std::env::remove_var("IDENTITY_ENDPOINT");
+        std::env::remove_var("IDENTITY_HEADER");
+    }
+
+    #[test]
+    fn managed_identity_request_falls_back_to_imds() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::remove_var("IDENTITY_ENDPOINT");
+        std::env::remove_var("IDENTITY_HEADER");
+        let req = managed_identity_token_request(None).unwrap();
+        assert!(req.url.as_str().starts_with(MANAGED_IDENTITY_TOKEN_URL));
+        assert!(req.url.as_str().contains("api-version=2018-02-01"));
+        assert_eq!(req.headers, vec![("Metadata", "true".to_string())]);
     }
 }

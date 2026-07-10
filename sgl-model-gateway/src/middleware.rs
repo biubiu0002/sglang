@@ -280,6 +280,7 @@ impl<B> MakeSpan<B> for RequestSpan {
             uri = %request.uri(),
             version = ?request.version(),
             request_id = Empty,  // Will be set later
+            trace_id = Empty,    // Will be set later
             status_code = Empty,
             latency = Empty,
             error = Empty,
@@ -300,6 +301,13 @@ impl<B> OnRequest<B> for RequestLogger {
         // This will work if RequestIdLayer has already run
         if let Some(request_id) = request.extensions().get::<RequestId>() {
             span.record("request_id", request_id.0.as_str());
+        }
+
+        // Extract trace_id from X-Trace-Id header for cross-service log correlation
+        if let Some(trace_id) = request.headers().get("x-trace-id").and_then(|v| v.to_str().ok()) {
+            if !trace_id.is_empty() {
+                span.record("trace_id", trace_id);
+            }
         }
 
         let method = method_to_static_str(request.method().as_str());

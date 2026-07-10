@@ -210,6 +210,7 @@ pub fn should_forward_request_header(name: &str) -> bool {
     name.eq_ignore_ascii_case("authorization")
         || name.eq_ignore_ascii_case("x-request-id")
         || name.eq_ignore_ascii_case("x-correlation-id")
+        || name.eq_ignore_ascii_case("x-trace-id")
         || name.eq_ignore_ascii_case("traceparent")
         || name.eq_ignore_ascii_case("tracestate")
         || name.eq_ignore_ascii_case("x-smg-routing-key")
@@ -272,6 +273,8 @@ mod tests {
         assert!(should_forward_request_header("traceparent"));
         assert!(should_forward_request_header("Traceparent"));
         assert!(should_forward_request_header("tracestate"));
+        assert!(should_forward_request_header("x-trace-id"));
+        assert!(should_forward_request_header("X-Trace-Id"));
         assert!(should_forward_request_header("Tracestate"));
         assert!(should_forward_request_header("x-request-id-user"));
         assert!(should_forward_request_header("X-Request-ID-Span"));

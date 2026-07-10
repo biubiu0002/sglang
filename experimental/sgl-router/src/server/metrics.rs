@@ -26,6 +26,9 @@
 //! | `sgl_router_overlap_blocks` | Histogram | `model_id` |
 //! | `sgl_router_active_load` | Gauge | `worker_url`, `kind` |
 //! | `sgl_router_workers` | Gauge | `mode` |
+//! | `sgl_router_worker_pool_member` | Gauge | `worker_id`, `worker_url`, `mode` |
+//! | `sgl_router_worker_routable` | Gauge | `worker_id`, `worker_url`, `mode` |
+//! | `sgl_router_worker_working` | Gauge | `worker_id`, `worker_url`, `mode` |
 //! | `sgl_router_worker_health` | Gauge | `worker_url` |
 //! | `sgl_router_worker_cb_state` | Gauge | `worker_url` |
 //! | `sgl_router_worker_inflight_requests` | Gauge | `worker_url` |
@@ -40,7 +43,7 @@
 //! | `sgl_router_remote_cache_state_feed_total` | Counter | `outcome` |
 //! | `sgl_router_sse_client_disconnects_total` | Counter | `phase` |
 //!
-//! The four `sgl_router_worker*` gauges and `sgl_router_workers` are sampled
+//! The `sgl_router_worker*` gauges and `sgl_router_workers` are sampled
 //! at scrape time from the live [`crate::workers::WorkerRegistry`] (passed to
 //! [`MetricsRegistry::render_with_workers`]) rather than pushed — there is no
 //! health-check loop to push from, and pull-on-scrape means a removed worker
@@ -372,6 +375,7 @@ struct EdgeResponseKey {
 /// the live registry on every scrape — see [`MetricsRegistry::render_with_workers`].
 #[derive(Debug, Clone)]
 pub struct WorkerSnapshot {
+    pub worker_id: String,
     pub worker_url: String,
     /// `"plain"`, `"prefill"`, or `"decode"`.
     pub mode: &'static str,
@@ -381,12 +385,30 @@ pub struct WorkerSnapshot {
     pub cb_state: u8,
     /// In-flight request count for this worker (`Worker::active_load`).
     pub inflight: i64,
+    /// Router-local pending request reservations for this worker.
+    pub pending_requests: i64,
+    /// Router-local pending prompt-token reservations for this worker.
+    pub pending_tokens: i64,
+    /// Cross-replica pending request reservations for this worker, when the
+    /// router-state overlay is enabled.
+    pub global_pending_requests: i64,
+    /// Cross-replica pending prompt-token reservations for this worker, when
+    /// the router-state overlay is enabled.
+    pub global_pending_tokens: i64,
     /// Worker-reported real load (`Worker::reported_load`): summed
     /// `num_waiting_reqs` from `/get_load` when the load poller is enabled,
     /// or a sentinel (`-1` = unset/not polled, `-2` = last poll failed).
     /// Exposed so operators can verify the real-load signal that drives
     /// cache_aware_zmq's spill decisions.
     pub reported_load: i64,
+    /// Router can currently consider this worker for normal routing. This is
+    /// derived from the circuit-breaker admit decision and the load-poller
+    /// failure sentinel; it is intended as an operator-facing status bit, not
+    /// a replacement for the policy's full candidate filtering.
+    pub routable: bool,
+    /// Worker is actively doing or waiting on work according to the router's
+    /// local/global reservations or the worker-reported load signal.
+    pub working: bool,
 }
 
 #[derive(Debug, Hash, Eq, PartialEq, Clone)]
@@ -894,6 +916,50 @@ impl MetricsRegistry {
         // Sort the per-worker series by URL for stable output (tests + diffs).
         let mut sorted: Vec<&WorkerSnapshot> = workers.iter().collect();
         sorted.sort_by(|a, b| a.worker_url.cmp(&b.worker_url));
+
+        // worker_pool_member (registered workers with stable operator labels)
+        out.push_str(
+            "# HELP sgl_router_worker_pool_member Registered worker membership sampled from the router registry. Value is always 1 for present workers; absent workers stop emitting on the next scrape.\n",
+        );
+        out.push_str("# TYPE sgl_router_worker_pool_member gauge\n");
+        for w in &sorted {
+            out.push_str(&format!(
+                "sgl_router_worker_pool_member{{worker_id=\"{}\",worker_url=\"{}\",mode=\"{}\"}} 1\n",
+                escape_label(&w.worker_id),
+                escape_label(&w.worker_url),
+                w.mode,
+            ));
+        }
+
+        // worker_routable (operator-facing availability bit)
+        out.push_str(
+            "# HELP sgl_router_worker_routable Worker is currently available for normal routing: circuit breaker admits and /get_load has not most recently failed.\n",
+        );
+        out.push_str("# TYPE sgl_router_worker_routable gauge\n");
+        for w in &sorted {
+            out.push_str(&format!(
+                "sgl_router_worker_routable{{worker_id=\"{}\",worker_url=\"{}\",mode=\"{}\"}} {}\n",
+                escape_label(&w.worker_id),
+                escape_label(&w.worker_url),
+                w.mode,
+                u8::from(w.routable),
+            ));
+        }
+
+        // worker_working (operator-facing busy/idle bit)
+        out.push_str(
+            "# HELP sgl_router_worker_working Worker is currently doing or waiting on work according to router in-flight/pending reservations or positive worker-reported load.\n",
+        );
+        out.push_str("# TYPE sgl_router_worker_working gauge\n");
+        for w in &sorted {
+            out.push_str(&format!(
+                "sgl_router_worker_working{{worker_id=\"{}\",worker_url=\"{}\",mode=\"{}\"}} {}\n",
+                escape_label(&w.worker_id),
+                escape_label(&w.worker_url),
+                w.mode,
+                u8::from(w.working),
+            ));
+        }
 
         // worker_health (1=breaker would admit a request, 0=breaker open)
         out.push_str(
@@ -1409,20 +1475,34 @@ mod tests {
         let reg = MetricsRegistry::new();
         let workers = vec![
             WorkerSnapshot {
+                worker_id: "p0".into(),
                 worker_url: "http://p0:30000".into(),
                 mode: "prefill",
                 healthy: true,
                 cb_state: 0,
                 inflight: 5,
+                pending_requests: 0,
+                pending_tokens: 0,
+                global_pending_requests: 0,
+                global_pending_tokens: 0,
                 reported_load: 5,
+                routable: true,
+                working: true,
             },
             WorkerSnapshot {
+                worker_id: "d0".into(),
                 worker_url: "http://d0:30000".into(),
                 mode: "decode",
                 healthy: false,
                 cb_state: 1,
                 inflight: 0,
+                pending_requests: 0,
+                pending_tokens: 0,
+                global_pending_requests: 0,
+                global_pending_tokens: 0,
                 reported_load: -1,
+                routable: false,
+                working: false,
             },
         ];
         let out = reg.render_with_workers(&workers);
@@ -1430,6 +1510,26 @@ mod tests {
         assert!(out.contains(r#"sgl_router_workers{mode="prefill"} 1"#));
         assert!(out.contains(r#"sgl_router_workers{mode="decode"} 1"#));
         assert!(out.contains(r#"sgl_router_workers{mode="plain"} 0"#));
+        // Pool membership carries worker_id for Grafana tables.
+        assert!(out.contains(
+            r#"sgl_router_worker_pool_member{worker_id="p0",worker_url="http://p0:30000",mode="prefill"} 1"#
+        ));
+        assert!(out.contains(
+            r#"sgl_router_worker_pool_member{worker_id="d0",worker_url="http://d0:30000",mode="decode"} 1"#
+        ));
+        // Operator-facing status bits.
+        assert!(out.contains(
+            r#"sgl_router_worker_routable{worker_id="p0",worker_url="http://p0:30000",mode="prefill"} 1"#
+        ));
+        assert!(out.contains(
+            r#"sgl_router_worker_routable{worker_id="d0",worker_url="http://d0:30000",mode="decode"} 0"#
+        ));
+        assert!(out.contains(
+            r#"sgl_router_worker_working{worker_id="p0",worker_url="http://p0:30000",mode="prefill"} 1"#
+        ));
+        assert!(out.contains(
+            r#"sgl_router_worker_working{worker_id="d0",worker_url="http://d0:30000",mode="decode"} 0"#
+        ));
         // Health: healthy prefill = 1, unhealthy decode = 0.
         assert!(out.contains(r#"sgl_router_worker_health{worker_url="http://p0:30000"} 1"#));
         assert!(out.contains(r#"sgl_router_worker_health{worker_url="http://d0:30000"} 0"#));
@@ -1451,6 +1551,12 @@ mod tests {
         let out = reg.render();
         // Headers present, but no per-worker series lines.
         assert!(out.contains("# TYPE sgl_router_worker_health gauge"));
+        assert!(out.contains("# TYPE sgl_router_worker_pool_member gauge"));
+        assert!(out.contains("# TYPE sgl_router_worker_routable gauge"));
+        assert!(out.contains("# TYPE sgl_router_worker_working gauge"));
+        assert!(!out.contains("sgl_router_worker_pool_member{"));
+        assert!(!out.contains("sgl_router_worker_routable{"));
+        assert!(!out.contains("sgl_router_worker_working{"));
         assert!(!out.contains("sgl_router_worker_health{"));
         assert!(!out.contains("sgl_router_worker_cb_state{"));
         assert!(!out.contains("sgl_router_worker_inflight_requests{"));

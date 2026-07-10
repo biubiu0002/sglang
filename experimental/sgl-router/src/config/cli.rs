@@ -82,7 +82,8 @@ pub struct Cli {
     pub balance_rel_threshold: Option<f32>,
     /// Cache-hit load guard (absolute): after a cache hit, divert to the
     /// globally least-loaded worker when the hit worker leads it by more
-    /// than this many in-flight requests (AND the relative guard fires).
+    /// than this many load units (AND the relative guard fires). TTFT-first
+    /// routing uses token-weighted first-token pressure units.
     #[arg(long)]
     pub hit_load_abs_threshold: Option<usize>,
     /// Cache-hit load guard (relative): the hit worker must also exceed

@@ -345,7 +345,9 @@ pub struct CacheAwareConfig {
     /// Cache-hit load guard (absolute). After a cache hit selects the
     /// lowest-load worker *within the matched set*, divert to the globally
     /// least-loaded worker when the hit worker is backed up by more than
-    /// this many in-flight requests AND the relative guard also fires.
+    /// this many load units AND the relative guard also fires. TTFT-first mode
+    /// uses token-weighted `effective_ttft_load`; cache-first mode uses
+    /// request-count `effective_load`.
     /// Default 0. Only armed when `hit_load_rel_threshold` is finite.
     pub hit_load_abs_threshold: usize,
     /// Cache-hit load guard (relative). The hit worker must also exceed
@@ -354,8 +356,8 @@ pub struct CacheAwareConfig {
     /// cache-aware). A finite value arms the guard; must be `>= 1.0`.
     pub hit_load_rel_threshold: f32,
     /// When true, load comparisons (min-load pick, imbalance fast-path, and
-    /// the hit-load guard) use each worker's REAL load reported by the
-    /// background load poller (`Worker::reported_load`, e.g. summed
+    /// the cache-first/TTFT-first hit-load guards) use each worker's REAL load
+    /// reported by the background load poller (`Worker::reported_load`, e.g. summed
     /// `num_waiting_reqs` from `/get_load`) instead of the router-side
     /// in-flight counter. Set by `into_config` iff `--load-poll-interval-secs`
     /// is configured. Default false (use in-flight, original behaviour).

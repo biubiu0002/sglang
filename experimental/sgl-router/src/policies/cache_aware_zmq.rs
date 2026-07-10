@@ -143,6 +143,12 @@ impl CacheAwareZmqPolicy {
             .map(Arc::clone)
     }
 
+    fn hit_load_guard_diverts(&self, hot_load: usize, cool_load: usize) -> bool {
+        self.config.hit_load_rel_threshold.is_finite()
+            && hot_load.saturating_sub(cool_load) > self.config.hit_load_abs_threshold
+            && (hot_load as f32) > (cool_load as f32) * self.config.hit_load_rel_threshold
+    }
+
     /// Cache-hit load guard. Given the worker chosen by cache overlap
     /// (`hot`), divert to the globally least-loaded worker when `hot` is
     /// backed up past both thresholds relative to the coolest worker.
@@ -171,13 +177,58 @@ impl CacheAwareZmqPolicy {
         }
         let c = hot.effective_load(self.config.use_reported_load);
         let m = cool.effective_load(self.config.use_reported_load);
-        let divert = c.saturating_sub(m) > self.config.hit_load_abs_threshold
-            && (c as f32) > (m as f32) * self.config.hit_load_rel_threshold;
-        if divert {
+        if self.hit_load_guard_diverts(c, m) {
             tracing::debug!(
                 hot = %hot.url, hot_load = c,
                 cool = %cool.url, cool_load = m,
                 "cache-aware-zmq: hit-load guard diverted off backed-up cache worker",
+            );
+            cool
+        } else {
+            hot
+        }
+    }
+
+    /// TTFT-first cache-hit guard. The TTFT score may still prefer a deeply
+    /// cached worker while a cold worker has materially less first-token
+    /// pressure. Reuse the cache-hit ABS/REL thresholds, but compare
+    /// `effective_ttft_load` so token-weighted local and cross-replica pending
+    /// reservations participate in the decision.
+    fn apply_ttft_hit_load_guard(
+        &self,
+        hot: Arc<Worker>,
+        workers: &[Arc<Worker>],
+        matched_blocks: usize,
+        matched_urls: &HashSet<&str>,
+    ) -> Arc<Worker> {
+        if !self.config.hit_load_rel_threshold.is_finite()
+            || matched_blocks_for_worker(&hot, matched_blocks, matched_urls) == 0
+        {
+            return hot;
+        }
+
+        let Some(cool) = workers
+            .iter()
+            .filter(|w| matched_blocks_for_worker(w, matched_blocks, matched_urls) == 0)
+            .min_by_key(|w| {
+                w.effective_ttft_load(self.config.use_reported_load, self.config.ttft_token_scale)
+            })
+            .map(Arc::clone)
+        else {
+            return hot;
+        };
+
+        let hot_load =
+            hot.effective_ttft_load(self.config.use_reported_load, self.config.ttft_token_scale);
+        let cool_load =
+            cool.effective_ttft_load(self.config.use_reported_load, self.config.ttft_token_scale);
+        if self.hit_load_guard_diverts(hot_load, cool_load) {
+            tracing::debug!(
+                hot = %hot.url,
+                hot_ttft_load = hot_load,
+                cool = %cool.url,
+                cool_ttft_load = cool_load,
+                "cache-aware-zmq: TTFT hit-load guard diverted to cold worker",
             );
             cool
         } else {
@@ -258,7 +309,9 @@ impl CacheAwareZmqPolicy {
                 w
             });
 
-        chosen.or_else(|| self.pick_min_ttft_load(workers))
+        chosen
+            .map(|hot| self.apply_ttft_hit_load_guard(hot, workers, matched_blocks, matched_urls))
+            .or_else(|| self.pick_min_ttft_load(workers))
     }
 
     fn ttft_score(&self, worker: &Worker, total_blocks: usize, matched_blocks: usize) -> usize {
@@ -613,6 +666,9 @@ mod tests {
     use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
     use crate::policies::kv_events::tree::KvWorkerId;
     use crate::policies::kv_events::HashTree;
+    use crate::router_state::{
+        RouterStateLoadOverlay, RouterStateSnapshotResponse, RouterStateWorkerLoad,
+    };
     use crate::tokenizer::adapter;
 
     async fn start_cache_state_service(
@@ -641,7 +697,7 @@ mod tests {
         client: Arc<RemoteCacheStateClient>,
         metrics: Arc<MetricsRegistry>,
     ) -> CacheAwareZmqPolicy {
-        CacheAwareZmqPolicy::new(
+        ttft_remote_policy_with_config(
             CacheAwareConfig {
                 cache_threshold: 0.0,
                 balance_abs_threshold: usize::MAX,
@@ -654,12 +710,23 @@ mod tests {
                 ttft_token_scale: 4,
                 ttft_cache_score_margin: 0,
             },
-            tree,
             registry,
-            oracle_for_tests(4),
+            tree,
+            client,
+            metrics,
         )
-        .with_remote_cache_state(client)
-        .with_metrics(metrics)
+    }
+
+    fn ttft_remote_policy_with_config(
+        config: CacheAwareConfig,
+        registry: Arc<TokenizerRegistry>,
+        tree: Arc<HashTree>,
+        client: Arc<RemoteCacheStateClient>,
+        metrics: Arc<MetricsRegistry>,
+    ) -> CacheAwareZmqPolicy {
+        CacheAwareZmqPolicy::new(config, tree, registry, oracle_for_tests(4))
+            .with_remote_cache_state(client)
+            .with_metrics(metrics)
     }
 
     fn cfg_default() -> CacheAwareConfig {
@@ -699,6 +766,26 @@ mod tests {
             backend: Default::default(),
             tier: Default::default(),
         }))
+    }
+
+    fn worker_with_router_state_overlay(
+        url: &str,
+        model_id: &str,
+        overlay: Arc<RouterStateLoadOverlay>,
+    ) -> Arc<Worker> {
+        let mut worker = Worker::new(WorkerSpec {
+            id: WorkerId(url.into()),
+            url: url.into(),
+            mode: WorkerMode::Plain,
+            model_ids: vec![ModelId(model_id.into())],
+            bootstrap_port: None,
+            min_priority: None,
+            bearer_token: None,
+            backend: Default::default(),
+            tier: Default::default(),
+        });
+        worker.attach_router_state_overlay(overlay);
+        Arc::new(worker)
     }
 
     fn tokenizer_registry_with_tiny() -> Arc<TokenizerRegistry> {
@@ -1905,6 +1992,16 @@ mod tests {
         hit_url: &str,
         cache_score_margin: usize,
     ) -> (CacheAwareZmqPolicy, Vec<u32>) {
+        ttft_first_policy_with_guard(text, hit_url, cache_score_margin, 0, f32::INFINITY)
+    }
+
+    fn ttft_first_policy_with_guard(
+        text: &str,
+        hit_url: &str,
+        cache_score_margin: usize,
+        hit_load_abs_threshold: usize,
+        hit_load_rel_threshold: f32,
+    ) -> (CacheAwareZmqPolicy, Vec<u32>) {
         let tree = Arc::new(HashTree::new());
         let registry = tokenizer_registry_with_tiny();
         let tok = registry.get("tiny").unwrap();
@@ -1917,8 +2014,8 @@ mod tests {
                 cache_threshold: 0.0,
                 balance_abs_threshold: usize::MAX,
                 balance_rel_threshold: f32::INFINITY,
-                hit_load_abs_threshold: 0,
-                hit_load_rel_threshold: f32::INFINITY,
+                hit_load_abs_threshold,
+                hit_load_rel_threshold,
                 use_reported_load: true,
                 tree_source: CacheTreeSource::Zmq,
                 ttft_first_routing: true,
@@ -1930,6 +2027,68 @@ mod tests {
             oracle_for_tests(4),
         );
         (policy, ids)
+    }
+
+    #[test]
+    fn ttft_hit_guard_gap_two_diverts_to_idle_worker() {
+        let text = "hello world hello world hello world";
+        let (policy, ids) =
+            ttft_first_policy_with_guard(text, "http://w0:30000", usize::MAX, 1, 1.0);
+        let w0 = worker("http://w0:30000", "tiny");
+        let w1 = worker("http://w1:30000", "tiny");
+        w0.set_reported_load(2);
+        w1.set_reported_load(0);
+        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None).with_request_tokens(Some(&ids));
+
+        let chosen = policy.select(&workers, &ctx).expect("must pick");
+
+        assert_eq!(
+            chosen.url, "http://w1:30000",
+            "a TTFT-load gap of two must divert a cache hit when the allowed slack is one",
+        );
+    }
+
+    #[test]
+    fn ttft_hit_guard_gap_one_keeps_cache_hit() {
+        let text = "hello world hello world hello world";
+        let (policy, ids) =
+            ttft_first_policy_with_guard(text, "http://w0:30000", usize::MAX, 1, 1.0);
+        let w0 = worker("http://w0:30000", "tiny");
+        let w1 = worker("http://w1:30000", "tiny");
+        w0.set_reported_load(1);
+        w1.set_reported_load(0);
+        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None).with_request_tokens(Some(&ids));
+
+        let chosen = policy.select(&workers, &ctx).expect("must pick");
+
+        assert_eq!(
+            chosen.url, "http://w0:30000",
+            "a TTFT-load gap equal to the configured slack must keep the cache hit",
+        );
+    }
+
+    #[test]
+    fn ttft_hit_guard_off_preserves_cache_hit_behavior() {
+        let text = "hello world hello world hello world";
+        let (policy, ids) = ttft_first_policy(text, "http://w0:30000", usize::MAX);
+        let w0 = worker("http://w0:30000", "tiny");
+        let w1 = worker("http://w1:30000", "tiny");
+        w0.set_reported_load(2);
+        w1.set_reported_load(0);
+        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None).with_request_tokens(Some(&ids));
+
+        let chosen = policy.select(&workers, &ctx).expect("must pick");
+
+        assert_eq!(
+            chosen.url, "http://w0:30000",
+            "an infinite relative threshold keeps the pre-fix TTFT cache-hit behavior",
+        );
     }
 
     #[test]
@@ -2016,6 +2175,136 @@ mod tests {
         assert!(
             rendered.contains(r#"sgl_router_remote_cache_state_query_total{outcome="hit"} 1"#),
             "remote hit must be counted; got:\n{rendered}",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_cache_hit_guard_honors_redis_router_state_overlay() {
+        let service = Arc::new(crate::cache_state::CacheStateService::with_empty_tree());
+        let (base_url, server) = start_cache_state_service(Arc::clone(&service)).await;
+        let registry = tokenizer_registry_with_tiny();
+        let text = "hello world hello world hello world";
+        let (ids, hashes) = tiny_ids_and_hashes(&registry, text);
+        service.insert(&CacheStateInsertRequest {
+            model_id: "tiny".into(),
+            worker_url: "http://w0:30000".into(),
+            dp_rank: 0,
+            parent_hash: None,
+            block_hashes: hashes,
+        });
+        let client = Arc::new(RemoteCacheStateClient::new(
+            base_url,
+            std::time::Duration::from_millis(500),
+        ));
+        let policy = ttft_remote_policy_with_config(
+            CacheAwareConfig {
+                cache_threshold: 0.0,
+                balance_abs_threshold: usize::MAX,
+                balance_rel_threshold: f32::INFINITY,
+                hit_load_abs_threshold: 1,
+                hit_load_rel_threshold: 1.0,
+                use_reported_load: true,
+                tree_source: CacheTreeSource::Zmq,
+                ttft_first_routing: true,
+                ttft_token_scale: 4,
+                ttft_cache_score_margin: usize::MAX,
+            },
+            registry,
+            Arc::new(HashTree::new()),
+            client,
+            MetricsRegistry::new(),
+        );
+
+        // This is the same overlay populated by the Redis router-state snapshot
+        // poller in production. One pending request carries eight prompt tokens:
+        // request-count load sees a gap of one, while TTFT load sees two units.
+        let overlay = RouterStateLoadOverlay::new();
+        overlay.update(RouterStateSnapshotResponse {
+            workers: [(
+                "http://w0:30000".to_string(),
+                RouterStateWorkerLoad {
+                    pending_requests: 1,
+                    pending_tokens: 8,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        });
+        let w0 = worker_with_router_state_overlay("http://w0:30000", "tiny", Arc::clone(&overlay));
+        let w1 = worker_with_router_state_overlay("http://w1:30000", "tiny", overlay);
+        w0.set_reported_load(0);
+        w1.set_reported_load(0);
+        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None).with_request_tokens(Some(&ids));
+
+        let chosen = policy.select(&workers, &ctx).expect("must pick");
+
+        server.abort();
+        assert_eq!(
+            chosen.url, "http://w1:30000",
+            "remote cache affinity must yield to token-weighted cross-replica pressure",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ttft_hit_guard_route_history_records_final_worker() {
+        let service = Arc::new(crate::cache_state::CacheStateService::with_empty_tree());
+        let (base_url, server) = start_cache_state_service(Arc::clone(&service)).await;
+        let registry = tokenizer_registry_with_tiny();
+        let text = "hello world hello world hello world";
+        let (ids, hashes) = tiny_ids_and_hashes(&registry, text);
+        service.insert(&CacheStateInsertRequest {
+            model_id: "tiny".into(),
+            worker_url: "http://w0:30000".into(),
+            dp_rank: 0,
+            parent_hash: None,
+            block_hashes: hashes.clone(),
+        });
+        let client = Arc::new(RemoteCacheStateClient::new(
+            base_url,
+            std::time::Duration::from_millis(500),
+        ));
+        let local_tree = Arc::new(HashTree::new());
+        let policy = ttft_remote_policy_with_config(
+            CacheAwareConfig {
+                cache_threshold: 0.0,
+                balance_abs_threshold: usize::MAX,
+                balance_rel_threshold: f32::INFINITY,
+                hit_load_abs_threshold: 1,
+                hit_load_rel_threshold: 1.0,
+                use_reported_load: true,
+                tree_source: CacheTreeSource::RouteHistory,
+                ttft_first_routing: true,
+                ttft_token_scale: 4,
+                ttft_cache_score_margin: usize::MAX,
+            },
+            registry,
+            Arc::clone(&local_tree),
+            client,
+            MetricsRegistry::new(),
+        );
+        let w0 = worker("http://w0:30000", "tiny");
+        let w1 = worker("http://w1:30000", "tiny");
+        w0.set_reported_load(2);
+        w1.set_reported_load(0);
+        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None).with_request_tokens(Some(&ids));
+
+        let chosen = policy.select(&workers, &ctx).expect("must pick");
+        let local_match = local_tree.match_prefix(None, &hashes);
+
+        server.abort();
+        assert_eq!(chosen.url, "http://w1:30000");
+        assert_eq!(local_match.matched_blocks, hashes.len());
+        assert_eq!(local_match.workers.len(), 1);
+        assert!(
+            local_match
+                .workers
+                .iter()
+                .any(|worker| worker.url == "http://w1:30000"),
+            "route-history must record the post-guard worker, not the original cache hit",
         );
     }
 

@@ -410,7 +410,7 @@ async def sls_trace_context_middleware(request: Request, call_next):
 
     Enables unified log tracing across 中转站 → SGLang Router → SGLang Worker
     via阿里云 SLS. The filter injects these IDs into every log record so
-    that SLS Logtail-collected stdout is consistently tagged.
+    that SLS SDK direct-push (or stdout) is consistently tagged.
     """
     from sglang.srt.utils.log_utils import get_sls_log_filter
 
@@ -2356,9 +2356,8 @@ def _setup_and_run_http_server(
         # Update logging configs
         set_uvicorn_logging_configs(server_args)
 
-        # Configure SLS-compatible structured JSON logging if enabled.
-        # This ensures all worker stdout logs include trace_id/request_id
-        # for阿里云 SLS Logtail collection and cross-service correlation.
+        # Configure SLS structured logging if enabled. Pushes logs directly to
+        #阿里云 SLS via the Python SDK (async batching), no Logtail agent needed.
         from sglang.srt.utils.log_utils import configure_sls_logging
         configure_sls_logging(service_name="sglang-worker")
 

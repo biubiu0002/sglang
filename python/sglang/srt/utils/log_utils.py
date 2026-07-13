@@ -3,8 +3,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+import queue
 import socket
 import sys
+import threading
+import time
 from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler
 from typing import List, Optional, Union
@@ -75,21 +78,26 @@ def log_json(
 
 
 class SLSJsonFormatter(logging.Formatter):
-    """Structured JSON log formatter for SLS (阿里云日志服务) Logtail pickup.
+    """Structured JSON log formatter for SLS (阿里云日志服务).
 
     Emits each log record as a single-line JSON object with trace_id and
     request_id fields, enabling cross-service log correlation across the
     中转站 (relay-stack) → SGLang Router → SGLang Worker chain.
 
-    Logtail collects stdout; this formatter ensures every log line is
-    parseable JSON with consistent field names.
+    Used both for stdout output and as the payload builder for the SLS SDK
+    direct-push handler, ensuring consistent field names across both paths.
     """
 
     def __init__(self, service_name: str = "sglang-worker"):
         super().__init__()
         self.service_name = service_name
 
-    def format(self, record: logging.LogRecord) -> str:
+    def build_dict(self, record: logging.LogRecord) -> dict:
+        """Build the structured log dict from a LogRecord.
+
+        Shared between format() (stdout) and the SLS SDK handler so that
+        field names stay consistent.
+        """
         log_entry = {
             "timestamp": datetime.utcnow().isoformat() + "Z",
             "level": record.levelname.lower(),
@@ -107,7 +115,10 @@ class SLSJsonFormatter(logging.Formatter):
             if value:
                 log_entry[field] = str(value)
 
-        return json.dumps(log_entry, ensure_ascii=False)
+        return log_entry
+
+    def format(self, record: logging.LogRecord) -> str:
+        return json.dumps(self.build_dict(record), ensure_ascii=False)
 
 
 class SLSLogContextFilter(logging.Filter):
@@ -155,16 +166,147 @@ def get_sls_log_filter() -> SLSLogContextFilter:
     return _global_sls_filter
 
 
-def configure_sls_logging(service_name: str = "sglang-worker"):
-    """Configure root logger with SLS-compatible JSON formatting.
+def _bool_env(key: str) -> bool:
+    return os.environ.get(key, "").lower() in ("true", "1", "yes")
 
-    This should be called at worker startup to ensure all log output
-    (including uvicorn and framework logs) is structured JSON suitable
-    for SLS Logtail collection.
 
-    Set SGLANG_SLS_LOGGING=true in the environment to enable.
+class SLSLogHandler(logging.Handler):
+    """Async batching logging handler that pushes logs to阿里云 SLS via SDK.
+
+    Uses a background thread to batch and send logs via PutLogs, so the
+    main request path is never blocked. Falls back gracefully: if the SDK
+    is not installed or credentials are missing, it silently no-ops and
+    logs go only to stdout.
     """
-    if not os.environ.get("SGLANG_SLS_LOGGING", "").lower() in ("true", "1", "yes"):
+
+    def __init__(self, service_name: str = "sglang-worker"):
+        super().__init__()
+        self.service_name = service_name
+        self.formatter = SLSJsonFormatter(service_name=service_name)
+        self._queue: queue.Queue[Optional[dict]] = queue.Queue(maxsize=10000)
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._client = None
+        self._project = ""
+        self._logstore = ""
+
+        self._init_client()
+
+        if self._client is not None:
+            self._thread = threading.Thread(target=self._run, daemon=True, name="sls-log-pusher")
+            self._thread.start()
+
+    def _init_client(self):
+        """Create the SLS LogClient from environment variables.
+
+        Reads SLS_ENDPOINT / SLS_ACCESS_KEY_ID / SLS_ACCESS_KEY_SECRET /
+        SLS_PROJECT / SLS_LOGSTORE. If any required value is missing or the
+        SDK is not installed, the handler stays inert (logs go to stdout only).
+        """
+        endpoint = os.environ.get("SLS_ENDPOINT", "").strip()
+        ak = os.environ.get("SLS_ACCESS_KEY_ID", "").strip()
+        sk = os.environ.get("SLS_ACCESS_KEY_SECRET", "").strip()
+        self._project = os.environ.get("SLS_PROJECT", "macaron-log").strip()
+        self._logstore = os.environ.get("SLS_LOGSTORE", "sglang-worker").strip()
+
+        if not endpoint or not ak or not sk:
+            return
+
+        try:
+            from aliyun.log import LogClient
+        except ImportError:
+            return
+
+        self._client = LogClient(endpoint, ak, sk)
+
+    def emit(self, record: logging.LogRecord):
+        """Enqueue a log record dict for async batch push."""
+        if self._client is None:
+            return
+        try:
+            log_dict = self.formatter.build_dict(record)
+            self._queue.put_nowait(log_dict)
+        except queue.Full:
+            pass  # drop on overflow to avoid blocking the request
+
+    def _run(self):
+        """Background loop: batch up to 200 logs and push every 1s."""
+        from aliyun.log import LogItem, PutLogsRequest
+
+        batch: list[dict] = []
+        batch_size = 200
+        flush_interval = 1.0
+
+        while not self._stop.is_set():
+            try:
+                item = self._queue.get(timeout=flush_interval)
+            except queue.Empty:
+                if batch:
+                    self._flush(batch, LogItem, PutLogsRequest)
+                    batch = []
+                continue
+
+            if item is None:
+                self._flush(batch, LogItem, PutLogsRequest)
+                break
+
+            batch.append(item)
+            if len(batch) >= batch_size:
+                self._flush(batch, LogItem, PutLogsRequest)
+                batch = []
+
+        # Final drain on stop
+        self._drain_and_flush(batch, LogItem, PutLogsRequest)
+
+    def _drain_and_flush(self, batch: list[dict], LogItem, PutLogsRequest):
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            if item is not None:
+                batch.append(item)
+        if batch:
+            self._flush(batch, LogItem, PutLogsRequest)
+
+    def _flush(self, batch: list[dict], LogItem, PutLogsRequest):
+        """Send a batch of logs to SLS via PutLogs."""
+        if not batch or self._client is None:
+            return
+        now = int(time.time())
+        items = []
+        for log_dict in batch:
+            contents = [(k, str(v)) for k, v in log_dict.items()]
+            items.append(LogItem(timestamp=now, contents=contents))
+        try:
+            req = PutLogsRequest(
+                self._project, self._logstore, topic="", logitems=items
+            )
+            self._client.put_logs(req)
+        except Exception:
+            pass  # swallow SLS errors; logging should never crash the worker
+
+    def close(self):
+        self._stop.set()
+        self._queue.put(None)  # signal the background thread to drain and exit
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+        super().close()
+
+
+def configure_sls_logging(service_name: str = "sglang-worker"):
+    """Configure root logger for SLS unified log tracing.
+
+    When SGLANG_SLS_LOGGING=true:
+    - Always adds a stdout handler with structured JSON (for local debugging)
+    - If SLS_ENDPOINT / SLS_ACCESS_KEY_ID / SLS_ACCESS_KEY_SECRET are set,
+      also adds an SLSLogHandler that pushes logs directly to阿里云 SLS via
+      the Python SDK (async batching, no Logtail agent required).
+
+    This makes the Worker self-contained: it works on Azure / Railway /
+    any platform without a Logtail sidecar.
+    """
+    if not _bool_env("SGLANG_SLS_LOGGING"):
         return
 
     root_logger = logging.getLogger()
@@ -174,7 +316,15 @@ def configure_sls_logging(service_name: str = "sglang-worker"):
     for handler in root_logger.handlers[:]:
         root_logger.removeHandler(handler)
 
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(SLSJsonFormatter(service_name=service_name))
-    handler.addFilter(_global_sls_filter)
-    root_logger.addHandler(handler)
+    formatter = SLSJsonFormatter(service_name=service_name)
+
+    # stdout handler — always present for local debugging / container logs
+    stdout_handler = logging.StreamHandler(sys.stdout)
+    stdout_handler.setFormatter(formatter)
+    stdout_handler.addFilter(_global_sls_filter)
+    root_logger.addHandler(stdout_handler)
+
+    # SLS SDK direct-push handler — only if credentials are configured
+    sls_handler = SLSLogHandler(service_name=service_name)
+    sls_handler.addFilter(_global_sls_filter)
+    root_logger.addHandler(sls_handler)

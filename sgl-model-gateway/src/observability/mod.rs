@@ -4,6 +4,6 @@ pub mod events;
 pub mod gauge_histogram;
 pub mod inflight_tracker;
 pub mod logging;
-pub mod sls_log_layer;
 pub mod metrics;
 pub mod otel_trace;
+pub mod sls_log_layer;

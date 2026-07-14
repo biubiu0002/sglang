@@ -171,6 +171,18 @@ pub(crate) fn init_metrics() {
         "smg_http_rate_limit_total",
         "Rate limiting decisions by result (allowed/rejected)"
     );
+    describe_counter!(
+        "smg_sls_log_batches_total",
+        "SLS log delivery batches by result"
+    );
+    describe_counter!(
+        "smg_sls_log_entries_sent_total",
+        "Log entries successfully delivered to SLS"
+    );
+    describe_counter!(
+        "smg_sls_log_entries_dropped_total",
+        "Log entries dropped before SLS delivery by reason"
+    );
 
     // Layer 2: Router metrics
     describe_counter!(

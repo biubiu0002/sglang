@@ -1,5 +1,7 @@
+import asyncio
 import io
 import json
+import logging
 import re
 import tempfile
 import unittest
@@ -7,7 +9,11 @@ import uuid
 from contextlib import redirect_stdout
 from pathlib import Path
 
-from sglang.srt.utils.log_utils import create_log_targets, log_json
+from sglang.srt.utils.log_utils import (
+    SLSLogContextFilter,
+    create_log_targets,
+    log_json,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
@@ -61,6 +67,61 @@ class TestLogUtils(unittest.TestCase):
             self.assertEqual(stdout_data["event"], "multi.event")
             self.assertEqual(file_data["event"], "multi.event")
             self.assertEqual(stdout_data["x"], file_data["x"])
+
+
+class TestSLSLogContextFilter(unittest.TestCase):
+    @staticmethod
+    def _record() -> logging.LogRecord:
+        return logging.LogRecord(
+            name="test",
+            level=logging.INFO,
+            pathname=__file__,
+            lineno=1,
+            msg="test",
+            args=(),
+            exc_info=None,
+        )
+
+    def test_nested_context_is_restored(self):
+        context_filter = SLSLogContextFilter()
+        outer_tokens = context_filter.set_context("outer-trace", "outer-request")
+        inner_tokens = context_filter.set_context("inner-trace", "inner-request")
+
+        inner_record = self._record()
+        context_filter.filter(inner_record)
+        self.assertEqual(inner_record.trace_id, "inner-trace")
+
+        context_filter.reset_context(inner_tokens)
+        outer_record = self._record()
+        context_filter.filter(outer_record)
+        self.assertEqual(outer_record.trace_id, "outer-trace")
+        self.assertEqual(outer_record.request_id, "outer-request")
+        context_filter.reset_context(outer_tokens)
+
+    def test_concurrent_contexts_are_isolated(self):
+        context_filter = SLSLogContextFilter()
+
+        async def capture(trace_id: str, request_id: str) -> tuple[str, str]:
+            tokens = context_filter.set_context(trace_id, request_id)
+            try:
+                await asyncio.sleep(0)
+                record = self._record()
+                context_filter.filter(record)
+                await asyncio.sleep(0)
+                return record.trace_id, record.request_id
+            finally:
+                context_filter.reset_context(tokens)
+
+        async def run_concurrently():
+            return await asyncio.gather(
+                capture("trace-a", "request-a"),
+                capture("trace-b", "request-b"),
+            )
+
+        self.assertEqual(
+            asyncio.run(run_concurrently()),
+            [("trace-a", "request-a"), ("trace-b", "request-b")],
+        )
 
 
 def _parse_log_json(line: str) -> dict:

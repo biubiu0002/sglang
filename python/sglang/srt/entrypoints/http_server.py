@@ -418,7 +418,7 @@ async def sls_trace_context_middleware(request: Request, call_next):
     request_id = request.headers.get("x-request-id", "")
 
     sls_filter = get_sls_log_filter()
-    sls_filter.set_context(
+    context_tokens = sls_filter.set_context(
         trace_id=trace_id or None,
         request_id=request_id or None,
     )
@@ -429,7 +429,7 @@ async def sls_trace_context_middleware(request: Request, call_next):
             response.headers["x-trace-id"] = trace_id
         return response
     finally:
-        sls_filter.clear()
+        sls_filter.reset_context(context_tokens)
 
 
 # Include routers

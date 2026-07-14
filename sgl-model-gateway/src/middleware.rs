@@ -304,7 +304,11 @@ impl<B> OnRequest<B> for RequestLogger {
         }
 
         // Extract trace_id from X-Trace-Id header for cross-service log correlation
-        if let Some(trace_id) = request.headers().get("x-trace-id").and_then(|v| v.to_str().ok()) {
+        if let Some(trace_id) = request
+            .headers()
+            .get("x-trace-id")
+            .and_then(|v| v.to_str().ok())
+        {
             if !trace_id.is_empty() {
                 span.record("trace_id", trace_id);
             }

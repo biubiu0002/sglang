@@ -8,6 +8,7 @@ import socket
 import sys
 import threading
 import time
+from contextvars import ContextVar, Token
 from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler
 from typing import List, Optional, Union
@@ -131,29 +132,37 @@ class SLSLogContextFilter(logging.Filter):
 
     def __init__(self):
         super().__init__()
-        self._trace_id = None
-        self._request_id = None
+        self._trace_id: ContextVar[Optional[str]] = ContextVar(
+            "sls_trace_id", default=None
+        )
+        self._request_id: ContextVar[Optional[str]] = ContextVar(
+            "sls_request_id", default=None
+        )
 
-    def set_context(self, trace_id: Optional[str] = None, request_id: Optional[str] = None):
+    def set_context(
+        self, trace_id: Optional[str] = None, request_id: Optional[str] = None
+    ) -> tuple[Token, Token]:
         """Set the current request's trace context.
 
-        Called by the FastAPI middleware at the start of each request.
+        Return reset tokens so nested and concurrent contexts can be restored.
         """
-        self._trace_id = trace_id
-        self._request_id = request_id
+        return self._trace_id.set(trace_id), self._request_id.set(request_id)
 
-    def clear(self):
-        """Clear the trace context after the request completes."""
-        self._trace_id = None
-        self._request_id = None
+    def reset_context(self, tokens: tuple[Token, Token]) -> None:
+        """Restore the context that preceded the matching set_context call."""
+        trace_token, request_token = tokens
+        self._trace_id.reset(trace_token)
+        self._request_id.reset(request_token)
 
     def filter(self, record: logging.LogRecord) -> bool:
-        if self._trace_id:
+        trace_id = self._trace_id.get()
+        request_id = self._request_id.get()
+        if trace_id:
             if not hasattr(record, "trace_id"):
-                record.trace_id = self._trace_id
-        if self._request_id:
+                record.trace_id = trace_id
+        if request_id:
             if not hasattr(record, "request_id"):
-                record.request_id = self._request_id
+                record.request_id = request_id
         return True
 
 
@@ -193,7 +202,9 @@ class SLSLogHandler(logging.Handler):
         self._init_client()
 
         if self._client is not None:
-            self._thread = threading.Thread(target=self._run, daemon=True, name="sls-log-pusher")
+            self._thread = threading.Thread(
+                target=self._run, daemon=True, name="sls-log-pusher"
+            )
             self._thread.start()
 
     def _init_client(self):

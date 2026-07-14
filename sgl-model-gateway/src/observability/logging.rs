@@ -15,6 +15,8 @@ use tracing_subscriber::{
 use super::otel_trace::get_otel_layer;
 use crate::config::TraceConfig;
 
+use super::sls_log_layer::{SlsLayerConfig, SlsLogLayer};
+
 const TIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
 const TIME_FORMAT_MS: &str = "%Y-%m-%d %H:%M:%S%.3f";
 const DEFAULT_LOG_TARGET: &str = "smg";
@@ -125,6 +127,13 @@ pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig
     };
 
     layers.push(stdout_layer);
+
+    // SLS direct-push layer — pushes logs to阿里云 SLS via HTTP API.
+    // Only enabled when SLS_ENDPOINT + SLS_ACCESS_KEY_ID + SLS_ACCESS_KEY_SECRET
+    // are all set. No Logtail agent required.
+    if let Some(sls_config) = SlsLayerConfig::from_env("sglang-router") {
+        layers.push(SlsLogLayer::new(sls_config).boxed());
+    }
 
     let mut file_guard = None;
 
